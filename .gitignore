@@ -1,0 +1,10 @@
+.build/
+.codex
+.m2/
+.tmp/
+.tools/apache-maven-3.9.9-bin.zip
+**/target/
+runtime/
+*.log
+*.tmp
+*.bak
