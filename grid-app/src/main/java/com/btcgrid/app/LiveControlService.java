@@ -275,6 +275,7 @@ public class LiveControlService {
         return Map.of(
                 "running", runner != null && runner.isRunning(),
                 "canResume", (runner == null || !runner.isRunning()) && canResume(snapshot),
+                "stopAfterCycle", runner != null && runner.isStopAfterCycleRequested(),
                 "config", lastConfig
         );
     }

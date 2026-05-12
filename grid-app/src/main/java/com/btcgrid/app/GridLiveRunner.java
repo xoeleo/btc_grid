@@ -242,6 +242,10 @@ public class GridLiveRunner implements AutoCloseable, PrivateExecutionListener, 
         stopAfterCycle.set(true);
     }
 
+    public boolean isStopAfterCycleRequested() {
+        return stopAfterCycle.get();
+    }
+
     public void stopNow() {
         cancelWorkingOrders();
         close();

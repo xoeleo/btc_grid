@@ -59,13 +59,24 @@ public class GridApplication {
         StatusStore statusStore = new FileStatusStore(PathResolver.absolutePath(properties.runtimeSettings().statusFilePath()));
         FillStore fillStore = new SqliteFillStore(PathResolver.absolutePath(properties.runtimeSettings().fillsDbPath()));
         WorkingOrderRegistry workingOrderRegistry = new WorkingOrderRegistry();
-        RecoveryState recoveryState = new RecoveryBootstrap(stateStore).restore(engine, strategyLedger);
+        RecoveryState recoveryState = new RecoveryBootstrap(stateStore, eventLogger).restore(engine, strategyLedger);
         workingOrderRegistry.replaceAll(recoveryState.trackedWorkingOrders());
         StartupReconciliationService reconciliationService = new StartupReconciliationService(
                 new BybitSdkOrderQueryGateway(sdkClientFactory, config.category()),
                 !properties.bybitSdkConfig().apiKey().isBlank() && !properties.bybitSdkConfig().apiSecret().isBlank()
         );
-        workingOrderRegistry.replaceAll(reconciliationService.reconcile(config.symbol(), workingOrderRegistry.snapshot()));
+        try {
+            workingOrderRegistry.replaceAll(reconciliationService.reconcile(config.symbol(), workingOrderRegistry.snapshot()));
+        } catch (RuntimeException e) {
+            eventLogger.error("startup.reconcile.failed", java.util.Map.of(
+                    "symbol", config.symbol(),
+                    "message", e.getMessage()
+            ));
+            alertService.warning("STARTUP_RECONCILE_FAILED", "Startup order reconciliation failed", java.util.Map.of(
+                    "symbol", config.symbol(),
+                    "message", e.getMessage()
+            ));
+        }
         repairFilledWorkingOrders(config.symbol(), fillStore, workingOrderRegistry);
         RuntimeConsistencyResult consistencyResult = new ActivePairConsistencyService()
                 .reconcile(engine.runtimeState(), workingOrderRegistry.snapshot());
@@ -96,6 +107,7 @@ public class GridApplication {
                 "logFile", properties.runtimeSettings().logFilePath(),
                 "statusFile", properties.runtimeSettings().statusFilePath(),
                 "httpEnabled", properties.runtimeSettings().httpEnabled(),
+                "httpHost", properties.runtimeSettings().httpHost(),
                 "httpPort", properties.runtimeSettings().httpPort()
         ));
         AtomicReference<MarketSnapshot> latestSnapshotRef = new AtomicReference<>(snapshot);
@@ -134,6 +146,7 @@ public class GridApplication {
         HttpStatusServer httpStatusServer = null;
         if (properties.runtimeSettings().httpEnabled()) {
             httpStatusServer = new HttpStatusServer(
+                    properties.runtimeSettings().httpHost(),
                     properties.runtimeSettings().httpPort(),
                     liveControlService::snapshot,
                     liveControlService,

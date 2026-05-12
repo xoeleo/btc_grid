@@ -10,6 +10,7 @@ public record RuntimeSettings(
         String statusFilePath,
         String fillsDbPath,
         boolean httpEnabled,
+        String httpHost,
         int httpPort,
         int reconnectBaseDelaySeconds,
         int reconnectMaxAttempts

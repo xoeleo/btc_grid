@@ -21,19 +21,20 @@ public class HttpStatusServer implements AutoCloseable {
     private final ObjectMapper objectMapper = new ObjectMapper().registerModule(new JavaTimeModule());
 
     public HttpStatusServer(int port, RuntimeStatusProvider runtimeStatusProvider, EventLogger eventLogger) {
-        this(port, runtimeStatusProvider::snapshot, null, eventLogger);
+        this("0.0.0.0", port, runtimeStatusProvider::snapshot, null, eventLogger);
     }
 
     public HttpStatusServer(
+            String host,
             int port,
             Supplier<RuntimeStatusSnapshot> runtimeStatusSupplier,
             LiveControlService liveControlService,
             EventLogger eventLogger
     ) {
         try {
-            this.httpServer = HttpServer.create(new InetSocketAddress("127.0.0.1", port), 0);
+            this.httpServer = HttpServer.create(new InetSocketAddress(host, port), 0);
         } catch (IOException e) {
-            throw new IllegalStateException("Failed to create HTTP status server on port " + port, e);
+            throw new IllegalStateException("Failed to create HTTP status server on " + host + ":" + port, e);
         }
         this.runtimeStatusSupplier = runtimeStatusSupplier;
         this.liveControlService = liveControlService;
@@ -43,7 +44,10 @@ public class HttpStatusServer implements AutoCloseable {
 
     public void start() {
         httpServer.start();
-        eventLogger.info("http.started", Map.of("port", httpServer.getAddress().getPort()));
+        eventLogger.info("http.started", Map.of(
+                "host", httpServer.getAddress().getHostString(),
+                "port", httpServer.getAddress().getPort()
+        ));
     }
 
     public int port() {
@@ -197,9 +201,11 @@ public class HttpStatusServer implements AutoCloseable {
                     <div class="summary">
                       <div class="metric"><span>运行状态</span><strong><span id="runBadge" class="badge badge-idle">读取中</span></strong></div>
                       <div class="metric"><span>当前标的</span><strong id="activeSymbol">-</strong></div>
+                      <div class="metric"><span>Cycle</span><strong id="cycleStatus">-</strong></div>
                       <div class="metric"><span>策略状态</span><strong id="strategyState">-</strong></div>
                       <div class="metric"><span>最新价 / 标记价</span><strong id="lastPrice">-</strong></div>
                       <div class="metric"><span>挂单数量</span><strong id="orderCount">0</strong></div>
+                      <div class="metric"><span>最近订单</span><strong id="lastOrderStatus">-</strong></div>
                     </div>
                     <div class="grid" id="form"></div>
                     <p>
@@ -357,15 +363,21 @@ public class HttpStatusServer implements AutoCloseable {
                       const state = status && status.runtimeState ? status.runtimeState.state : '-';
                       const activeSymbol = (control && control.config && control.config.symbol) || (status && status.symbol) || '-';
                       const snapshot = status && status.latestMarketSnapshot ? status.latestMarketSnapshot : {};
+                      const orders = status && status.workingOrders ? status.workingOrders : [];
+                      const lastOrder = orders.length ? orders[orders.length - 1] : null;
                       const badge = document.getElementById('runBadge');
                       badge.textContent = running ? '运行中' : '未运行';
                       badge.className = `badge ${running ? 'badge-running' : 'badge-idle'}`;
                       document.getElementById('activeSymbol').textContent = activeSymbol;
+                      document.getElementById('cycleStatus').textContent = cycleLabel(control, status);
                       document.getElementById('strategyState').textContent = state || '-';
                       document.getElementById('lastPrice').textContent = snapshot.markPrice == null
                         ? (snapshot.lastPrice ?? '-')
                         : `${snapshot.lastPrice ?? '-'} / ${snapshot.markPrice}`;
                       document.getElementById('orderCount').textContent = activeOrders.length;
+                      document.getElementById('lastOrderStatus').textContent = lastOrder
+                        ? `${formatSide(lastOrder.side)} ${lastOrder.orderType} ${lastOrder.status}`
+                        : '-';
                       document.getElementById('startButton').disabled = running;
                       document.getElementById('resumeButton').disabled = running || !Boolean(control && control.canResume);
                       document.getElementById('stopButton').disabled = !running;
@@ -376,6 +388,13 @@ public class HttpStatusServer implements AutoCloseable {
                         document.getElementById('stopButton').disabled = true;
                         document.getElementById('flattenButton').disabled = true;
                       }
+                    }
+                    function cycleLabel(control, status) {
+                      if (!control || !control.running) return '未运行';
+                      const pair = status && status.runtimeState ? status.runtimeState.activeOrderPair : null;
+                      if (pair) return '网格挂单中';
+                      if (status && status.runtimeState && status.runtimeState.state === 'OPENING_FIRST_POSITION') return '开仓中';
+                      return control.stopAfterCycle ? '本轮结束后停止' : '连续运行';
                     }
                     function isActiveOrder(order) {
                       if (!order || !['NEW', 'PARTIALLY_FILLED', 'UNTRIGGERED'].includes(order.status)) return false;
