@@ -24,6 +24,8 @@ import okhttp3.WebSocket;
 
 public class BybitSdkPrivateStreamGateway implements BybitPrivateStreamGateway {
 
+    private static final String DEMO_STREAM_DOMAIN = "wss://stream-demo.bybit.com";
+
     private final BybitSdkConfig config;
     private final ObjectMapper objectMapper = new ObjectMapper();
     private WebsocketStreamClient websocketClient;
@@ -39,7 +41,9 @@ public class BybitSdkPrivateStreamGateway implements BybitPrivateStreamGateway {
             PrivateOrderListener orderListener,
             PrivateStreamLifecycleListener lifecycleListener
     ) {
-        String streamDomain = config.testnet() ? BybitApiConfig.STREAM_TESTNET_DOMAIN : BybitApiConfig.STREAM_MAINNET_DOMAIN;
+        String streamDomain = config.demo()
+                ? DEMO_STREAM_DOMAIN
+                : (config.testnet() ? BybitApiConfig.STREAM_TESTNET_DOMAIN : BybitApiConfig.STREAM_MAINNET_DOMAIN);
         websocketClient = new WebsocketStreamClientImpl(
                 config.apiKey(),
                 config.apiSecret(),
@@ -98,7 +102,10 @@ public class BybitSdkPrivateStreamGateway implements BybitPrivateStreamGateway {
                             sideOf(data.getSide()),
                             decimal(data.getExecQty()),
                             decimal(data.getExecPrice()),
-                            Instant.ofEpochMilli(Long.parseLong(data.getExecTime()))
+                            Instant.ofEpochMilli(Long.parseLong(data.getExecTime())),
+                            decimalOrZero(data.getExecValue()),
+                            decimalOrZero(data.getExecFee()),
+                            "USDT"
                     ));
                 }
             } else if (topic.startsWith("order")) {

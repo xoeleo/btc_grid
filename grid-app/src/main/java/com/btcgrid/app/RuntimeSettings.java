@@ -8,6 +8,7 @@ public record RuntimeSettings(
         String stateFilePath,
         String logFilePath,
         String statusFilePath,
+        String fillsDbPath,
         boolean httpEnabled,
         int httpPort,
         int reconnectBaseDelaySeconds,

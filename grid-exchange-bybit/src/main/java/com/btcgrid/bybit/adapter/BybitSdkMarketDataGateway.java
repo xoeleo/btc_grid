@@ -74,11 +74,15 @@ public class BybitSdkMarketDataGateway implements BybitMarketDataGateway {
             throw new IllegalStateException("No ticker returned for symbol " + symbol);
         }
 
-        BigDecimal lastPrice = BybitSdkMapper.decimal(tickerList.get(0).path("lastPrice").asText());
+        JsonNode ticker = tickerList.get(0);
+        BigDecimal lastPrice = BybitSdkMapper.decimal(ticker.path("lastPrice").asText());
+        BigDecimal markPrice = ticker.hasNonNull("markPrice") && !ticker.path("markPrice").asText().isBlank()
+                ? BybitSdkMapper.decimal(ticker.path("markPrice").asText())
+                : lastPrice;
         long responseTime = tickerRoot.path("time").asLong(Instant.now().toEpochMilli());
         List<Candle> candles = loadFourHourCandles(marketClient, symbol);
         return indicatorCalculator.calculate(symbol, candles, emaLength4h, bollLength4h, bollStdDevMultiplier)
-                .map(indicators -> new MarketSnapshot(symbol, Instant.ofEpochMilli(responseTime), lastPrice, indicators))
+                .map(indicators -> new MarketSnapshot(symbol, Instant.ofEpochMilli(responseTime), lastPrice, markPrice, indicators))
                 .orElseThrow(() -> new IllegalStateException("Insufficient 4H candles to calculate indicators for " + symbol));
     }
 

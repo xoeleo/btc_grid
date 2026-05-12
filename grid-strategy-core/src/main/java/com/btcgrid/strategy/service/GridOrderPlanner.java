@@ -52,9 +52,11 @@ public class GridOrderPlanner {
         }
         BigDecimal entrySteps = config.maxInitialSteps();
         BigDecimal rawQty = entrySteps.multiply(config.baseGridQty());
-        BigDecimal finalQty = clampQty(
-                tradableQty(instrumentSpec, rawQty),
-                maxAddQty(config, BigDecimal.ZERO).min(config.maxOrderQty())
+        BigDecimal finalQty = clampTradableQty(
+                instrumentSpec,
+                rawQty,
+                maxAddQty(config, BigDecimal.ZERO).min(config.maxOrderQty()),
+                currentPrice
         );
         if (finalQty.signum() == 0) {
             return null;
@@ -116,13 +118,17 @@ public class GridOrderPlanner {
                 : sellStepPlan.placementDistance(baseSpacing);
         BigDecimal buyPrice = instrumentSpec.roundPrice(anchorPrice.subtract(buyPlacementDistance));
         BigDecimal sellPrice = instrumentSpec.roundPrice(anchorPrice.add(sellPlacementDistance));
-        BigDecimal buyNormalQty = clampQty(
-                tradableQty(instrumentSpec, qtyFromPlacementDistance(buyPlacementDistance, baseSpacing, config.baseGridQty())),
-                config.maxOrderQty()
+        BigDecimal buyNormalQty = clampTradableQty(
+                instrumentSpec,
+                qtyFromPlacementDistance(buyPlacementDistance, baseSpacing, config.baseGridQty()),
+                config.maxOrderQty(),
+                buyPrice
         );
-        BigDecimal sellNormalQty = clampQty(
-                tradableQty(instrumentSpec, qtyFromPlacementDistance(sellPlacementDistance, baseSpacing, config.baseGridQty())),
-                config.maxOrderQty()
+        BigDecimal sellNormalQty = clampTradableQty(
+                instrumentSpec,
+                qtyFromPlacementDistance(sellPlacementDistance, baseSpacing, config.baseGridQty()),
+                config.maxOrderQty(),
+                sellPrice
         );
         if (buyNormalQty.signum() == 0 && sellNormalQty.signum() == 0) {
             return null;
@@ -222,8 +228,7 @@ public class GridOrderPlanner {
         BigDecimal rawQty = inventory
                 .divide(denominator, 8, RoundingMode.HALF_UP)
                 .multiply(numerator);
-        BigDecimal tradable = tradableQty(instrumentSpec, rawQty);
-        return clampQty(tradable.min(inventory), config.maxOrderQty());
+        return clampTradableQty(instrumentSpec, rawQty, inventory.min(config.maxOrderQty()), orderPrice);
     }
 
     public BigDecimal nextRequoteSpacing(
@@ -255,7 +260,12 @@ public class GridOrderPlanner {
         BigDecimal baseSpacing = baseSpacing(config, referencePrice);
         TradeSide side = ledgerSnapshot.netQty().signum() > 0 ? TradeSide.SELL : TradeSide.BUY;
         StepPlan stepPlan = stepPlan(marketSnapshot.lastPrice(), referencePrice, baseSpacing, ledgerSnapshot, side);
-        BigDecimal normalQty = clampQty(tradableQty(instrumentSpec, stepPlan.qty(config.baseGridQty())), config.maxOrderQty());
+        BigDecimal normalQty = clampTradableQty(
+                instrumentSpec,
+                stepPlan.qty(config.baseGridQty()),
+                config.maxOrderQty(),
+                marketSnapshot.lastPrice()
+        );
         if (normalQty.signum() == 0) {
             return null;
         }
@@ -263,7 +273,7 @@ public class GridOrderPlanner {
         BigDecimal boost = BigDecimal.ONE.add(
                 pnlRate.multiply(config.deinventoryBoostSlope()).min(config.deinventoryBoostCap())
         );
-        BigDecimal qty = tradableQty(instrumentSpec, normalQty.multiply(boost));
+        BigDecimal qty = tradableQty(instrumentSpec, normalQty.multiply(boost), marketSnapshot.lastPrice());
         qty = qty.min(ledgerSnapshot.netQty().abs());
         if (qty.signum() == 0) {
             return null;
@@ -291,7 +301,7 @@ public class GridOrderPlanner {
         BigDecimal boost = BigDecimal.ONE.add(
                 pnlRate.multiply(config.deinventoryBoostSlope()).min(config.deinventoryBoostCap())
         );
-        BigDecimal boostedQty = tradableQty(instrumentSpec, normalQty.multiply(boost));
+        BigDecimal boostedQty = tradableQty(instrumentSpec, normalQty.multiply(boost), ledgerSnapshot.lastFillPrice());
         BigDecimal reduceCap = ledgerSnapshot.netQty().abs();
         return clampQty(boostedQty.min(reduceCap), config.maxOrderQty());
     }
@@ -302,7 +312,12 @@ public class GridOrderPlanner {
             BigDecimal qty,
             StrategyLedgerSnapshot ledgerSnapshot
     ) {
-        return tradableQty(instrumentSpec, qty.min(maxAddQty(config, ledgerSnapshot.netQty().abs())));
+        return clampTradableQty(
+                instrumentSpec,
+                qty,
+                maxAddQty(config, ledgerSnapshot.netQty().abs()),
+                ledgerSnapshot.lastFillPrice()
+        );
     }
 
     private BigDecimal maxAddQty(GridStrategyConfig config, BigDecimal currentAbsQty) {
@@ -357,12 +372,35 @@ public class GridOrderPlanner {
         return qty.min(maxOrderQty);
     }
 
-    private BigDecimal tradableQty(InstrumentSpec instrumentSpec, BigDecimal qty) {
+    private BigDecimal tradableQty(InstrumentSpec instrumentSpec, BigDecimal qty, BigDecimal price) {
         if (qty == null || qty.signum() <= 0) {
             return BigDecimal.ZERO;
         }
         BigDecimal rounded = instrumentSpec.roundQty(qty);
+        if (rounded.compareTo(instrumentSpec.minOrderQty()) < 0) {
+            return BigDecimal.ZERO;
+        }
+        if (instrumentSpec.minNotionalValue().signum() > 0 && price != null && price.signum() > 0
+                && rounded.multiply(price).compareTo(instrumentSpec.minNotionalValue()) < 0) {
+            rounded = instrumentSpec.roundQtyUp(instrumentSpec.minNotionalValue().divide(price, 16, RoundingMode.CEILING));
+        }
         return rounded.compareTo(instrumentSpec.minOrderQty()) < 0 ? BigDecimal.ZERO : rounded;
+    }
+
+    private BigDecimal clampTradableQty(InstrumentSpec instrumentSpec, BigDecimal qty, BigDecimal maxOrderQty, BigDecimal price) {
+        BigDecimal tradable = tradableQty(instrumentSpec, qty, price);
+        if (tradable.signum() == 0 || maxOrderQty == null || maxOrderQty.signum() <= 0) {
+            return BigDecimal.ZERO;
+        }
+        BigDecimal capped = instrumentSpec.roundQty(tradable.min(maxOrderQty));
+        if (capped.compareTo(instrumentSpec.minOrderQty()) < 0) {
+            return BigDecimal.ZERO;
+        }
+        if (instrumentSpec.minNotionalValue().signum() > 0 && price != null && price.signum() > 0
+                && capped.multiply(price).compareTo(instrumentSpec.minNotionalValue()) < 0) {
+            return BigDecimal.ZERO;
+        }
+        return capped;
     }
 
     private BigDecimal spacingFromRatio(BigDecimal spacingRatio, BigDecimal referencePrice) {

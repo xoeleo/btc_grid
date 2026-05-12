@@ -45,6 +45,7 @@ public final class GridConfigLoader {
                 PathResolver.absolute(properties.getProperty("runtime.state-file", "runtime/grid-state.json")),
                 PathResolver.absolute(properties.getProperty("runtime.log-file", "runtime/grid-events.log")),
                 PathResolver.absolute(properties.getProperty("runtime.status-file", "runtime/grid-status.json")),
+                PathResolver.absolute(properties.getProperty("runtime.fills-db", "runtime/grid-fills.sqlite")),
                 Boolean.parseBoolean(properties.getProperty("runtime.http-enabled", "true")),
                 Integer.parseInt(properties.getProperty("runtime.http-port", "8787")),
                 Integer.parseInt(properties.getProperty("runtime.reconnect-base-delay-seconds", "5")),

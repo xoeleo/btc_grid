@@ -16,7 +16,7 @@ class InMemoryStrategyLedgerTest {
     void initialFillDoesNotStartConsecutiveSequence() {
         InMemoryStrategyLedger ledger = new InMemoryStrategyLedger("BTCUSDT");
 
-        ledger.applyFill(fill("BTCUSDT_INIT_1", TradeSide.BUY, "1", "100", Instant.parse("2026-01-01T00:00:00Z")));
+        ledger.applyFill(fill("GRID_BTCUSDT_I_1", TradeSide.BUY, "1", "100", Instant.parse("2026-01-01T00:00:00Z")));
         StrategyLedgerSnapshot afterInit = ledger.snapshot();
         assertEquals(new BigDecimal("0"), afterInit.previousFillPrice());
         assertEquals(new BigDecimal("100"), afterInit.lastFillPrice());

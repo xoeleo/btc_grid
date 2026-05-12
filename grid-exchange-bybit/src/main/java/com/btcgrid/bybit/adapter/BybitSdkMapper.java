@@ -60,7 +60,8 @@ public final class BybitSdkMapper {
                 decimal(lotSizeFilter, "qtyStep", "0.001"),
                 decimal(lotSizeFilter, "minOrderQty", "0.001"),
                 decimal(priceFilter, "tickSize", "0.1"),
-                decimal(priceFilter, "minPrice", "0.1")
+                decimal(priceFilter, "minPrice", "0.1"),
+                decimal(lotSizeFilter, "minNotionalValue", "0")
         );
     }
 

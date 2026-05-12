@@ -7,14 +7,18 @@ import com.bybit.api.client.service.BybitApiClientFactory;
 
 public class BybitSdkClientFactory {
 
+    private static final String DEMO_REST_DOMAIN = "https://api-demo.bybit.com";
+
     private final BybitSdkConfig config;
     private final BybitApiClientFactory marketDelegate;
     private final BybitApiClientFactory tradeDelegate;
 
     public BybitSdkClientFactory(BybitSdkConfig config) {
         this.config = config;
-        String tradeBaseUrl = config.testnet() ? BybitApiConfig.TESTNET_DOMAIN : BybitApiConfig.MAINNET_DOMAIN;
-        String marketBaseUrl = config.publicMarketMainnet() ? BybitApiConfig.MAINNET_DOMAIN : tradeBaseUrl;
+        String tradeBaseUrl = config.demo()
+                ? DEMO_REST_DOMAIN
+                : (config.testnet() ? BybitApiConfig.TESTNET_DOMAIN : BybitApiConfig.MAINNET_DOMAIN);
+        String marketBaseUrl = !config.demo() && config.publicMarketMainnet() ? BybitApiConfig.MAINNET_DOMAIN : tradeBaseUrl;
         this.tradeDelegate = BybitApiClientFactory.newInstance(
                 config.apiKey(),
                 config.apiSecret(),

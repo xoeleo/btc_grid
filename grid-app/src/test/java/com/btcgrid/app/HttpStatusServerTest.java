@@ -46,16 +46,17 @@ class HttpStatusServerTest {
                 Set.of()
         );
 
-        try (HttpStatusServer server = new HttpStatusServer(8788, provider, new StructuredEventLogger())) {
+        try (HttpStatusServer server = new HttpStatusServer(0, provider, new StructuredEventLogger())) {
             server.start();
             HttpClient client = HttpClient.newHttpClient();
+            int port = server.port();
 
             HttpResponse<String> health = client.send(
-                    HttpRequest.newBuilder(URI.create("http://127.0.0.1:8788/health")).GET().build(),
+                    HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/health")).GET().build(),
                     HttpResponse.BodyHandlers.ofString()
             );
             HttpResponse<String> orders = client.send(
-                    HttpRequest.newBuilder(URI.create("http://127.0.0.1:8788/orders")).GET().build(),
+                    HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/orders")).GET().build(),
                     HttpResponse.BodyHandlers.ofString()
             );
 

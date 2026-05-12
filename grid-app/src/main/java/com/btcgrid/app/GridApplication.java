@@ -17,9 +17,12 @@ import com.btcgrid.strategy.service.GridOrderPlanner;
 import com.btcgrid.strategy.service.GridStrategyEngine;
 import com.btcgrid.strategy.service.GridTriggerEvaluator;
 import java.math.BigDecimal;
+import java.time.Instant;
+import java.util.Collection;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.List;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 public class GridApplication {
 
@@ -43,7 +46,8 @@ public class GridApplication {
                 instrumentSpec,
                 strategyLedger,
                 new GridTriggerEvaluator(),
-                new GridOrderPlanner(new ClientOrderIdFactory())
+                new GridOrderPlanner(new ClientOrderIdFactory()),
+                true
         );
         EventLogger eventLogger = new CompositeEventLogger(List.of(
                 new StructuredEventLogger(),
@@ -53,6 +57,7 @@ public class GridApplication {
         BybitSdkTradeGateway tradeGateway = new BybitSdkTradeGateway(sdkClientFactory, config.category());
         StateStore stateStore = new FileStateStore(PathResolver.absolutePath(properties.runtimeSettings().stateFilePath()));
         StatusStore statusStore = new FileStatusStore(PathResolver.absolutePath(properties.runtimeSettings().statusFilePath()));
+        FillStore fillStore = new SqliteFillStore(PathResolver.absolutePath(properties.runtimeSettings().fillsDbPath()));
         WorkingOrderRegistry workingOrderRegistry = new WorkingOrderRegistry();
         RecoveryState recoveryState = new RecoveryBootstrap(stateStore).restore(engine, strategyLedger);
         workingOrderRegistry.replaceAll(recoveryState.trackedWorkingOrders());
@@ -61,6 +66,7 @@ public class GridApplication {
                 !properties.bybitSdkConfig().apiKey().isBlank() && !properties.bybitSdkConfig().apiSecret().isBlank()
         );
         workingOrderRegistry.replaceAll(reconciliationService.reconcile(config.symbol(), workingOrderRegistry.snapshot()));
+        repairFilledWorkingOrders(config.symbol(), fillStore, workingOrderRegistry);
         RuntimeConsistencyResult consistencyResult = new ActivePairConsistencyService()
                 .reconcile(engine.runtimeState(), workingOrderRegistry.snapshot());
         if (consistencyResult.corrected()) {
@@ -104,11 +110,17 @@ public class GridApplication {
         LiveControlService liveControlService = new LiveControlService(
                 properties,
                 sdkClientFactory,
+                marketDataGateway,
+                engine,
+                strategyLedger,
+                processedExecutionIds,
                 runtimeStatusProvider,
                 eventLogger,
                 alertService,
                 stateStore,
-                statusStore
+                statusStore,
+                workingOrderRegistry,
+                fillStore
         );
         new RuntimeStatusPublisher(
                 config.symbol(),
@@ -149,6 +161,7 @@ public class GridApplication {
                     engine,
                     strategyLedger,
                     new LiveCommandExecutor(tradeGateway, workingOrderRegistry, new RiskGuardService(config), eventLogger, alertService),
+                    new BybitSdkOrderQueryGateway(sdkClientFactory, config.category()),
                     stateStore,
                     workingOrderRegistry,
                     processedExecutionIds,
@@ -170,5 +183,18 @@ public class GridApplication {
                 Thread.currentThread().interrupt();
             }
         }
+    }
+
+    private static void repairFilledWorkingOrders(String symbol, FillStore fillStore, WorkingOrderRegistry workingOrderRegistry) {
+        Collection<String> openClientOrderIds = workingOrderRegistry.snapshot().stream()
+                .filter(order -> order.status() == com.btcgrid.common.model.OrderStatus.NEW)
+                .map(order -> order.clientOrderId())
+                .collect(Collectors.toSet());
+        Set<String> filledClientOrderIds = fillStore.filledClientOrderIds(symbol, openClientOrderIds);
+        if (filledClientOrderIds.isEmpty()) {
+            return;
+        }
+        Instant now = Instant.now();
+        filledClientOrderIds.forEach(clientOrderId -> workingOrderRegistry.markFilled(clientOrderId, now));
     }
 }

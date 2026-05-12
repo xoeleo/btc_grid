@@ -48,6 +48,22 @@ class ActivePairConsistencyServiceTest {
         assertNull(result.runtimeState().activeOrderPair());
     }
 
+    @Test
+    void resetsOpeningFirstPositionWhenNoOrderIsOpen() {
+        ActivePairConsistencyService service = new ActivePairConsistencyService();
+        StrategyRuntimeState runtimeState = new StrategyRuntimeState(
+                GridState.OPENING_FIRST_POSITION,
+                null,
+                Instant.now()
+        );
+
+        RuntimeConsistencyResult result = service.reconcile(runtimeState, List.of(canceledMarketOrder("INIT-1")));
+
+        assertTrue(result.corrected());
+        assertEquals(GridState.INIT, result.runtimeState().state());
+        assertNull(result.runtimeState().activeOrderPair());
+    }
+
     private StrategyRuntimeState runtimeState() {
         return new StrategyRuntimeState(
                 GridState.GRID_ACTIVE,
@@ -72,6 +88,22 @@ class ActivePairConsistencyServiceTest {
                 new BigDecimal("0.01"),
                 false,
                 OrderStatus.NEW,
+                Instant.now(),
+                Instant.now()
+        );
+    }
+
+    private WorkingOrder canceledMarketOrder(String clientOrderId) {
+        return new WorkingOrder(
+                "BTCUSDT",
+                clientOrderId,
+                null,
+                TradeSide.BUY,
+                OrderType.MARKET,
+                null,
+                new BigDecimal("0.01"),
+                false,
+                OrderStatus.CANCELED,
                 Instant.now(),
                 Instant.now()
         );

@@ -1,6 +1,7 @@
 package com.btcgrid.ledger.service;
 
 import com.btcgrid.common.model.BandZone;
+import com.btcgrid.common.model.ClientOrderIds;
 import com.btcgrid.common.model.FillEvent;
 import com.btcgrid.common.model.InventoryMode;
 import com.btcgrid.common.model.MarketSnapshot;
@@ -72,7 +73,7 @@ public class InMemoryStrategyLedger implements StrategyLedger {
 
     @Override
     public synchronized void applyFill(FillEvent fillEvent) {
-        boolean initialFill = fillEvent.clientOrderId() != null && fillEvent.clientOrderId().contains("_INIT_");
+        boolean initialFill = ClientOrderIds.isInitialPositionOrder(fillEvent.clientOrderId());
         BigDecimal signedQty = fillEvent.side() == TradeSide.BUY ? fillEvent.fillQty() : fillEvent.fillQty().negate();
         BigDecimal newNetQty = netQty.add(signedQty, MATH_CONTEXT);
 
@@ -130,7 +131,7 @@ public class InMemoryStrategyLedger implements StrategyLedger {
         if (netQty.signum() == 0) {
             floatingPnl = BigDecimal.ZERO;
         } else {
-            BigDecimal pnlPerUnit = marketSnapshot.lastPrice().subtract(avgEntryPrice, MATH_CONTEXT);
+            BigDecimal pnlPerUnit = marketSnapshot.markPrice().subtract(avgEntryPrice, MATH_CONTEXT);
             floatingPnl = netQty.multiply(pnlPerUnit, MATH_CONTEXT);
         }
         lastFillZone = marketSnapshot.indicators().zoneOf(lastFillPrice.signum() == 0 ? marketSnapshot.lastPrice() : lastFillPrice);

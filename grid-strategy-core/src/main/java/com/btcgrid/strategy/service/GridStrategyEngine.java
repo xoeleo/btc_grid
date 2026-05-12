@@ -166,23 +166,49 @@ public class GridStrategyEngine {
         boolean boostReduceSide = shouldBoostReduceSide(marketSnapshot.indicators(), marketSnapshot, ledgerSnapshot);
 
         if (runtimeState.state() == GridState.OPENING_FIRST_POSITION) {
+            if (manualStartMode && ledgerSnapshot.netQty().signum() != 0) {
+                BigDecimal referencePrice = ledgerSnapshot.lastFillPrice().signum() == 0
+                        ? fillEvent.fillPrice()
+                        : ledgerSnapshot.lastFillPrice();
+                OrderPairPlan firstPair = orderPlanner.planPairedOrders(
+                        config,
+                        instrumentSpec,
+                        marketSnapshot,
+                        ledgerSnapshot,
+                        referencePrice,
+                        null,
+                        boostReduceSide,
+                        "manual-grid"
+                );
+                if (firstPair != null) {
+                    addPlaceCommands(commands, firstPair);
+                    activeSpacing = plannedSpacing(firstPair, referencePrice);
+                    runtimeState = new StrategyRuntimeState(
+                            GridState.GRID_ACTIVE,
+                            new ActiveOrderPair(UUID.randomUUID().toString(), firstPair.buyOrder(), firstPair.sellOrder(), marketSnapshot.timestamp()),
+                            runtimeState.lastTriggerTime()
+                    );
+                    return commands;
+                }
+            }
             runtimeState = runtimeState.withState(GridState.WAITING_TRIGGER);
             return commands;
         }
 
         ActiveOrderPair pair = runtimeState.activeOrderPair();
+        if (ledgerSnapshot.netQty().signum() == 0) {
+            cancelActivePair(commands, pair, fillEvent.clientOrderId(), "cycle-end");
+            runtimeState = new StrategyRuntimeState(
+                    GridState.INIT,
+                    null,
+                    runtimeState.lastTriggerTime()
+            );
+            return commands;
+        }
         if (pair != null && pair.contains(fillEvent.clientOrderId())) {
             OrderIntent opposite = pair.oppositeOf(fillEvent.clientOrderId());
             if (opposite != null) {
                 commands.add(StrategyCommand.cancel(opposite.symbol(), opposite.clientOrderId(), "pair-opposite-filled"));
-            }
-            if (ledgerSnapshot.netQty().signum() == 0) {
-                runtimeState = new StrategyRuntimeState(
-                        GridState.INIT,
-                        null,
-                        runtimeState.lastTriggerTime()
-                );
-                return commands;
             }
             OrderPairPlan nextPair = orderPlanner.planPairedOrders(
                     config,
@@ -209,6 +235,73 @@ public class GridStrategyEngine {
                         runtimeState.lastTriggerTime()
                 );
             }
+        }
+
+        return commands;
+    }
+
+    private void cancelActivePair(List<StrategyCommand> commands, ActiveOrderPair pair, String filledClientOrderId, String reason) {
+        if (pair == null) {
+            return;
+        }
+        addCancelIfDifferent(commands, pair.buyOrder(), filledClientOrderId, reason);
+        addCancelIfDifferent(commands, pair.sellOrder(), filledClientOrderId, reason);
+    }
+
+    private void addCancelIfDifferent(List<StrategyCommand> commands, OrderIntent order, String filledClientOrderId, String reason) {
+        if (order != null && !order.clientOrderId().equals(filledClientOrderId)) {
+            commands.add(StrategyCommand.cancel(order.symbol(), order.clientOrderId(), reason));
+        }
+    }
+
+    public List<StrategyCommand> replanActivePair(
+            MarketSnapshot marketSnapshot,
+            Set<String> activeClientOrderIds,
+            String reason
+    ) {
+        strategyLedger.markToMarket(marketSnapshot);
+        StrategyLedgerSnapshot ledgerSnapshot = strategyLedger.snapshot();
+        List<StrategyCommand> commands = new ArrayList<>();
+        ActiveOrderPair pair = runtimeState.activeOrderPair();
+        if (runtimeState.state() != GridState.GRID_ACTIVE || pair == null || ledgerSnapshot.netQty().signum() == 0) {
+            return commands;
+        }
+
+        if (pair.buyOrder() != null && activeClientOrderIds.contains(pair.buyOrder().clientOrderId())) {
+            commands.add(StrategyCommand.cancel(pair.buyOrder().symbol(), pair.buyOrder().clientOrderId(), reason));
+        }
+        if (pair.sellOrder() != null && activeClientOrderIds.contains(pair.sellOrder().clientOrderId())) {
+            commands.add(StrategyCommand.cancel(pair.sellOrder().symbol(), pair.sellOrder().clientOrderId(), reason));
+        }
+
+        boolean boostReduceSide = shouldBoostReduceSide(marketSnapshot.indicators(), marketSnapshot, ledgerSnapshot);
+        BigDecimal referencePrice = ledgerSnapshot.lastFillPrice().signum() == 0
+                ? marketSnapshot.lastPrice()
+                : ledgerSnapshot.lastFillPrice();
+        OrderPairPlan replan = orderPlanner.planPairedOrders(
+                config,
+                instrumentSpec,
+                marketSnapshot,
+                ledgerSnapshot,
+                referencePrice,
+                activeSpacing,
+                boostReduceSide,
+                reason
+        );
+        if (replan != null) {
+            addPlaceCommands(commands, replan);
+            activeSpacing = plannedSpacing(replan, referencePrice);
+            runtimeState = new StrategyRuntimeState(
+                    GridState.GRID_ACTIVE,
+                    new ActiveOrderPair(UUID.randomUUID().toString(), replan.buyOrder(), replan.sellOrder(), marketSnapshot.timestamp()),
+                    runtimeState.lastTriggerTime()
+            );
+        } else {
+            runtimeState = new StrategyRuntimeState(
+                    GridState.WAITING_TRIGGER,
+                    null,
+                    runtimeState.lastTriggerTime()
+            );
         }
 
         return commands;

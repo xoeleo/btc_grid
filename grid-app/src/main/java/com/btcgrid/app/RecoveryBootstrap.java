@@ -26,6 +26,9 @@ public class RecoveryBootstrap {
             GridStrategyEngine strategyEngine,
             StrategyLedger strategyLedger
     ) {
+        if (!strategyEngine.config().symbol().equals(snapshot.ledgerSnapshot().symbol())) {
+            return new RecoveryState(ConcurrentHashMap.newKeySet(), List.of());
+        }
         strategyLedger.restore(snapshot.ledgerSnapshot());
         strategyEngine.restore(snapshot.runtimeState(), snapshot.activeSpacing());
         Set<String> executionIds = ConcurrentHashMap.newKeySet();

@@ -8,13 +8,31 @@ public record InstrumentSpec(
         BigDecimal qtyStep,
         BigDecimal minOrderQty,
         BigDecimal priceTick,
-        BigDecimal minPrice
+        BigDecimal minPrice,
+        BigDecimal minNotionalValue
 ) {
+    public InstrumentSpec(
+            String symbol,
+            BigDecimal qtyStep,
+            BigDecimal minOrderQty,
+            BigDecimal priceTick,
+            BigDecimal minPrice
+    ) {
+        this(symbol, qtyStep, minOrderQty, priceTick, minPrice, BigDecimal.ZERO);
+    }
+
     public BigDecimal roundQty(BigDecimal qty) {
         if (qtyStep.signum() <= 0) {
             return qty;
         }
         return qty.divide(qtyStep, 0, RoundingMode.HALF_UP).multiply(qtyStep);
+    }
+
+    public BigDecimal roundQtyUp(BigDecimal qty) {
+        if (qtyStep.signum() <= 0) {
+            return qty;
+        }
+        return qty.divide(qtyStep, 0, RoundingMode.CEILING).multiply(qtyStep);
     }
 
     public BigDecimal normalizeQty(BigDecimal qty) {

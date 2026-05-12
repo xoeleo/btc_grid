@@ -48,9 +48,19 @@ public class WorkingOrderRegistry {
                 existing.withStatus(OrderStatus.CANCELED, now, existing.exchangeOrderId()));
     }
 
+    public void markAccepted(String clientOrderId, String exchangeOrderId, Instant now) {
+        ordersByClientId.computeIfPresent(clientOrderId, (key, existing) ->
+                existing.withStatus(existing.status(), now, exchangeOrderId));
+    }
+
     public void markExpired(String clientOrderId, Instant now) {
         ordersByClientId.computeIfPresent(clientOrderId, (key, existing) ->
                 existing.withStatus(OrderStatus.EXPIRED, now, existing.exchangeOrderId()));
+    }
+
+    public void markFilled(String clientOrderId, Instant now) {
+        ordersByClientId.computeIfPresent(clientOrderId, (key, existing) ->
+                existing.withStatus(OrderStatus.FILLED, now, existing.exchangeOrderId()));
     }
 
     public void applyUpdate(OrderUpdateEvent event) {

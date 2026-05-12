@@ -19,6 +19,9 @@ public class ActivePairConsistencyService {
 
         ActiveOrderPair activePair = runtimeState.activeOrderPair();
         if (activePair == null) {
+            if (runtimeState.state() == GridState.OPENING_FIRST_POSITION && noOpenOrders(trackedWorkingOrders)) {
+                return new RuntimeConsistencyResult(StrategyRuntimeState.initial(), true);
+            }
             if (runtimeState.state() == GridState.GRID_ACTIVE || runtimeState.state() == GridState.REQUOTE) {
                 return new RuntimeConsistencyResult(runtimeState.withState(GridState.WAITING_TRIGGER), true);
             }
@@ -47,5 +50,9 @@ public class ActivePairConsistencyService {
 
     private boolean isOpen(WorkingOrder order) {
         return order != null && order.status() == OrderStatus.NEW;
+    }
+
+    private boolean noOpenOrders(Collection<WorkingOrder> orders) {
+        return orders == null || orders.stream().noneMatch(this::isOpen);
     }
 }
