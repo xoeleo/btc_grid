@@ -5,8 +5,18 @@ import java.util.UUID;
 
 public class ClientOrderIdFactory {
 
+    private final String prefix;
+
+    public ClientOrderIdFactory() {
+        this("GRID");
+    }
+
+    public ClientOrderIdFactory(String prefix) {
+        this.prefix = prefix == null || prefix.isBlank() ? "GRID" : prefix.trim();
+    }
+
     public String next(String symbol, String reason) {
-        return "GRID_" + symbol + "_" + shortReason(reason) + "_"
+        return prefix + "_" + symbol + "_" + shortReason(reason) + "_"
                 + Long.toString(Instant.now().toEpochMilli(), 36) + "_"
                 + UUID.randomUUID().toString().substring(0, 6);
     }

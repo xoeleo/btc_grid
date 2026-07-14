@@ -12,11 +12,25 @@ public interface FillStore {
 
     List<FillRecord> recent(int limit);
 
+    List<FillRecord> recent(String symbol, int limit);
+
+    List<FillRecord> recent(String symbol, int limit, int offset);
+
+    List<FillRecord> recentTrading(String symbol, int limit, int offset);
+
     List<FillRecord> recentCycles(int limit);
+
+    List<FillRecord> recentCycles(String symbol, int limit);
+
+    List<FillRecord> recentCycles(String symbol, int limit, int offset);
 
     List<FillRecord> cycleFills(String cycleExecutionId);
 
+    List<FillRecord> currentCycleFills(String symbol);
+
     CurrentCycleSummary currentCycle(String symbol, Instant now, BigDecimal markPrice);
+
+    CurrentCycleSummary latestOpenCycle(Instant now, BigDecimal markPrice);
 
     FillRecord latestTradingFill(String symbol);
 

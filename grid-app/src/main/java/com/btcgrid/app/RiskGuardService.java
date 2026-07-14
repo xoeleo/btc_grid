@@ -34,6 +34,10 @@ public class RiskGuardService {
 
             TradeSide side = command.orderIntent().side();
             BigDecimal nextNetQty = simulatedNetQty.add(side == TradeSide.BUY ? qty : qty.negate());
+            if (config.entryDirection().isSpotLongOnly() && nextNetQty.signum() < 0) {
+                decisions.add(RiskDecision.block(command, "spot-sell-exceeds-inventory"));
+                continue;
+            }
             if (!command.orderIntent().reduceOnly() && nextNetQty.abs().compareTo(config.maxInventoryQty()) > 0) {
                 decisions.add(RiskDecision.block(command, "net-inventory-exceeds-max"));
                 continue;

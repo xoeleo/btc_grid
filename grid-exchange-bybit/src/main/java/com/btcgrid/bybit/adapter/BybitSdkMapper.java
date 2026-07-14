@@ -37,17 +37,20 @@ public final class BybitSdkMapper {
                 .side(orderIntent.side() == TradeSide.BUY ? Side.BUY : Side.SELL)
                 .orderType(orderIntent.type() == OrderType.MARKET ? TradeOrderType.MARKET : TradeOrderType.LIMIT)
                 .qty(orderIntent.qty().stripTrailingZeros().toPlainString())
-                .orderLinkId(orderIntent.clientOrderId())
-                .reduceOnly(orderIntent.reduceOnly());
+                .orderLinkId(orderIntent.clientOrderId());
 
         if (category == ProductCategory.LINEAR || category == ProductCategory.INVERSE) {
-            builder.positionIdx(PositionIdx.ONE_WAY_MODE);
+            builder.positionIdx(PositionIdx.ONE_WAY_MODE)
+                    .reduceOnly(orderIntent.reduceOnly());
         }
         if (orderIntent.type() == OrderType.LIMIT) {
             builder.price(orderIntent.price().stripTrailingZeros().toPlainString())
                     .timeInForce(TimeInForce.GOOD_TILL_CANCEL);
         } else {
             builder.timeInForce(TimeInForce.IMMEDIATE_OR_CANCEL);
+            if (category == ProductCategory.SPOT && orderIntent.side() == TradeSide.BUY) {
+                builder.marketUnit("baseCoin");
+            }
         }
         return builder.build();
     }

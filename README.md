@@ -33,9 +33,14 @@ Java multi-module implementation of a Bybit perpetual grid system centered on:
 
 ## Runtime Files
 
-- `runtime/grid-state.json`: persisted runtime state for recovery
-- `runtime/grid-status.json`: latest runtime status snapshot
-- `runtime/grid-events.log`: structured event log
+- `runtime/demo/grid-state.json`: persisted demo runtime state for recovery
+- `runtime/demo/grid-status.json`: latest demo runtime status snapshot
+- `runtime/demo/grid-events.log`: structured demo event log
+- `runtime/demo/grid-fills.sqlite`: demo fills and cycle history
+- `runtime/mainnet/...`: mainnet runtime files, isolated from demo history
+
+The default runtime paths in `application.properties` are resolved by environment:
+`bybit.demo=true` uses `runtime/demo`, `bybit.testnet=true` uses `runtime/testnet`, and otherwise the app uses `runtime/mainnet`.
 
 ## Local Run
 

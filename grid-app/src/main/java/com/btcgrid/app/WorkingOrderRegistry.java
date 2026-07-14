@@ -25,7 +25,8 @@ public class WorkingOrderRegistry {
                 intent.reduceOnly(),
                 OrderStatus.NEW,
                 now,
-                now
+                now,
+                intent.reason()
         ));
     }
 

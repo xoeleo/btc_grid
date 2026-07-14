@@ -74,20 +74,21 @@ public class InMemoryStrategyLedger implements StrategyLedger {
     @Override
     public synchronized void applyFill(FillEvent fillEvent) {
         boolean initialFill = ClientOrderIds.isInitialPositionOrder(fillEvent.clientOrderId());
-        BigDecimal signedQty = fillEvent.side() == TradeSide.BUY ? fillEvent.fillQty() : fillEvent.fillQty().negate();
+        BigDecimal signedQty = fillEvent.netQtyDelta();
+        BigDecimal fillAbsQty = signedQty.abs();
         BigDecimal newNetQty = netQty.add(signedQty, MATH_CONTEXT);
 
         if (netQty.signum() == 0 || Integer.signum(netQty.signum()) == Integer.signum(signedQty.signum())) {
             BigDecimal currentNotional = avgEntryPrice.multiply(netQty.abs(), MATH_CONTEXT);
             BigDecimal fillNotional = fillEvent.fillPrice().multiply(fillEvent.fillQty(), MATH_CONTEXT);
-            BigDecimal newAbsQty = netQty.abs().add(fillEvent.fillQty(), MATH_CONTEXT);
+            BigDecimal newAbsQty = netQty.abs().add(fillAbsQty, MATH_CONTEXT);
             if (newAbsQty.signum() > 0) {
                 avgEntryPrice = currentNotional.add(fillNotional, MATH_CONTEXT).divide(newAbsQty, MATH_CONTEXT);
             } else {
                 avgEntryPrice = BigDecimal.ZERO;
             }
         } else {
-            BigDecimal closedQty = fillEvent.fillQty().min(netQty.abs());
+            BigDecimal closedQty = fillAbsQty.min(netQty.abs());
             BigDecimal pnlPerUnit = fillEvent.side() == TradeSide.BUY
                     ? avgEntryPrice.subtract(fillEvent.fillPrice(), MATH_CONTEXT)
                     : fillEvent.fillPrice().subtract(avgEntryPrice, MATH_CONTEXT);

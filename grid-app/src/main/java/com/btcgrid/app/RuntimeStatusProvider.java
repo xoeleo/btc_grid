@@ -1,6 +1,7 @@
 package com.btcgrid.app;
 
 import com.btcgrid.common.model.MarketSnapshot;
+import com.btcgrid.common.model.WorkingOrder;
 import com.btcgrid.ledger.service.StrategyLedger;
 import com.btcgrid.strategy.service.GridStrategyEngine;
 import java.time.Instant;
@@ -41,7 +42,13 @@ public class RuntimeStatusProvider {
                 strategyLedger.snapshot(),
                 latestMarketSnapshot.get(),
                 processedExecutionIds.size(),
-                List.copyOf(workingOrderRegistry.snapshot())
+                workingOrderRegistry.snapshot().stream()
+                        .filter(order -> order != null && isStatusSymbol(order))
+                        .toList()
         );
+    }
+
+    private boolean isStatusSymbol(WorkingOrder order) {
+        return order.symbol() != null && order.symbol().equalsIgnoreCase(symbol);
     }
 }

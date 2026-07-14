@@ -53,6 +53,27 @@ class InMemoryStrategyLedgerTest {
         assertEquals(0, flatSnapshot.consecutiveSellFills());
     }
 
+    @Test
+    void baseCurrencyFeeReducesSpotBuyInventory() {
+        InMemoryStrategyLedger ledger = new InMemoryStrategyLedger("SOLUSDT");
+
+        ledger.applyFill(new FillEvent(
+                "exec-1",
+                "SOLUSDT",
+                "GRID_SOLUSDT_I_1",
+                TradeSide.BUY,
+                new BigDecimal("0.0619"),
+                new BigDecimal("80.73"),
+                Instant.parse("2026-01-01T00:00:00Z"),
+                new BigDecimal("4.997187"),
+                new BigDecimal("0.0000619"),
+                "SOL"
+        ));
+
+        StrategyLedgerSnapshot snapshot = ledger.snapshot();
+        assertEquals(new BigDecimal("0.0618381"), snapshot.netQty());
+    }
+
     private FillEvent fill(String clientOrderId, TradeSide side, String qty, String price, Instant time) {
         return new FillEvent(
                 clientOrderId + "-exec",

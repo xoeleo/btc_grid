@@ -14,7 +14,9 @@ import com.btcgrid.common.model.ProductCategory;
 import com.btcgrid.common.model.StrategyCommand;
 import com.btcgrid.common.model.StrategyCommandType;
 import com.btcgrid.common.model.TradeSide;
+import com.btcgrid.ledger.model.StrategyLedgerSnapshot;
 import com.btcgrid.ledger.service.InMemoryStrategyLedger;
+import com.btcgrid.strategy.model.StrategyRuntimeState;
 import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
@@ -60,6 +62,44 @@ class GridStrategyEngineTest {
         assertEquals(OrderType.LIMIT, gridCommands.get(1).orderIntent().type());
         assertEquals("manual-grid|buy", gridCommands.get(0).reason());
         assertEquals("manual-grid|sell", gridCommands.get(1).reason());
+        assertEquals(GridState.GRID_ACTIVE, engine.runtimeState().state());
+    }
+
+    @Test
+    void manualStartWithRestoredInventoryPlacesGridWithoutInitialMarketBuy() {
+        InMemoryStrategyLedger ledger = new InMemoryStrategyLedger("BTCUSDT");
+        ledger.restore(new StrategyLedgerSnapshot(
+                "BTCUSDT",
+                new BigDecimal("0.050"),
+                new BigDecimal("100"),
+                BigDecimal.ZERO,
+                BigDecimal.ZERO,
+                BigDecimal.ZERO,
+                new BigDecimal("100"),
+                TradeSide.BUY,
+                com.btcgrid.common.model.BandZone.INSIDE_BAND,
+                0,
+                0,
+                com.btcgrid.common.model.InventoryMode.NORMAL,
+                Instant.parse("2026-01-01T00:00:00Z")
+        ));
+        GridStrategyEngine engine = new GridStrategyEngine(
+                config(),
+                instrument(),
+                ledger,
+                new GridTriggerEvaluator(),
+                new GridOrderPlanner(new ClientOrderIdFactory()),
+                true
+        );
+        engine.restoreRuntimeState(new StrategyRuntimeState(GridState.WAITING_TRIGGER, null, Instant.EPOCH));
+
+        List<StrategyCommand> commands = engine.onMarket(market());
+
+        assertEquals(2, commands.size());
+        assertEquals(OrderType.LIMIT, commands.get(0).orderIntent().type());
+        assertEquals(OrderType.LIMIT, commands.get(1).orderIntent().type());
+        assertEquals("manual-grid|buy", commands.get(0).reason());
+        assertEquals("manual-grid|sell", commands.get(1).reason());
         assertEquals(GridState.GRID_ACTIVE, engine.runtimeState().state());
     }
 

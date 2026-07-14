@@ -15,10 +15,13 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
 
 public class BybitSdkMarketDataGateway implements BybitMarketDataGateway {
 
     private static final long FOUR_HOUR_MILLIS = 4L * 60L * 60L * 1000L;
+    private static final long ONE_HOUR_MILLIS = 60L * 60L * 1000L;
 
     private final BybitSdkClientFactory clientFactory;
     private final ProductCategory category;
@@ -91,24 +94,95 @@ public class BybitSdkMarketDataGateway implements BybitMarketDataGateway {
     }
 
     private List<Candle> loadFourHourCandles(BybitApiMarketRestClient marketClient, String symbol) {
-        int limit = Math.max(emaLength4h, bollLength4h) + 20;
+        int requiredFourHourCandles = Math.max(emaLength4h, bollLength4h) + 20;
+        RuntimeException fourHourFailure = null;
+        try {
+            List<Candle> fourHourCandles = loadCandles(marketClient, symbol, MarketInterval.FOUR_HOURLY, requiredFourHourCandles, FOUR_HOUR_MILLIS);
+            if (!fourHourCandles.isEmpty()) {
+                return fourHourCandles;
+            }
+        } catch (RuntimeException e) {
+            fourHourFailure = e;
+        }
+        List<Candle> hourlyCandles = loadCandles(marketClient, symbol, MarketInterval.HOURLY, requiredFourHourCandles * 4, ONE_HOUR_MILLIS);
+        List<Candle> aggregated = aggregateFourHourCandles(symbol, hourlyCandles);
+        if (aggregated.isEmpty()) {
+            IllegalStateException exception = new IllegalStateException("No kline data returned for symbol " + symbol + " on 4H or 1H intervals");
+            if (fourHourFailure != null) {
+                exception.addSuppressed(fourHourFailure);
+            }
+            throw exception;
+        }
+        return aggregated;
+    }
+
+    private List<Candle> loadCandles(
+            BybitApiMarketRestClient marketClient,
+            String symbol,
+            MarketInterval interval,
+            int limit,
+            long intervalMillis
+    ) {
         JsonNode klineRoot = objectMapper.valueToTree(marketClient.getMarketLinesData(
                 MarketDataRequest.builder()
                         .category(BybitSdkMapper.toCategory(category))
                         .symbol(symbol)
-                        .marketInterval(MarketInterval.FOUR_HOURLY)
+                        .marketInterval(interval)
                         .limit(limit)
                         .build()
         ));
         JsonNode klineList = klineRoot.path("result").path("list");
         if (!klineList.isArray()) {
-            throw new IllegalStateException("No kline data returned for symbol " + symbol);
+            throw new IllegalStateException("No kline data returned for symbol " + symbol
+                    + " interval=" + interval.getIntervalId()
+                    + " response=" + klineRoot);
         }
         List<Candle> candles = new ArrayList<>();
         for (JsonNode klineNode : klineList) {
-            candles.add(BybitSdkMapper.toCandle(symbol, klineNode, FOUR_HOUR_MILLIS));
+            candles.add(BybitSdkMapper.toCandle(symbol, klineNode, intervalMillis));
         }
         candles.sort(Comparator.comparing(Candle::openTime));
         return candles;
+    }
+
+    private List<Candle> aggregateFourHourCandles(String symbol, List<Candle> hourlyCandles) {
+        Map<Long, List<Candle>> grouped = new TreeMap<>();
+        for (Candle candle : hourlyCandles) {
+            long bucket = (candle.openTime().toEpochMilli() / FOUR_HOUR_MILLIS) * FOUR_HOUR_MILLIS;
+            grouped.computeIfAbsent(bucket, ignored -> new ArrayList<>()).add(candle);
+        }
+
+        List<Candle> aggregated = new ArrayList<>();
+        for (Map.Entry<Long, List<Candle>> entry : grouped.entrySet()) {
+            List<Candle> group = entry.getValue();
+            if (group.size() < 4) {
+                continue;
+            }
+            group.sort(Comparator.comparing(Candle::openTime));
+            Candle first = group.get(0);
+            Candle last = group.get(group.size() - 1);
+            BigDecimal high = group.stream()
+                    .map(Candle::high)
+                    .max(Comparator.naturalOrder())
+                    .orElse(first.high());
+            BigDecimal low = group.stream()
+                    .map(Candle::low)
+                    .min(Comparator.naturalOrder())
+                    .orElse(first.low());
+            BigDecimal volume = group.stream()
+                    .map(Candle::volume)
+                    .reduce(BigDecimal.ZERO, BigDecimal::add);
+            aggregated.add(new Candle(
+                    symbol,
+                    Instant.ofEpochMilli(entry.getKey()),
+                    last.closeTime(),
+                    first.open(),
+                    high,
+                    low,
+                    last.close(),
+                    volume
+            ));
+        }
+        return aggregated;
     }
 }

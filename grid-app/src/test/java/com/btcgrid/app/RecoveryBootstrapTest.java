@@ -51,7 +51,8 @@ class RecoveryBootstrapTest {
                         com.btcgrid.common.model.OrderStatus.NEW,
                         Instant.now(),
                         Instant.now()
-                ))
+                )),
+                engineConfig()
         ));
 
         StrategyLedger strategyLedger = new InMemoryStrategyLedger("BTCUSDT");
@@ -83,7 +84,18 @@ class RecoveryBootstrapTest {
     }
 
     private GridStrategyEngine engine(StrategyLedger strategyLedger) {
-        GridStrategyConfig config = new GridStrategyConfig(
+        GridStrategyConfig config = engineConfig();
+        return new GridStrategyEngine(
+                config,
+                new InstrumentSpec("BTCUSDT", new BigDecimal("0.001"), new BigDecimal("0.001"), new BigDecimal("0.1"), new BigDecimal("0.1")),
+                strategyLedger,
+                new GridTriggerEvaluator(),
+                new GridOrderPlanner(new ClientOrderIdFactory())
+        );
+    }
+
+    private GridStrategyConfig engineConfig() {
+        return new GridStrategyConfig(
                 ProductCategory.LINEAR,
                 "BTCUSDT",
                 EntryDirection.BOTH,
@@ -104,13 +116,6 @@ class RecoveryBootstrapTest {
                 false,
                 Duration.ofMinutes(15),
                 Duration.ofMinutes(5)
-        );
-        return new GridStrategyEngine(
-                config,
-                new InstrumentSpec("BTCUSDT", new BigDecimal("0.001"), new BigDecimal("0.001"), new BigDecimal("0.1"), new BigDecimal("0.1")),
-                strategyLedger,
-                new GridTriggerEvaluator(),
-                new GridOrderPlanner(new ClientOrderIdFactory())
         );
     }
 }

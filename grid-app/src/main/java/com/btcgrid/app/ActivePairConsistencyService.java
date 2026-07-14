@@ -31,10 +31,14 @@ public class ActivePairConsistencyService {
         Map<String, WorkingOrder> byClientOrderId = trackedWorkingOrders.stream()
                 .collect(Collectors.toMap(WorkingOrder::clientOrderId, Function.identity(), (left, right) -> right));
 
-        WorkingOrder buy = byClientOrderId.get(activePair.buyOrder().clientOrderId());
-        WorkingOrder sell = byClientOrderId.get(activePair.sellOrder().clientOrderId());
-        boolean buyOpen = isOpen(buy);
-        boolean sellOpen = isOpen(sell);
+        WorkingOrder buy = activePair.buyOrder() == null
+                ? null
+                : byClientOrderId.get(activePair.buyOrder().clientOrderId());
+        WorkingOrder sell = activePair.sellOrder() == null
+                ? null
+                : byClientOrderId.get(activePair.sellOrder().clientOrderId());
+        boolean buyOpen = activePair.buyOrder() == null || isOpen(buy);
+        boolean sellOpen = activePair.sellOrder() == null || isOpen(sell);
 
         if (buyOpen && sellOpen) {
             return new RuntimeConsistencyResult(runtimeState, false);

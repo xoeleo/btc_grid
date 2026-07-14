@@ -35,6 +35,13 @@ public record InstrumentSpec(
         return qty.divide(qtyStep, 0, RoundingMode.CEILING).multiply(qtyStep);
     }
 
+    public BigDecimal roundQtyDown(BigDecimal qty) {
+        if (qtyStep.signum() <= 0) {
+            return qty;
+        }
+        return qty.divide(qtyStep, 0, RoundingMode.DOWN).multiply(qtyStep);
+    }
+
     public BigDecimal normalizeQty(BigDecimal qty) {
         BigDecimal rounded = roundQty(qty);
         return rounded.compareTo(minOrderQty) < 0 ? minOrderQty : rounded;

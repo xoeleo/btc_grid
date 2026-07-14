@@ -8,3 +8,6 @@ runtime/
 *.log
 *.tmp
 *.bak
+test-results/
+local_108_migration/
+ff7c789-grid-startup-runtime-safeguards.patch

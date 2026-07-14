@@ -83,7 +83,7 @@ public class GridStrategyEngine {
                     return commands;
                 }
                 if ((manualStartMode || triggerEvaluator.canActivate(marketSnapshot, ledgerSnapshot))
-                        && marketSnapshot.timestamp().isAfter(runtimeState.lastTriggerTime().plus(config.triggerCooldown()))) {
+                        && (manualStartMode || marketSnapshot.timestamp().isAfter(runtimeState.lastTriggerTime().plus(config.triggerCooldown())))) {
                     String pairReason = manualStartMode ? "manual-grid" : activationReason(marketSnapshot, ledgerSnapshot);
                     OrderPairPlan pairPlan = orderPlanner.planPairedOrders(
                             config,
@@ -307,6 +307,45 @@ public class GridStrategyEngine {
         return commands;
     }
 
+    public List<StrategyCommand> recoverPairFromLastFill(MarketSnapshot marketSnapshot, String reason) {
+        strategyLedger.markToMarket(marketSnapshot);
+        StrategyLedgerSnapshot ledgerSnapshot = strategyLedger.snapshot();
+        if (ledgerSnapshot.netQty().signum() == 0
+                || runtimeState.activeOrderPair() != null
+                || runtimeState.state() == GridState.GRID_ACTIVE
+                || ledgerSnapshot.lastFillPrice().signum() == 0) {
+            return List.of();
+        }
+        boolean boostReduceSide = shouldBoostReduceSide(marketSnapshot.indicators(), marketSnapshot, ledgerSnapshot);
+        OrderPairPlan recoveryPlan = orderPlanner.planPairedOrders(
+                config,
+                instrumentSpec,
+                marketSnapshot,
+                ledgerSnapshot,
+                ledgerSnapshot.lastFillPrice(),
+                null,
+                boostReduceSide,
+                reason
+        );
+        if (recoveryPlan == null) {
+            runtimeState = new StrategyRuntimeState(
+                    GridState.WAITING_TRIGGER,
+                    null,
+                    runtimeState.lastTriggerTime()
+            );
+            return List.of();
+        }
+        List<StrategyCommand> commands = new ArrayList<>();
+        addPlaceCommands(commands, recoveryPlan);
+        activeSpacing = plannedSpacing(recoveryPlan, ledgerSnapshot.lastFillPrice());
+        runtimeState = new StrategyRuntimeState(
+                GridState.GRID_ACTIVE,
+                new ActiveOrderPair(UUID.randomUUID().toString(), recoveryPlan.buyOrder(), recoveryPlan.sellOrder(), marketSnapshot.timestamp()),
+                runtimeState.lastTriggerTime()
+        );
+        return commands;
+    }
+
     public StrategyRuntimeState runtimeState() {
         return runtimeState;
     }
@@ -353,7 +392,8 @@ public class GridStrategyEngine {
                 runtimeState,
                 activeSpacing,
                 processedExecutionIds,
-                List.of()
+                List.of(),
+                config
         );
     }
 

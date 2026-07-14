@@ -13,6 +13,6 @@ public final class ClientOrderIds {
             return true;
         }
         String[] parts = clientOrderId.split("_", 4);
-        return parts.length >= 3 && "GRID".equals(parts[0]) && "I".equals(parts[2]);
+        return parts.length >= 3 && ("GRID".equals(parts[0]) || "RBAL".equals(parts[0])) && "I".equals(parts[2]);
     }
 }

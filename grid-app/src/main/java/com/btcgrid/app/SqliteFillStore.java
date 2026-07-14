@@ -1,6 +1,10 @@
 package com.btcgrid.app;
 
 import com.btcgrid.common.model.ClientOrderIds;
+import com.btcgrid.common.model.FillEvent;
+import com.btcgrid.common.model.TradeSide;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import java.math.MathContext;
 import java.math.BigDecimal;
 import java.nio.file.Files;
@@ -17,11 +21,15 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 public class SqliteFillStore implements FillStore {
 
     private static final MathContext MATH_CONTEXT = MathContext.DECIMAL64;
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+    private static final TypeReference<Map<String, Object>> MAP_TYPE = new TypeReference<>() {
+    };
 
     private final String jdbcUrl;
 
@@ -45,8 +53,8 @@ public class SqliteFillStore implements FillStore {
                   execution_id, fill_time_millis, symbol, side, qty, price,
                   value, fee, fee_currency, cumulative_qty, cumulative_value, cumulative_fee,
                   net_qty, avg_entry_price, realized_pnl, floating_pnl_at_fill,
-                  total_pnl_at_fill, client_order_id
-                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  total_pnl_at_fill, client_order_id, config_json
+                ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """;
         try (Connection connection = connect();
              PreparedStatement statement = connection.prepareStatement(sql)) {
@@ -68,9 +76,29 @@ public class SqliteFillStore implements FillStore {
             statement.setString(16, text(record.floatingPnlAtFill()));
             statement.setString(17, text(record.totalPnlAtFill()));
             statement.setString(18, record.clientOrderId());
+            statement.setString(19, record.configJson());
             statement.executeUpdate();
+            fillMissingConfigJson(connection, executionId(record), record.configJson());
+            backfillDerivedColumns(connection, record.symbol());
         } catch (SQLException e) {
             throw new IllegalStateException("Failed to save fill record", e);
+        }
+    }
+
+    private void fillMissingConfigJson(Connection connection, String executionId, String configJson) throws SQLException {
+        if (executionId == null || executionId.isBlank() || configJson == null || configJson.isBlank()) {
+            return;
+        }
+        String sql = """
+                update fills
+                   set config_json = ?
+                 where execution_id = ?
+                   and (config_json is null or config_json = '')
+                """;
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setString(1, configJson);
+            statement.setString(2, executionId);
+            statement.executeUpdate();
         }
     }
 
@@ -80,7 +108,7 @@ public class SqliteFillStore implements FillStore {
                 select execution_id, fill_time_millis, symbol, side, qty, price,
                        value, fee, fee_currency, cumulative_qty, cumulative_value, cumulative_fee,
                        net_qty, avg_entry_price, realized_pnl, floating_pnl_at_fill,
-                       total_pnl_at_fill, client_order_id
+                       total_pnl_at_fill, client_order_id, config_json
                   from fills
                  order by fill_time_millis desc, rowid desc
                  limit ?
@@ -101,18 +129,129 @@ public class SqliteFillStore implements FillStore {
     }
 
     @Override
+    public synchronized List<FillRecord> recent(String symbol, int limit) {
+        return recent(symbol, limit, 0);
+    }
+
+    @Override
+    public synchronized List<FillRecord> recent(String symbol, int limit, int offset) {
+        if (symbol == null || symbol.isBlank()) {
+            return List.of();
+        }
+        String sql = """
+                select execution_id, fill_time_millis, symbol, side, qty, price,
+                       value, fee, fee_currency, cumulative_qty, cumulative_value, cumulative_fee,
+                       net_qty, avg_entry_price, realized_pnl, floating_pnl_at_fill,
+                       total_pnl_at_fill, client_order_id, config_json
+                 from fills
+                 where symbol = ?
+                 order by fill_time_millis desc, rowid desc
+                 limit ?
+                offset ?
+                """;
+        List<FillRecord> records = new ArrayList<>();
+        try (Connection connection = connect();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setString(1, symbol.trim().toUpperCase());
+            statement.setInt(2, Math.max(1, limit));
+            statement.setInt(3, Math.max(0, offset));
+            try (ResultSet rs = statement.executeQuery()) {
+                while (rs.next()) {
+                    records.add(record(rs));
+                }
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to read fill records", e);
+        }
+        return records;
+    }
+
+    @Override
+    public synchronized List<FillRecord> recentTrading(String symbol, int limit, int offset) {
+        if (symbol == null || symbol.isBlank()) {
+            return List.of();
+        }
+        String sql = """
+                select execution_id, fill_time_millis, symbol, side, qty, price,
+                       value, fee, fee_currency, cumulative_qty, cumulative_value, cumulative_fee,
+                       net_qty, avg_entry_price, realized_pnl, floating_pnl_at_fill,
+                       total_pnl_at_fill, client_order_id, config_json
+                  from fills
+                 where symbol = ?
+                   and side in ('BUY', 'SELL', 'FUNDING_FEE')
+                 order by fill_time_millis desc, rowid desc
+                 limit ?
+                offset ?
+                """;
+        List<FillRecord> records = new ArrayList<>();
+        try (Connection connection = connect();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setString(1, symbol.trim().toUpperCase());
+            statement.setInt(2, Math.max(1, limit));
+            statement.setInt(3, Math.max(0, offset));
+            try (ResultSet rs = statement.executeQuery()) {
+                while (rs.next()) {
+                    records.add(record(rs));
+                }
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to read trading fill records", e);
+        }
+        return records;
+    }
+
+    @Override
     public synchronized List<FillRecord> recentCycles(int limit) {
         String sql = """
                 select execution_id, fill_time_millis, symbol, side, qty, price,
                        value, fee, fee_currency, cumulative_qty, cumulative_value, cumulative_fee,
                        net_qty, avg_entry_price, realized_pnl, floating_pnl_at_fill,
-                       total_pnl_at_fill, client_order_id
+                       total_pnl_at_fill, client_order_id, config_json
                   from fills
                  where side = 'CYCLE_END'
                  order by fill_time_millis desc, rowid desc
                  limit ?
                 """;
         return query(sql, Math.max(1, limit));
+    }
+
+    @Override
+    public synchronized List<FillRecord> recentCycles(String symbol, int limit) {
+        return recentCycles(symbol, limit, 0);
+    }
+
+    @Override
+    public synchronized List<FillRecord> recentCycles(String symbol, int limit, int offset) {
+        if (symbol == null || symbol.isBlank()) {
+            return List.of();
+        }
+        String sql = """
+                select execution_id, fill_time_millis, symbol, side, qty, price,
+                       value, fee, fee_currency, cumulative_qty, cumulative_value, cumulative_fee,
+                       net_qty, avg_entry_price, realized_pnl, floating_pnl_at_fill,
+                       total_pnl_at_fill, client_order_id, config_json
+                  from fills
+                 where side = 'CYCLE_END'
+                   and symbol = ?
+                 order by fill_time_millis desc, rowid desc
+                 limit ?
+                offset ?
+                """;
+        List<FillRecord> records = new ArrayList<>();
+        try (Connection connection = connect();
+             PreparedStatement statement = connection.prepareStatement(sql)) {
+            statement.setString(1, symbol.trim().toUpperCase());
+            statement.setInt(2, Math.max(1, limit));
+            statement.setInt(3, Math.max(0, offset));
+            try (ResultSet rs = statement.executeQuery()) {
+                while (rs.next()) {
+                    records.add(record(rs));
+                }
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to read cycle records", e);
+        }
+        return records;
     }
 
     @Override
@@ -128,14 +267,15 @@ public class SqliteFillStore implements FillStore {
                 select execution_id, fill_time_millis, symbol, side, qty, price,
                        value, fee, fee_currency, cumulative_qty, cumulative_value, cumulative_fee,
                        net_qty, avg_entry_price, realized_pnl, floating_pnl_at_fill,
-                       total_pnl_at_fill, client_order_id
+                       total_pnl_at_fill, client_order_id, config_json
                   from fills
-                 where side in ('BUY', 'SELL')
+                 where side in ('BUY', 'SELL', 'FUNDING_FEE')
                    and symbol = ?
                    and fill_time_millis < ?
                  order by fill_time_millis desc, rowid desc
                 """;
         List<FillRecord> fills = new ArrayList<>();
+        String initialClientOrderId = null;
         try (Connection connection = connect();
              PreparedStatement statement = connection.prepareStatement(sql)) {
             statement.setString(1, cycleEnd.symbol());
@@ -143,9 +283,12 @@ public class SqliteFillStore implements FillStore {
             try (ResultSet rs = statement.executeQuery()) {
                 while (rs.next()) {
                     FillRecord record = record(rs);
-                    fills.add(record);
-                    if (ClientOrderIds.isInitialPositionOrder(record.clientOrderId())) {
+                    if (initialClientOrderId != null && !initialClientOrderId.equals(record.clientOrderId())) {
                         break;
+                    }
+                    fills.add(record);
+                    if (initialClientOrderId == null && ClientOrderIds.isInitialPositionOrder(record.clientOrderId())) {
+                        initialClientOrderId = record.clientOrderId();
                     }
                 }
             }
@@ -157,41 +300,93 @@ public class SqliteFillStore implements FillStore {
     }
 
     @Override
-    public synchronized CurrentCycleSummary currentCycle(String symbol, Instant now, BigDecimal markPrice) {
+    public synchronized List<FillRecord> currentCycleFills(String symbol) {
         if (symbol == null || symbol.isBlank()) {
-            return null;
+            return List.of();
         }
         String sql = """
                 select execution_id, fill_time_millis, symbol, side, qty, price,
                        value, fee, fee_currency, cumulative_qty, cumulative_value, cumulative_fee,
                        net_qty, avg_entry_price, realized_pnl, floating_pnl_at_fill,
-                       total_pnl_at_fill, client_order_id
+                       total_pnl_at_fill, client_order_id, config_json
                   from fills
-                 where side in ('BUY', 'SELL')
+                 where side in ('BUY', 'SELL', 'FUNDING_FEE')
                    and symbol = ?
+                   and fill_time_millis > coalesce((
+                         select max(fill_time_millis)
+                           from fills
+                          where symbol = ?
+                            and side = 'CYCLE_END'
+                       ), 0)
                  order by fill_time_millis desc, rowid desc
                 """;
-        List<FillRecord> cycleFills = new ArrayList<>();
+        List<FillRecord> fills = new ArrayList<>();
+        String initialClientOrderId = null;
         try (Connection connection = connect();
              PreparedStatement statement = connection.prepareStatement(sql)) {
-            statement.setString(1, symbol.trim().toUpperCase());
+            String normalizedSymbol = symbol.trim().toUpperCase();
+            statement.setString(1, normalizedSymbol);
+            statement.setString(2, normalizedSymbol);
             try (ResultSet rs = statement.executeQuery()) {
                 while (rs.next()) {
                     FillRecord record = record(rs);
-                    cycleFills.add(record);
-                    if (ClientOrderIds.isInitialPositionOrder(record.clientOrderId())) {
+                    if (initialClientOrderId != null && !initialClientOrderId.equals(record.clientOrderId())) {
                         break;
+                    }
+                    fills.add(record);
+                    if (initialClientOrderId == null && ClientOrderIds.isInitialPositionOrder(record.clientOrderId())) {
+                        initialClientOrderId = record.clientOrderId();
                     }
                 }
             }
         } catch (SQLException e) {
-            throw new IllegalStateException("Failed to read current cycle", e);
+            throw new IllegalStateException("Failed to read current cycle fills", e);
         }
-        if (cycleFills.isEmpty() || !ClientOrderIds.isInitialPositionOrder(cycleFills.get(cycleFills.size() - 1).clientOrderId())) {
+        if (fills.isEmpty() || !ClientOrderIds.isInitialPositionOrder(fills.get(fills.size() - 1).clientOrderId())) {
+            return List.of();
+        }
+        Collections.reverse(fills);
+        return fills;
+    }
+
+    @Override
+    public synchronized CurrentCycleSummary currentCycle(String symbol, Instant now, BigDecimal markPrice) {
+        if (symbol == null || symbol.isBlank()) {
             return null;
         }
-        Collections.reverse(cycleFills);
+        List<FillRecord> cycleFills = currentCycleFills(symbol);
+        if (cycleFills.isEmpty()) {
+            return null;
+        }
         return summarizeCycle(cycleFills, now == null ? Instant.now() : now, markPrice);
+    }
+
+    @Override
+    public synchronized CurrentCycleSummary latestOpenCycle(Instant now, BigDecimal markPrice) {
+        String sql = """
+                select symbol
+                  from fills
+                 where side in ('BUY', 'SELL')
+                 group by symbol
+                 order by max(fill_time_millis) desc
+                """;
+        List<String> symbols = new ArrayList<>();
+        try (Connection connection = connect();
+             PreparedStatement statement = connection.prepareStatement(sql);
+             ResultSet rs = statement.executeQuery()) {
+            while (rs.next()) {
+                symbols.add(rs.getString("symbol"));
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to read current cycle symbols", e);
+        }
+        for (String symbol : symbols) {
+            CurrentCycleSummary summary = currentCycle(symbol, now, markPrice);
+            if (summary != null && summary.cumulativeQty() != null && summary.cumulativeQty().signum() != 0) {
+                return summary;
+            }
+        }
+        return null;
     }
 
     private FillRecord cycleEnd(String cycleExecutionId) {
@@ -199,7 +394,7 @@ public class SqliteFillStore implements FillStore {
                 select execution_id, fill_time_millis, symbol, side, qty, price,
                        value, fee, fee_currency, cumulative_qty, cumulative_value, cumulative_fee,
                        net_qty, avg_entry_price, realized_pnl, floating_pnl_at_fill,
-                       total_pnl_at_fill, client_order_id
+                       total_pnl_at_fill, client_order_id, config_json
                   from fills
                  where side = 'CYCLE_END'
                    and (execution_id = ? or client_order_id = ?)
@@ -224,7 +419,7 @@ public class SqliteFillStore implements FillStore {
                 select execution_id, fill_time_millis, symbol, side, qty, price,
                        value, fee, fee_currency, cumulative_qty, cumulative_value, cumulative_fee,
                        net_qty, avg_entry_price, realized_pnl, floating_pnl_at_fill,
-                       total_pnl_at_fill, client_order_id
+                       total_pnl_at_fill, client_order_id, config_json
                   from fills
                  where side in ('BUY', 'SELL')
                    and symbol = ?
@@ -283,7 +478,10 @@ public class SqliteFillStore implements FillStore {
     private CurrentCycleSummary summarizeCycle(List<FillRecord> fills, Instant now, BigDecimal markPrice) {
         BigDecimal cumulativeQty = BigDecimal.ZERO;
         BigDecimal cumulativeValue = BigDecimal.ZERO;
-        BigDecimal cumulativeFee = BigDecimal.ZERO;
+        BigDecimal cumulativeTradingFee = BigDecimal.ZERO;
+        BigDecimal cumulativeFundingFee = BigDecimal.ZERO;
+        BigDecimal profitableReduceQty = BigDecimal.ZERO;
+        BigDecimal profitReduceBoostExtraQty = BigDecimal.ZERO;
         BigDecimal buyQty = BigDecimal.ZERO;
         BigDecimal sellQty = BigDecimal.ZERO;
         int buyCount = 0;
@@ -296,27 +494,45 @@ public class SqliteFillStore implements FillStore {
                     ? qty.multiply(fill.price(), MATH_CONTEXT)
                     : fill.value();
             BigDecimal fee = fill.fee() == null ? BigDecimal.ZERO : fill.fee();
+            BigDecimal beforeQty = cumulativeQty;
+            BigDecimal netQtyDelta = netQtyDelta(fill.symbol(), fill.side(), qty, fee, fill.feeCurrency());
             if ("BUY".equals(fill.side())) {
                 buyCount++;
                 buyQty = buyQty.add(qty, MATH_CONTEXT);
-                cumulativeQty = cumulativeQty.add(qty, MATH_CONTEXT);
+                cumulativeQty = cumulativeQty.add(netQtyDelta, MATH_CONTEXT);
                 cumulativeValue = cumulativeValue.add(value, MATH_CONTEXT);
+                cumulativeTradingFee = cumulativeTradingFee.add(fee, MATH_CONTEXT);
+                if (beforeQty.signum() < 0 && isPositive(fill.totalPnlAtFill())) {
+                    profitableReduceQty = profitableReduceQty.add(qty, MATH_CONTEXT);
+                }
             } else if ("SELL".equals(fill.side())) {
                 sellCount++;
                 sellQty = sellQty.add(qty, MATH_CONTEXT);
-                cumulativeQty = cumulativeQty.subtract(qty, MATH_CONTEXT);
+                cumulativeQty = cumulativeQty.add(netQtyDelta, MATH_CONTEXT);
                 cumulativeValue = cumulativeValue.subtract(value, MATH_CONTEXT);
+                cumulativeTradingFee = cumulativeTradingFee.add(fee, MATH_CONTEXT);
+                if (beforeQty.signum() > 0 && isPositive(fill.totalPnlAtFill())) {
+                    profitableReduceQty = profitableReduceQty.add(qty, MATH_CONTEXT);
+                }
+            } else if ("FUNDING_FEE".equals(fill.side())) {
+                cumulativeFundingFee = cumulativeFundingFee.add(fee, MATH_CONTEXT);
             }
-            cumulativeFee = cumulativeFee.add(fee, MATH_CONTEXT);
+            BigDecimal boostExtraQty = metadataDecimal(fill, "profitReduceBoostExtraQty");
+            if (boostExtraQty != null) {
+                profitReduceBoostExtraQty = profitReduceBoostExtraQty.add(boostExtraQty, MATH_CONTEXT);
+            }
         }
         if (latest == null) {
             return null;
         }
+        BigDecimal cumulativeFee = cumulativeTradingFee.subtract(cumulativeFundingFee, MATH_CONTEXT);
         BigDecimal latestFillPrice = latest.price();
         BigDecimal fillPricePnl = cumulativeProfit(cumulativeQty, cumulativeValue, cumulativeFee, latestFillPrice);
         BigDecimal marketPrice = markPrice == null || markPrice.signum() == 0 ? latestFillPrice : markPrice;
         BigDecimal markPricePnl = cumulativeProfit(cumulativeQty, cumulativeValue, cumulativeFee, marketPrice);
         String entryDirection = "BUY".equals(fills.get(0).side()) ? "LONG" : "SHORT";
+        BigDecimal startRatio = metadataDecimal(fills.get(0), "startRatio");
+        BigDecimal startPrice = fills.get(0).price();
         Instant startedAt = fills.get(0).time();
         long durationSeconds = Math.max(0L, now.getEpochSecond() - startedAt.getEpochSecond());
         return new CurrentCycleSummary(
@@ -333,12 +549,37 @@ public class SqliteFillStore implements FillStore {
                 cumulativeQty,
                 cumulativeValue,
                 cumulativeFee,
+                cumulativeTradingFee,
+                cumulativeFundingFee,
+                profitableReduceQty,
+                profitReduceBoostExtraQty,
+                startRatio,
+                startPrice,
                 latestFillPrice,
                 marketPrice,
                 entryDirection,
                 fillPricePnl,
                 markPricePnl
         );
+    }
+
+    private boolean isPositive(BigDecimal value) {
+        return value != null && value.signum() > 0;
+    }
+
+    private BigDecimal metadataDecimal(FillRecord fill, String key) {
+        if (fill == null || fill.configJson() == null || fill.configJson().isBlank()) {
+            return null;
+        }
+        try {
+            Object value = OBJECT_MAPPER.readValue(fill.configJson(), MAP_TYPE).get(key);
+            if (value == null) {
+                return null;
+            }
+            return new BigDecimal(String.valueOf(value));
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     private BigDecimal cumulativeProfit(
@@ -394,7 +635,13 @@ public class SqliteFillStore implements FillStore {
             ensureColumn(connection, "cumulative_qty", "text not null default '0'");
             ensureColumn(connection, "cumulative_value", "text not null default '0'");
             ensureColumn(connection, "cumulative_fee", "text not null default '0'");
+            ensureColumn(connection, "config_json", "text");
             statement.execute("create index if not exists idx_fills_time on fills(fill_time_millis desc)");
+            statement.execute("""
+                    create unique index if not exists idx_funding_fee_once
+                      on fills(symbol, side, fill_time_millis)
+                     where side = 'FUNDING_FEE'
+                    """);
             backfillDerivedColumns(connection);
         } catch (SQLException e) {
             throw new IllegalStateException("Failed to initialize fill database", e);
@@ -417,24 +664,33 @@ public class SqliteFillStore implements FillStore {
     }
 
     private void backfillDerivedColumns(Connection connection) throws SQLException {
+        backfillDerivedColumns(connection, null);
+    }
+
+    private void backfillDerivedColumns(Connection connection, String targetSymbol) throws SQLException {
         String selectSql = """
-                select rowid, symbol, side, qty, price, fee, client_order_id
+                select rowid, symbol, side, qty, price, fee, fee_currency, client_order_id
                   from fills
+                 %s
                  order by symbol asc, fill_time_millis asc, rowid asc
-                """;
+                """.formatted(targetSymbol == null || targetSymbol.isBlank() ? "" : "where symbol = ?");
         String updateSql = """
                 update fills
                    set value = ?, cumulative_qty = ?, cumulative_value = ?, cumulative_fee = ?,
-                       floating_pnl_at_fill = ?, total_pnl_at_fill = ?
+                       net_qty = ?, floating_pnl_at_fill = ?, total_pnl_at_fill = ?
                  where rowid = ?
                 """;
         BigDecimal cumulativeQty = BigDecimal.ZERO;
         BigDecimal cumulativeValue = BigDecimal.ZERO;
         BigDecimal cumulativeFee = BigDecimal.ZERO;
         String currentSymbol = null;
+        String currentInitialClientOrderId = null;
         try (PreparedStatement select = connection.prepareStatement(selectSql);
-             ResultSet rs = select.executeQuery();
              PreparedStatement update = connection.prepareStatement(updateSql)) {
+            if (targetSymbol != null && !targetSymbol.isBlank()) {
+                select.setString(1, targetSymbol.trim().toUpperCase());
+            }
+            try (ResultSet rs = select.executeQuery()) {
             while (rs.next()) {
                 String symbol = rs.getString("symbol");
                 if (!symbol.equals(currentSymbol)) {
@@ -442,36 +698,45 @@ public class SqliteFillStore implements FillStore {
                     cumulativeQty = BigDecimal.ZERO;
                     cumulativeValue = BigDecimal.ZERO;
                     cumulativeFee = BigDecimal.ZERO;
+                    currentInitialClientOrderId = null;
                 }
                 String side = rs.getString("side");
                 String clientOrderId = rs.getString("client_order_id");
-                if (ClientOrderIds.isInitialPositionOrder(clientOrderId)) {
+                if (ClientOrderIds.isInitialPositionOrder(clientOrderId)
+                        && !clientOrderId.equals(currentInitialClientOrderId)) {
                     cumulativeQty = BigDecimal.ZERO;
                     cumulativeValue = BigDecimal.ZERO;
                     cumulativeFee = BigDecimal.ZERO;
+                    currentInitialClientOrderId = clientOrderId;
                 }
                 BigDecimal qty = decimal(rs.getString("qty"));
                 BigDecimal price = decimal(rs.getString("price"));
                 BigDecimal value = "CYCLE_END".equals(side) ? BigDecimal.ZERO : qty.multiply(price);
                 BigDecimal fee = decimal(rs.getString("fee"));
+                String feeCurrency = rs.getString("fee_currency");
+                BigDecimal netQtyDelta = netQtyDelta(symbol, side, qty, fee, feeCurrency);
                 if ("BUY".equals(side)) {
-                    cumulativeQty = cumulativeQty.add(qty);
+                    cumulativeQty = cumulativeQty.add(netQtyDelta);
                     cumulativeValue = cumulativeValue.add(value);
                     cumulativeFee = cumulativeFee.add(fee);
                 } else if ("SELL".equals(side)) {
-                    cumulativeQty = cumulativeQty.subtract(qty);
+                    cumulativeQty = cumulativeQty.add(netQtyDelta);
                     cumulativeValue = cumulativeValue.subtract(value);
                     cumulativeFee = cumulativeFee.add(fee);
+                } else if ("FUNDING_FEE".equals(side)) {
+                    cumulativeFee = cumulativeFee.subtract(fee);
                 }
                 BigDecimal profit = cumulativeQty.multiply(price).subtract(cumulativeValue).subtract(cumulativeFee);
                 update.setString(1, text(value));
                 update.setString(2, text(cumulativeQty));
                 update.setString(3, text(cumulativeValue));
                 update.setString(4, text(cumulativeFee));
-                update.setString(5, text(profit));
+                update.setString(5, text(cumulativeQty));
                 update.setString(6, text(profit));
-                update.setLong(7, rs.getLong("rowid"));
+                update.setString(7, text(profit));
+                update.setLong(8, rs.getLong("rowid"));
                 update.addBatch();
+            }
             }
             update.executeBatch();
         }
@@ -496,7 +761,8 @@ public class SqliteFillStore implements FillStore {
                 decimal(rs.getString("floating_pnl_at_fill")),
                 decimal(rs.getString("total_pnl_at_fill")),
                 rs.getString("client_order_id"),
-                rs.getString("execution_id")
+                rs.getString("execution_id"),
+                rs.getString("config_json")
         );
     }
 
@@ -517,6 +783,25 @@ public class SqliteFillStore implements FillStore {
 
     private static String text(BigDecimal value) {
         return value == null ? "0" : value.stripTrailingZeros().toPlainString();
+    }
+
+    private static BigDecimal netQtyDelta(String symbol, String side, BigDecimal qty, BigDecimal fee, String feeCurrency) {
+        if (!"BUY".equals(side) && !"SELL".equals(side)) {
+            return BigDecimal.ZERO;
+        }
+        TradeSide tradeSide = "BUY".equals(side) ? TradeSide.BUY : TradeSide.SELL;
+        return new FillEvent(
+                "",
+                symbol,
+                "",
+                tradeSide,
+                qty == null ? BigDecimal.ZERO : qty,
+                BigDecimal.ZERO,
+                Instant.EPOCH,
+                BigDecimal.ZERO,
+                fee == null ? BigDecimal.ZERO : fee,
+                feeCurrency
+        ).netQtyDelta();
     }
 
     private static BigDecimal decimal(String value) {

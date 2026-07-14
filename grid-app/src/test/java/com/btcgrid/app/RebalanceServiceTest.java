@@ -1,0 +1,964 @@
+package com.btcgrid.app;
+
+import com.btcgrid.bybit.adapter.BybitOrderSubmission;
+import com.btcgrid.bybit.adapter.BybitSdkMarketDataGateway;
+import com.btcgrid.bybit.adapter.BybitTradeGateway;
+import com.btcgrid.common.indicator.IndicatorCalculator;
+import com.btcgrid.common.model.AccountAssetSnapshot;
+import com.btcgrid.common.model.FillEvent;
+import com.btcgrid.common.model.IndicatorSnapshot;
+import com.btcgrid.common.model.InstrumentSpec;
+import com.btcgrid.common.model.MarketSnapshot;
+import com.btcgrid.common.model.OrderIntent;
+import com.btcgrid.common.model.OrderStatus;
+import com.btcgrid.common.model.OrderType;
+import com.btcgrid.common.model.ProductCategory;
+import com.btcgrid.common.model.TradeSide;
+import com.btcgrid.common.model.WorkingOrder;
+import java.math.BigDecimal;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import org.junit.jupiter.api.Test;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+class RebalanceServiceTest {
+
+    @Test
+    void placesBuyOrderWhenBtcRatioIsBelowPriceBandTarget() throws Exception {
+        Path stateFile = Files.createTempFile("rebalance-state", ".json");
+        WorkingOrderRegistry registry = new WorkingOrderRegistry();
+        RecordingTradeGateway tradeGateway = new RecordingTradeGateway();
+        RebalanceService service = new RebalanceService(
+                new RebalanceSettings(
+                        true,
+                        ProductCategory.LINEAR,
+                        "BTCUSDT",
+                        "UNIFIED",
+                        "BTC",
+                        "USDT",
+                        List.of(
+                                new RebalanceBand(BigDecimal.ZERO, new BigDecimal("0.70")),
+                                new RebalanceBand(new BigDecimal("100000"), new BigDecimal("0.50"))
+                        ),
+                        new BigDecimal("0.01"),
+                        new BigDecimal("0.001"),
+                        new BigDecimal("0.85"),
+                        new BigDecimal("0.010"),
+                        new BigDecimal("5"),
+                        new BigDecimal("0.100"),
+                        new BigDecimal("1.0"),
+                        new BigDecimal("0.001"),
+                        new BigDecimal("0.001"),
+                        Duration.ofMinutes(15),
+                        1,
+                        "rebalance-config.properties",
+                        stateFile.toString()
+                ),
+                new FakeMarketDataGateway(new BigDecimal("110000")),
+                (accountType, baseCoin, quoteCoin, positionCategory, symbol) -> new AccountAssetSnapshot(
+                        Instant.now(),
+                        accountType,
+                        baseCoin,
+                        quoteCoin,
+                        new BigDecimal("0.30"),
+                        new BigDecimal("67000"),
+                        BigDecimal.ZERO,
+                        new BigDecimal("0.30"),
+                        new BigDecimal("100000")
+                ),
+                tradeGateway,
+                registry,
+                new FileRebalanceStateStore(stateFile),
+                new NoopEventLogger(),
+                new AlertService(new NoopEventLogger())
+        );
+
+        service.onPoll();
+
+        assertEquals(1, tradeGateway.submitted.size());
+        OrderIntent order = tradeGateway.submitted.get(0);
+        assertTrue(order.clientOrderId().startsWith(RebalanceService.CLIENT_ORDER_PREFIX));
+        assertEquals(TradeSide.BUY, order.side());
+        assertEquals(new BigDecimal("0.050"), order.qty());
+        assertTrue(order.isMarket());
+        RebalanceState saved = new FileRebalanceStateStore(stateFile).load().orElseThrow();
+        assertEquals("GRID_OPENING", saved.status());
+        assertEquals(new BigDecimal("0.50000000"), saved.targetRatio().setScale(8));
+        Files.deleteIfExists(stateFile);
+    }
+
+    @Test
+    void doesNotPlaceAnotherInitialOrderWhileRebalanceCycleIsActive() throws Exception {
+        Path stateFile = Files.createTempFile("rebalance-state", ".json");
+        new FileRebalanceStateStore(stateFile).save(new RebalanceState(
+                true,
+                "BTCUSDT",
+                "GRID_ACTIVE",
+                new BigDecimal("0.75"),
+                new BigDecimal("0.73"),
+                new BigDecimal("0.30"),
+                BigDecimal.ZERO,
+                new BigDecimal("0.30"),
+                new BigDecimal("100000"),
+                new BigDecimal("65000"),
+                null,
+                null,
+                null,
+                null,
+                List.of(new BigDecimal("0.73")),
+                Instant.now(),
+                "rebalance grid running"
+        ));
+        WorkingOrderRegistry registry = new WorkingOrderRegistry();
+        RecordingTradeGateway tradeGateway = new RecordingTradeGateway();
+        RebalanceService service = new RebalanceService(
+                new RebalanceSettings(
+                        true,
+                        ProductCategory.LINEAR,
+                        "BTCUSDT",
+                        "UNIFIED",
+                        "BTC",
+                        "USDT",
+                        List.of(
+                                new RebalanceBand(BigDecimal.ZERO, new BigDecimal("0.80")),
+                                new RebalanceBand(new BigDecimal("59000"), new BigDecimal("0.75")),
+                                new RebalanceBand(new BigDecimal("65000"), new BigDecimal("0.70"))
+                        ),
+                        new BigDecimal("0.01"),
+                        new BigDecimal("0.001"),
+                        new BigDecimal("0.85"),
+                        new BigDecimal("0.005"),
+                        new BigDecimal("5"),
+                        new BigDecimal("0.100"),
+                        new BigDecimal("1.0"),
+                        new BigDecimal("0.001"),
+                        new BigDecimal("0.001"),
+                        Duration.ofMinutes(15),
+                        1,
+                        "rebalance-config.properties",
+                        stateFile.toString()
+                ),
+                new FakeMarketDataGateway(new BigDecimal("64990")),
+                (accountType, baseCoin, quoteCoin, positionCategory, symbol) -> new AccountAssetSnapshot(
+                        Instant.now(),
+                        accountType,
+                        baseCoin,
+                        quoteCoin,
+                        new BigDecimal("0.30"),
+                        new BigDecimal("67500"),
+                        BigDecimal.ZERO,
+                        new BigDecimal("0.30"),
+                        new BigDecimal("100000")
+                ),
+                tradeGateway,
+                registry,
+                new FileRebalanceStateStore(stateFile),
+                new NoopEventLogger(),
+                new AlertService(new NoopEventLogger())
+        );
+
+        service.onPoll();
+
+        assertEquals(0, tradeGateway.submitted.size());
+        RebalanceState saved = new FileRebalanceStateStore(stateFile).load().orElseThrow();
+        assertEquals("GRID_ACTIVE", saved.status());
+        Files.deleteIfExists(stateFile);
+    }
+
+    @Test
+    void activeCycleUsesLockedTargetRatioWhenPriceMovesToAnotherBand() throws Exception {
+        Path stateFile = Files.createTempFile("rebalance-state", ".json");
+        new FileRebalanceStateStore(stateFile).save(new RebalanceState(
+                true,
+                "BTCUSDT",
+                "GRID_ACTIVE",
+                new BigDecimal("0.70"),
+                new BigDecimal("0.735"),
+                new BigDecimal("1.13251156"),
+                BigDecimal.ZERO,
+                new BigDecimal("1.13251156"),
+                new BigDecimal("100000"),
+                new BigDecimal("65100"),
+                TradeSide.SELL,
+                null,
+                null,
+                null,
+                List.of(new BigDecimal("0.735")),
+                Instant.now(),
+                "rebalance grid running"
+        ));
+        WorkingOrderRegistry registry = new WorkingOrderRegistry();
+        RecordingTradeGateway tradeGateway = new RecordingTradeGateway();
+        RebalanceService service = new RebalanceService(
+                new RebalanceSettings(
+                        true,
+                        ProductCategory.LINEAR,
+                        "BTCUSDT",
+                        "UNIFIED",
+                        "BTC",
+                        "USDT",
+                        List.of(
+                                new RebalanceBand(BigDecimal.ZERO, new BigDecimal("0.80")),
+                                new RebalanceBand(new BigDecimal("59000"), new BigDecimal("0.75")),
+                                new RebalanceBand(new BigDecimal("65000"), new BigDecimal("0.70"))
+                        ),
+                        new BigDecimal("0.01"),
+                        new BigDecimal("0.001"),
+                        new BigDecimal("0.85"),
+                        new BigDecimal("0.005"),
+                        new BigDecimal("5"),
+                        new BigDecimal("0.100"),
+                        new BigDecimal("1.0"),
+                        new BigDecimal("0.001"),
+                        new BigDecimal("0.001"),
+                        Duration.ofMinutes(15),
+                        1,
+                        "rebalance-config.properties",
+                        stateFile.toString()
+                ),
+                new FakeMarketDataGateway(new BigDecimal("64900")),
+                (accountType, baseCoin, quoteCoin, positionCategory, symbol) -> new AccountAssetSnapshot(
+                        Instant.now(),
+                        accountType,
+                        baseCoin,
+                        quoteCoin,
+                        new BigDecimal("1.13251156"),
+                        new BigDecimal("26499.99964"),
+                        BigDecimal.ZERO,
+                        new BigDecimal("1.13251156"),
+                        new BigDecimal("100000")
+                ),
+                tradeGateway,
+                registry,
+                new FileRebalanceStateStore(stateFile),
+                new NoopEventLogger(),
+                new AlertService(new NoopEventLogger())
+        );
+
+        service.onPoll();
+
+        RebalanceState saved = new FileRebalanceStateStore(stateFile).load().orElseThrow();
+        assertEquals("GRID_ACTIVE", saved.status());
+        assertEquals(new BigDecimal("0.70"), saved.targetRatio());
+        assertEquals(0, tradeGateway.submitted.size());
+        Files.deleteIfExists(stateFile);
+    }
+
+    @Test
+    void endedCycleDoesNotReuseLockedTargetForNextCycleBandSelection() throws Exception {
+        Path stateFile = Files.createTempFile("rebalance-state", ".json");
+        new FileRebalanceStateStore(stateFile).save(new RebalanceState(
+                true,
+                "BTCUSDT",
+                "IDLE",
+                new BigDecimal("0.70"),
+                new BigDecimal("0.752"),
+                new BigDecimal("1.0"),
+                BigDecimal.ZERO,
+                new BigDecimal("1.0"),
+                new BigDecimal("100000"),
+                new BigDecimal("64001"),
+                null,
+                null,
+                null,
+                null,
+                List.of(new BigDecimal("0.752")),
+                Instant.now(),
+                "rebalance grid position is flat; stopped"
+        ));
+        WorkingOrderRegistry registry = new WorkingOrderRegistry();
+        RecordingTradeGateway tradeGateway = new RecordingTradeGateway();
+        RebalanceService service = new RebalanceService(
+                new RebalanceSettings(
+                        true,
+                        ProductCategory.LINEAR,
+                        "BTCUSDT",
+                        "UNIFIED",
+                        "BTC",
+                        "USDT",
+                        List.of(
+                                new RebalanceBand(BigDecimal.ZERO, new BigDecimal("0.80")),
+                                new RebalanceBand(new BigDecimal("59000"), new BigDecimal("0.75")),
+                                new RebalanceBand(new BigDecimal("64000"), new BigDecimal("0.70"))
+                        ),
+                        new BigDecimal("0.01"),
+                        new BigDecimal("0.001"),
+                        new BigDecimal("0.85"),
+                        new BigDecimal("0.005"),
+                        new BigDecimal("5"),
+                        new BigDecimal("0.100"),
+                        new BigDecimal("1.0"),
+                        new BigDecimal("0.001"),
+                        new BigDecimal("0.001"),
+                        Duration.ofMinutes(15),
+                        1,
+                        "rebalance-config.properties",
+                        stateFile.toString()
+                ),
+                new FakeMarketDataGateway(new BigDecimal("63991.7")),
+                (accountType, baseCoin, quoteCoin, positionCategory, symbol) -> new AccountAssetSnapshot(
+                        Instant.now(),
+                        accountType,
+                        baseCoin,
+                        quoteCoin,
+                        new BigDecimal("1.1955"),
+                        BigDecimal.ZERO,
+                        BigDecimal.ZERO,
+                        new BigDecimal("1.1955"),
+                        new BigDecimal("100000")
+                ),
+                tradeGateway,
+                registry,
+                new FileRebalanceStateStore(stateFile),
+                new NoopEventLogger(),
+                new AlertService(new NoopEventLogger())
+        );
+
+        service.onPoll();
+
+        RebalanceState saved = new FileRebalanceStateStore(stateFile).load().orElseThrow();
+        assertEquals("GRID_OPENING", saved.status());
+        assertEquals(new BigDecimal("0.75"), saved.targetRatio());
+        assertEquals(TradeSide.SELL, tradeGateway.submitted.get(0).side());
+        Files.deleteIfExists(stateFile);
+    }
+
+    @Test
+    void shortCycleCrossingFlatDoesNotEndAsTargetReached() throws Exception {
+        Path stateFile = Files.createTempFile("rebalance-state", ".json");
+        WorkingOrderRegistry registry = new WorkingOrderRegistry();
+        RecordingTradeGateway tradeGateway = new RecordingTradeGateway();
+        List<String> cycleEndReasons = new ArrayList<>();
+        RebalanceService service = new RebalanceService(
+                new RebalanceSettings(
+                        true,
+                        ProductCategory.LINEAR,
+                        "BTCUSDT",
+                        "UNIFIED",
+                        "BTC",
+                        "USDT",
+                        List.of(
+                                new RebalanceBand(BigDecimal.ZERO, new BigDecimal("0.80")),
+                                new RebalanceBand(new BigDecimal("59000"), new BigDecimal("0.75")),
+                                new RebalanceBand(new BigDecimal("65000"), new BigDecimal("0.70"))
+                        ),
+                        new BigDecimal("0.01"),
+                        new BigDecimal("0.001"),
+                        new BigDecimal("0.85"),
+                        new BigDecimal("0.005"),
+                        new BigDecimal("5"),
+                        new BigDecimal("0.100"),
+                        new BigDecimal("1.0"),
+                        new BigDecimal("0.001"),
+                        new BigDecimal("0.001"),
+                        Duration.ofMinutes(15),
+                        1,
+                        "rebalance-config.properties",
+                        stateFile.toString()
+                ),
+                new FakeMarketDataGateway(new BigDecimal("64762.9")),
+                (accountType, baseCoin, quoteCoin, positionCategory, symbol) -> new AccountAssetSnapshot(
+                        Instant.now(),
+                        accountType,
+                        baseCoin,
+                        quoteCoin,
+                        new BigDecimal("1.137"),
+                        new BigDecimal("0.002"),
+                        BigDecimal.ZERO,
+                        new BigDecimal("1.139"),
+                        new BigDecimal("100000")
+                ),
+                tradeGateway,
+                registry,
+                new FileRebalanceStateStore(stateFile),
+                new NoopEventLogger(),
+                new AlertService(new NoopEventLogger()),
+                cycleEndReasons::add
+        );
+        service.restoreActiveCycle(
+                List.of(
+                        new FillRecord(
+                                Instant.now().minusSeconds(60),
+                                "RBAL:BTCUSDT",
+                                "SELL",
+                                new BigDecimal("0.003"),
+                                new BigDecimal("65102.7"),
+                                new BigDecimal("195.3081"),
+                                BigDecimal.ZERO,
+                                "USDT",
+                                new BigDecimal("-0.003"),
+                                new BigDecimal("-195.3081"),
+                                BigDecimal.ZERO,
+                                new BigDecimal("-0.003"),
+                                new BigDecimal("65102.7"),
+                                BigDecimal.ZERO,
+                                BigDecimal.ZERO,
+                                BigDecimal.ZERO,
+                                "RBAL_BTCUSDT_I_test",
+                                "initial-short"
+                        ),
+                        new FillRecord(
+                                Instant.now().minusSeconds(10),
+                                "RBAL:BTCUSDT",
+                                "BUY",
+                                new BigDecimal("0.005"),
+                                new BigDecimal("64762.9"),
+                                new BigDecimal("323.8145"),
+                                BigDecimal.ZERO,
+                                "USDT",
+                                new BigDecimal("0.002"),
+                                new BigDecimal("75.8833"),
+                                BigDecimal.ZERO,
+                                new BigDecimal("0.002"),
+                                new BigDecimal("37941.65"),
+                                BigDecimal.ZERO,
+                                BigDecimal.ZERO,
+                                BigDecimal.ZERO,
+                                "RBAL_BTCUSDT_PB_test",
+                                "flat-cross-buy"
+                        )
+                ),
+                List.of()
+        );
+
+        service.onPoll();
+
+        assertEquals(List.of("rebalance grid position crossed zero; stopped"), cycleEndReasons);
+        RebalanceState saved = new FileRebalanceStateStore(stateFile).load().orElseThrow();
+        assertEquals("IDLE", saved.status());
+        assertEquals("rebalance grid position crossed zero; stopped", saved.message());
+        Files.deleteIfExists(stateFile);
+    }
+
+    @Test
+    void activeLongCycleDoesNotStopUntilTargetRatioIsActuallyReached() throws Exception {
+        Path stateFile = Files.createTempFile("rebalance-state", ".json");
+        new FileRebalanceStateStore(stateFile).save(new RebalanceState(
+                true,
+                "BTCUSDT",
+                "GRID_ACTIVE",
+                new BigDecimal("0.75"),
+                new BigDecimal("0.745"),
+                new BigDecimal("1.10"),
+                new BigDecimal("0.025"),
+                new BigDecimal("1.125"),
+                new BigDecimal("100000"),
+                new BigDecimal("65000"),
+                TradeSide.BUY,
+                null,
+                null,
+                null,
+                List.of(new BigDecimal("0.745")),
+                Instant.now(),
+                "rebalance grid running"
+        ));
+        WorkingOrderRegistry registry = new WorkingOrderRegistry();
+        RecordingTradeGateway tradeGateway = new RecordingTradeGateway();
+        List<String> cycleEndReasons = new ArrayList<>();
+        RebalanceService service = new RebalanceService(
+                new RebalanceSettings(
+                        true,
+                        ProductCategory.LINEAR,
+                        "BTCUSDT",
+                        "UNIFIED",
+                        "BTC",
+                        "USDT",
+                        List.of(new RebalanceBand(BigDecimal.ZERO, new BigDecimal("0.75"))),
+                        new BigDecimal("0.01"),
+                        new BigDecimal("0.001"),
+                        new BigDecimal("0.85"),
+                        new BigDecimal("0.005"),
+                        new BigDecimal("5"),
+                        new BigDecimal("0.100"),
+                        new BigDecimal("1.0"),
+                        new BigDecimal("0.001"),
+                        new BigDecimal("0.001"),
+                        Duration.ofMinutes(15),
+                        1,
+                        "rebalance-config.properties",
+                        stateFile.toString()
+                ),
+                new FakeMarketDataGateway(new BigDecimal("65000")),
+                (accountType, baseCoin, quoteCoin, positionCategory, symbol) -> new AccountAssetSnapshot(
+                        Instant.now(),
+                        accountType,
+                        baseCoin,
+                        quoteCoin,
+                        new BigDecimal("1.10"),
+                        new BigDecimal("0.04615385"),
+                        BigDecimal.ZERO,
+                        new BigDecimal("1.14615385"),
+                        new BigDecimal("100000")
+                ),
+                tradeGateway,
+                registry,
+                new FileRebalanceStateStore(stateFile),
+                new NoopEventLogger(),
+                new AlertService(new NoopEventLogger()),
+                cycleEndReasons::add
+        );
+        service.restoreActiveCycle(
+                List.of(new FillRecord(
+                        Instant.now().minusSeconds(30),
+                        "RBAL:BTCUSDT",
+                        "BUY",
+                        new BigDecimal("0.025"),
+                        new BigDecimal("64774.4"),
+                        new BigDecimal("1619.36"),
+                        BigDecimal.ZERO,
+                        "USDT",
+                        new BigDecimal("0.025"),
+                        new BigDecimal("1619.36"),
+                        BigDecimal.ZERO,
+                        new BigDecimal("0.025"),
+                        new BigDecimal("64774.4"),
+                        BigDecimal.ZERO,
+                        BigDecimal.ZERO,
+                        BigDecimal.ZERO,
+                        "RBAL_BTCUSDT_I_test",
+                        "initial-long"
+                )),
+                List.of()
+        );
+
+        service.onPoll();
+
+        assertTrue(cycleEndReasons.isEmpty());
+        RebalanceState saved = new FileRebalanceStateStore(stateFile).load().orElseThrow();
+        assertEquals("GRID_ACTIVE", saved.status());
+        Files.deleteIfExists(stateFile);
+    }
+
+    @Test
+    void recoveredCycleClosingFillStopsImmediatelyAndCancelsActiveOrders() throws Exception {
+        Path stateFile = Files.createTempFile("rebalance-state", ".json");
+        WorkingOrderRegistry registry = new WorkingOrderRegistry();
+        RecordingTradeGateway tradeGateway = new RecordingTradeGateway();
+        List<String> cycleEndReasons = new ArrayList<>();
+        RebalanceService service = new RebalanceService(
+                new RebalanceSettings(
+                        true,
+                        ProductCategory.LINEAR,
+                        "BTCUSDT",
+                        "UNIFIED",
+                        "BTC",
+                        "USDT",
+                        List.of(new RebalanceBand(BigDecimal.ZERO, new BigDecimal("0.75"))),
+                        new BigDecimal("0.01"),
+                        new BigDecimal("0.001"),
+                        new BigDecimal("0.85"),
+                        new BigDecimal("0.005"),
+                        new BigDecimal("5"),
+                        new BigDecimal("0.100"),
+                        new BigDecimal("1.0"),
+                        new BigDecimal("0.001"),
+                        new BigDecimal("0.001"),
+                        Duration.ofMinutes(15),
+                        1,
+                        "rebalance-config.properties",
+                        stateFile.toString()
+                ),
+                new FakeMarketDataGateway(new BigDecimal("64694.3")),
+                (accountType, baseCoin, quoteCoin, positionCategory, symbol) -> new AccountAssetSnapshot(
+                        Instant.now(),
+                        accountType,
+                        baseCoin,
+                        quoteCoin,
+                        new BigDecimal("1.10"),
+                        BigDecimal.ZERO,
+                        BigDecimal.ZERO,
+                        new BigDecimal("1.10"),
+                        new BigDecimal("100000")
+                ),
+                tradeGateway,
+                registry,
+                new FileRebalanceStateStore(stateFile),
+                new NoopEventLogger(),
+                new AlertService(new NoopEventLogger()),
+                cycleEndReasons::add
+        );
+        service.restoreActiveCycle(
+                List.of(new FillRecord(
+                        Instant.now().minusSeconds(60),
+                        "RBAL:BTCUSDT",
+                        "BUY",
+                        new BigDecimal("0.025"),
+                        new BigDecimal("64127.9"),
+                        new BigDecimal("1603.1975"),
+                        BigDecimal.ZERO,
+                        "USDT",
+                        new BigDecimal("0.025"),
+                        new BigDecimal("1603.1975"),
+                        BigDecimal.ZERO,
+                        new BigDecimal("0.025"),
+                        new BigDecimal("64127.9"),
+                        BigDecimal.ZERO,
+                        BigDecimal.ZERO,
+                        BigDecimal.ZERO,
+                        "RBAL_BTCUSDT_I_test",
+                        "initial-long"
+                )),
+                List.of(
+                        new WorkingOrder(
+                                "BTCUSDT",
+                                "RBAL_BTCUSDT_PB_test",
+                                "buy-exchange",
+                                TradeSide.BUY,
+                                OrderType.LIMIT,
+                                new BigDecimal("64063.8"),
+                                new BigDecimal("0.005"),
+                                false,
+                                OrderStatus.NEW,
+                                Instant.now(),
+                                Instant.now()
+                        ),
+                        new WorkingOrder(
+                                "BTCUSDT",
+                                "RBAL_BTCUSDT_PS_test",
+                                "sell-exchange",
+                                TradeSide.SELL,
+                                OrderType.LIMIT,
+                                new BigDecimal("64694.3"),
+                                new BigDecimal("0.025"),
+                                false,
+                                OrderStatus.NEW,
+                                Instant.now(),
+                                Instant.now()
+                        )
+                )
+        );
+
+        service.onExecution(new FillEvent(
+                "closing-sell",
+                "BTCUSDT",
+                "RBAL_BTCUSDT_PS_test",
+                TradeSide.SELL,
+                new BigDecimal("0.025"),
+                new BigDecimal("64694.3"),
+                Instant.now()
+        ), "test");
+
+        RebalanceState afterFill = new FileRebalanceStateStore(stateFile).load().orElseThrow();
+        assertEquals("IDLE", afterFill.status());
+        assertEquals(List.of("rebalance grid position is flat; stopped"), cycleEndReasons);
+        assertEquals(List.of("RBAL_BTCUSDT_PB_test"), tradeGateway.canceled);
+        Files.deleteIfExists(stateFile);
+    }
+
+    @Test
+    void duplicateExecutionDoesNotAdvanceRebalanceGridTwice() throws Exception {
+        Path stateFile = Files.createTempFile("rebalance-state", ".json");
+        WorkingOrderRegistry registry = new WorkingOrderRegistry();
+        RecordingTradeGateway tradeGateway = new RecordingTradeGateway();
+        RebalanceService service = new RebalanceService(
+                new RebalanceSettings(
+                        true,
+                        ProductCategory.LINEAR,
+                        "BTCUSDT",
+                        "UNIFIED",
+                        "BTC",
+                        "USDT",
+                        List.of(new RebalanceBand(BigDecimal.ZERO, new BigDecimal("0.70"))),
+                        new BigDecimal("0.01"),
+                        new BigDecimal("0.001"),
+                        new BigDecimal("0.85"),
+                        new BigDecimal("0.005"),
+                        new BigDecimal("5"),
+                        new BigDecimal("0.100"),
+                        new BigDecimal("1.0"),
+                        new BigDecimal("0.001"),
+                        new BigDecimal("0.001"),
+                        Duration.ofMinutes(15),
+                        1,
+                        "rebalance-config.properties",
+                        stateFile.toString()
+                ),
+                new FakeMarketDataGateway(new BigDecimal("65000")),
+                (accountType, baseCoin, quoteCoin, positionCategory, symbol) -> new AccountAssetSnapshot(
+                        Instant.now(),
+                        accountType,
+                        baseCoin,
+                        quoteCoin,
+                        new BigDecimal("1.20"),
+                        new BigDecimal("-0.025"),
+                        BigDecimal.ZERO,
+                        new BigDecimal("1.175"),
+                        new BigDecimal("100000")
+                ),
+                tradeGateway,
+                registry,
+                new FileRebalanceStateStore(stateFile),
+                new NoopEventLogger(),
+                new AlertService(new NoopEventLogger())
+        );
+        service.restoreActiveCycle(
+                List.of(new FillRecord(
+                        Instant.now().minusSeconds(30),
+                        "RBAL:BTCUSDT",
+                        "SELL",
+                        new BigDecimal("0.025"),
+                        new BigDecimal("65000"),
+                        new BigDecimal("1625"),
+                        BigDecimal.ZERO,
+                        "USDT",
+                        new BigDecimal("-0.025"),
+                        new BigDecimal("-1625"),
+                        BigDecimal.ZERO,
+                        new BigDecimal("-0.025"),
+                        new BigDecimal("65000"),
+                        BigDecimal.ZERO,
+                        BigDecimal.ZERO,
+                        BigDecimal.ZERO,
+                        "RBAL_BTCUSDT_I_test",
+                        "initial-exec"
+                )),
+                List.of(
+                        new WorkingOrder(
+                                "BTCUSDT",
+                                "RBAL_BTCUSDT_PB_test",
+                                "buy-exchange",
+                                TradeSide.BUY,
+                                OrderType.LIMIT,
+                                new BigDecimal("64935"),
+                                new BigDecimal("0.005"),
+                                false,
+                                OrderStatus.NEW,
+                                Instant.now(),
+                                Instant.now()
+                        ),
+                        new WorkingOrder(
+                                "BTCUSDT",
+                                "RBAL_BTCUSDT_PS_test",
+                                "sell-exchange",
+                                TradeSide.SELL,
+                                OrderType.LIMIT,
+                                new BigDecimal("65100"),
+                                new BigDecimal("0.005"),
+                                false,
+                                OrderStatus.NEW,
+                                Instant.now(),
+                                Instant.now()
+                        )
+                )
+        );
+        FillEvent fill = new FillEvent(
+                "dup-exec",
+                "BTCUSDT",
+                "RBAL_BTCUSDT_PS_test",
+                TradeSide.SELL,
+                new BigDecimal("0.005"),
+                new BigDecimal("65100"),
+                Instant.now()
+        );
+
+        service.onExecution(fill, "test");
+        int submittedAfterFirst = tradeGateway.submitted.size();
+        service.onExecution(fill, "test");
+
+        assertTrue(submittedAfterFirst > 0);
+        assertEquals(submittedAfterFirst, tradeGateway.submitted.size());
+        Files.deleteIfExists(stateFile);
+    }
+
+    @Test
+    void activeCycleTimeoutRequotesPairWithGridEngine() throws Exception {
+        Path stateFile = Files.createTempFile("rebalance-state", ".json");
+        WorkingOrderRegistry registry = new WorkingOrderRegistry();
+        RecordingTradeGateway tradeGateway = new RecordingTradeGateway();
+        FakeMarketDataGateway marketDataGateway = new FakeMarketDataGateway(new BigDecimal("100"));
+        RebalanceService service = new RebalanceService(
+                new RebalanceSettings(
+                        true,
+                        ProductCategory.LINEAR,
+                        "BTCUSDT",
+                        "UNIFIED",
+                        "BTC",
+                        "USDT",
+                        List.of(new RebalanceBand(BigDecimal.ZERO, new BigDecimal("0.75"))),
+                        new BigDecimal("0.01"),
+                        new BigDecimal("0.01"),
+                        new BigDecimal("0.50"),
+                        new BigDecimal("0.010"),
+                        new BigDecimal("5"),
+                        new BigDecimal("0.100"),
+                        new BigDecimal("1.0"),
+                        new BigDecimal("0.001"),
+                        new BigDecimal("0.001"),
+                        Duration.ofMinutes(1),
+                        1,
+                        "rebalance-config.properties",
+                        stateFile.toString()
+                ),
+                marketDataGateway,
+                (accountType, baseCoin, quoteCoin, positionCategory, symbol) -> new AccountAssetSnapshot(
+                        marketDataGateway.timestamp,
+                        accountType,
+                        baseCoin,
+                        quoteCoin,
+                        new BigDecimal("0.72"),
+                        BigDecimal.ZERO,
+                        BigDecimal.ZERO,
+                        new BigDecimal("0.72"),
+                        new BigDecimal("100")
+                ),
+                tradeGateway,
+                registry,
+                new FileRebalanceStateStore(stateFile),
+                new NoopEventLogger(),
+                new AlertService(new NoopEventLogger())
+        );
+
+        service.onPoll();
+        OrderIntent initial = tradeGateway.submitted.get(0);
+        service.onExecution(new FillEvent(
+                "initial-fill",
+                "BTCUSDT",
+                initial.clientOrderId(),
+                TradeSide.BUY,
+                initial.qty(),
+                new BigDecimal("100"),
+                marketDataGateway.timestamp
+        ), "test");
+        int submittedAfterPair = tradeGateway.submitted.size();
+        assertEquals(3, submittedAfterPair);
+
+        marketDataGateway.advance(Duration.ofMinutes(2));
+        service.onPoll();
+
+        assertEquals(2, tradeGateway.canceled.size());
+        assertEquals(5, tradeGateway.submitted.size());
+        assertTrue(tradeGateway.submitted.subList(submittedAfterPair, tradeGateway.submitted.size()).stream()
+                .allMatch(order -> order.clientOrderId().startsWith(RebalanceService.CLIENT_ORDER_PREFIX)));
+        Files.deleteIfExists(stateFile);
+    }
+
+    @Test
+    void autoCycleStartsFixedBuyGridOnlyWhenTotalEquityExceedsSevenBtc() throws Exception {
+        Path stateFile = Files.createTempFile("rebalance-auto-state", ".json");
+        RecordingTradeGateway tradeGateway = new RecordingTradeGateway();
+        RebalanceService service = autoCycleService(stateFile, tradeGateway, new BigDecimal("800"));
+
+        service.onPoll();
+
+        assertEquals(1, tradeGateway.submitted.size());
+        OrderIntent initial = tradeGateway.submitted.get(0);
+        assertEquals(TradeSide.BUY, initial.side());
+        assertEquals(new BigDecimal("0.025"), initial.qty());
+        RebalanceState saved = new FileRebalanceStateStore(stateFile).load().orElseThrow();
+        assertEquals("GRID_OPENING", saved.status());
+        assertEquals(BigDecimal.ONE, saved.targetRatio());
+        Files.deleteIfExists(stateFile);
+    }
+
+    @Test
+    void autoCycleWaitsWhenTotalEquityIsExactlySevenBtc() throws Exception {
+        Path stateFile = Files.createTempFile("rebalance-auto-state", ".json");
+        RecordingTradeGateway tradeGateway = new RecordingTradeGateway();
+        RebalanceService service = autoCycleService(stateFile, tradeGateway, new BigDecimal("700"));
+
+        service.onPoll();
+
+        assertTrue(tradeGateway.submitted.isEmpty());
+        RebalanceState saved = new FileRebalanceStateStore(stateFile).load().orElseThrow();
+        assertEquals("IDLE", saved.status());
+        assertTrue(saved.message().contains("must be greater than 7 BTC"));
+        Files.deleteIfExists(stateFile);
+    }
+
+    private RebalanceService autoCycleService(Path stateFile, RecordingTradeGateway tradeGateway, BigDecimal totalEquity) {
+        FakeMarketDataGateway marketDataGateway = new FakeMarketDataGateway(new BigDecimal("100"));
+        RebalanceSettings settings = new RebalanceSettings(
+                true, RebalanceMode.AUTO_CYCLE, new BigDecimal("7"), new BigDecimal("0.005"), new BigDecimal("5"),
+                ProductCategory.LINEAR, "BTCUSDT", "UNIFIED", "BTC", "USDT",
+                List.of(
+                        new RebalanceBand(BigDecimal.ZERO, new BigDecimal("0.80")),
+                        new RebalanceBand(new BigDecimal("60000"), new BigDecimal("0.75")),
+                        new RebalanceBand(new BigDecimal("65000"), new BigDecimal("0.70")),
+                        new RebalanceBand(new BigDecimal("100000"), new BigDecimal("0.50"))
+                ),
+                new BigDecimal("0.01"), new BigDecimal("0.0016"), new BigDecimal("0.85"),
+                new BigDecimal("0.001"), new BigDecimal("5"), new BigDecimal("0.001"), new BigDecimal("1.0"),
+                new BigDecimal("0.001"), new BigDecimal("0.001"), Duration.ofMinutes(15), 1,
+                "rebalance-config.properties", stateFile.toString()
+        );
+        return new RebalanceService(
+                settings,
+                marketDataGateway,
+                (accountType, baseCoin, quoteCoin, positionCategory, symbol) -> new AccountAssetSnapshot(
+                        Instant.now(), accountType, baseCoin, quoteCoin, new BigDecimal("0.10"),
+                        totalEquity.subtract(new BigDecimal("10")), BigDecimal.ZERO, new BigDecimal("0.10"), totalEquity
+                ),
+                tradeGateway,
+                new WorkingOrderRegistry(),
+                new FileRebalanceStateStore(stateFile),
+                new NoopEventLogger(),
+                new AlertService(new NoopEventLogger())
+        );
+    }
+
+    private static class FakeMarketDataGateway extends BybitSdkMarketDataGateway {
+        private final BigDecimal price;
+        private Instant timestamp = Instant.now();
+
+        FakeMarketDataGateway(BigDecimal price) {
+            super(null, ProductCategory.SPOT, (IndicatorCalculator) null, 20, 20, new BigDecimal("2.0"));
+            this.price = price;
+        }
+
+        void advance(Duration duration) {
+            timestamp = timestamp.plus(duration);
+        }
+
+        @Override
+        public InstrumentSpec loadInstrumentSpec(String symbol) {
+            return new InstrumentSpec(symbol, new BigDecimal("0.001"), new BigDecimal("0.001"), new BigDecimal("0.1"), new BigDecimal("0.1"));
+        }
+
+        @Override
+        public MarketSnapshot latestSnapshot(String symbol) {
+            return new MarketSnapshot(
+                symbol,
+                timestamp,
+                price,
+                new IndicatorSnapshot(timestamp, price, price, price, price)
+            );
+        }
+    }
+
+    private static class RecordingTradeGateway implements BybitTradeGateway {
+        private final List<OrderIntent> submitted = new ArrayList<>();
+        private final List<String> canceled = new ArrayList<>();
+
+        @Override
+        public BybitOrderSubmission submit(OrderIntent orderIntent) {
+            submitted.add(orderIntent);
+            return new BybitOrderSubmission("exchange-1", orderIntent.clientOrderId());
+        }
+
+        @Override
+        public void cancel(String symbol, String clientOrderId) {
+            canceled.add(clientOrderId);
+        }
+    }
+
+    private static class NoopEventLogger implements EventLogger {
+        @Override
+        public void info(String event, Map<String, Object> fields) {
+        }
+
+        @Override
+        public void warn(String event, Map<String, Object> fields) {
+        }
+
+        @Override
+        public void error(String event, Map<String, Object> fields) {
+        }
+    }
+}

@@ -6,6 +6,7 @@ import java.util.Properties;
 
 public record GridProperties(
         GridStrategyConfig strategyConfig,
+        RebalanceSettings rebalanceSettings,
         BybitSdkConfig bybitSdkConfig,
         RuntimeSettings runtimeSettings,
         Properties rawProperties

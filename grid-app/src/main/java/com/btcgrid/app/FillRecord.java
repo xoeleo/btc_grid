@@ -21,8 +21,52 @@ public record FillRecord(
         BigDecimal floatingPnlAtFill,
         BigDecimal totalPnlAtFill,
         String clientOrderId,
-        String executionId
+        String executionId,
+        String configJson
 ) {
+    public FillRecord(
+            Instant time,
+            String symbol,
+            String side,
+            BigDecimal qty,
+            BigDecimal price,
+            BigDecimal value,
+            BigDecimal fee,
+            String feeCurrency,
+            BigDecimal cumulativeQty,
+            BigDecimal cumulativeValue,
+            BigDecimal cumulativeFee,
+            BigDecimal netQty,
+            BigDecimal avgEntryPrice,
+            BigDecimal realizedPnl,
+            BigDecimal floatingPnlAtFill,
+            BigDecimal totalPnlAtFill,
+            String clientOrderId,
+            String executionId
+    ) {
+        this(
+                time,
+                symbol,
+                side,
+                qty,
+                price,
+                value,
+                fee,
+                feeCurrency,
+                cumulativeQty,
+                cumulativeValue,
+                cumulativeFee,
+                netQty,
+                avgEntryPrice,
+                realizedPnl,
+                floatingPnlAtFill,
+                totalPnlAtFill,
+                clientOrderId,
+                executionId,
+                null
+        );
+    }
+
     public FillRecord(
             Instant time,
             String symbol,
@@ -55,7 +99,8 @@ public record FillRecord(
                 floatingPnlAtFill,
                 totalPnlAtFill,
                 clientOrderId,
-                executionId
+                executionId,
+                null
         );
     }
 }

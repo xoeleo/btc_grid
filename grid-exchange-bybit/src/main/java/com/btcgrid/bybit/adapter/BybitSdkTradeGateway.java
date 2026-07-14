@@ -77,15 +77,18 @@ public class BybitSdkTradeGateway implements BybitTradeGateway {
         body.put("orderType", orderIntent.type() == OrderType.MARKET ? "Market" : "Limit");
         body.put("qty", orderIntent.qty().stripTrailingZeros().toPlainString());
         body.put("orderLinkId", orderIntent.clientOrderId());
-        body.put("reduceOnly", orderIntent.reduceOnly());
         if (category == ProductCategory.LINEAR || category == ProductCategory.INVERSE) {
             body.put("positionIdx", 0);
+            body.put("reduceOnly", orderIntent.reduceOnly());
         }
         if (orderIntent.type() == OrderType.LIMIT) {
             body.put("price", orderIntent.price().stripTrailingZeros().toPlainString());
             body.put("timeInForce", "GTC");
         } else {
             body.put("timeInForce", "IOC");
+            if (category == ProductCategory.SPOT && orderIntent.side() == TradeSide.BUY) {
+                body.put("marketUnit", "baseCoin");
+            }
         }
 
         JsonNode root = signedDemoPost("createOrder", "/v5/order/create", body);

@@ -1,5 +1,6 @@
 package com.btcgrid.strategy.model;
 
+import com.btcgrid.common.config.GridStrategyConfig;
 import com.btcgrid.common.model.WorkingOrder;
 import com.btcgrid.ledger.model.StrategyLedgerSnapshot;
 import java.math.BigDecimal;
@@ -11,6 +12,7 @@ public record StrategyStateSnapshot(
         StrategyRuntimeState runtimeState,
         BigDecimal activeSpacing,
         Set<String> processedExecutionIds,
-        List<WorkingOrder> trackedWorkingOrders
+        List<WorkingOrder> trackedWorkingOrders,
+        GridStrategyConfig cycleConfig
 ) {
 }

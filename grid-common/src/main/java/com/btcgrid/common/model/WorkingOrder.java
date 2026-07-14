@@ -14,8 +14,38 @@ public record WorkingOrder(
         boolean reduceOnly,
         OrderStatus status,
         Instant createdAt,
-        Instant updatedAt
+        Instant updatedAt,
+        String reason
 ) {
+    public WorkingOrder(
+            String symbol,
+            String clientOrderId,
+            String exchangeOrderId,
+            TradeSide side,
+            OrderType orderType,
+            BigDecimal price,
+            BigDecimal qty,
+            boolean reduceOnly,
+            OrderStatus status,
+            Instant createdAt,
+            Instant updatedAt
+    ) {
+        this(
+                symbol,
+                clientOrderId,
+                exchangeOrderId,
+                side,
+                orderType,
+                price,
+                qty,
+                reduceOnly,
+                status,
+                createdAt,
+                updatedAt,
+                null
+        );
+    }
+
     public WorkingOrder withStatus(OrderStatus nextStatus, Instant nextUpdatedAt, String nextExchangeOrderId) {
         return new WorkingOrder(
                 symbol,
@@ -28,7 +58,8 @@ public record WorkingOrder(
                 reduceOnly,
                 nextStatus,
                 createdAt,
-                nextUpdatedAt
+                nextUpdatedAt,
+                reason
         );
     }
 }

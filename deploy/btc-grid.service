@@ -1,0 +1,17 @@
+[Unit]
+Description=btc_grid live runtime
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+WorkingDirectory=/opt/btc_grid
+ExecStart=/opt/btc_grid/scripts/start-grid-runtime.sh start
+ExecStop=/opt/btc_grid/scripts/start-grid-runtime.sh stop
+PIDFile=/opt/btc_grid/runtime/grid-app.pid
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

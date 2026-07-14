@@ -101,7 +101,7 @@ public class BybitSdkOrderQueryGateway implements BybitOrderQueryGateway {
                     epochMillis(node.path("execTime").asText()),
                     decimalOrZero(node.path("execValue").asText()),
                     decimalOrZero(node.path("execFee").asText()),
-                    "USDT"
+                    feeCurrency(node, node.path("symbol").asText(symbol), "Buy".equalsIgnoreCase(node.path("side").asText()) ? TradeSide.BUY : TradeSide.SELL)
             ));
         }
         result.sort(Comparator.comparing(FillEvent::fillTime));
@@ -130,5 +130,17 @@ public class BybitSdkOrderQueryGateway implements BybitOrderQueryGateway {
 
     private Instant epochMillis(String value) {
         return value == null || value.isBlank() ? Instant.EPOCH : Instant.ofEpochMilli(Long.parseLong(value));
+    }
+
+    private String feeCurrency(JsonNode node, String symbol, TradeSide side) {
+        String explicit = node.path("feeCurrency").asText("");
+        if (!explicit.isBlank()) {
+            return explicit.trim().toUpperCase();
+        }
+        if (category == ProductCategory.SPOT && side == TradeSide.BUY) {
+            String base = FillEvent.baseCoin(symbol);
+            return base == null ? "USDT" : base;
+        }
+        return "USDT";
     }
 }

@@ -1,5 +1,7 @@
 package com.btcgrid.app;
 
+import com.btcgrid.bybit.adapter.BybitSdkAccountGateway;
+import com.btcgrid.bybit.adapter.BybitSdkFundingFeeQueryGateway;
 import com.btcgrid.bybit.adapter.BybitSdkClientFactory;
 import com.btcgrid.bybit.adapter.BybitSdkMarketDataGateway;
 import com.btcgrid.bybit.adapter.BybitSdkOrderQueryGateway;
@@ -7,10 +9,16 @@ import com.btcgrid.bybit.adapter.BybitSdkPrivateStreamGateway;
 import com.btcgrid.bybit.adapter.BybitSdkTradeGateway;
 import com.btcgrid.common.config.GridStrategyConfig;
 import com.btcgrid.common.indicator.FourHourIndicatorCalculator;
+import com.btcgrid.common.model.BandZone;
+import com.btcgrid.common.model.GridState;
+import com.btcgrid.common.model.InventoryMode;
 import com.btcgrid.common.model.InstrumentSpec;
 import com.btcgrid.common.model.MarketSnapshot;
+import com.btcgrid.common.model.TradeSide;
+import com.btcgrid.ledger.model.StrategyLedgerSnapshot;
 import com.btcgrid.ledger.service.InMemoryStrategyLedger;
 import com.btcgrid.ledger.service.StrategyLedger;
+import com.btcgrid.strategy.model.StrategyRuntimeState;
 import com.btcgrid.strategy.model.StrategyStateSnapshot;
 import com.btcgrid.strategy.service.ClientOrderIdFactory;
 import com.btcgrid.strategy.service.GridOrderPlanner;
@@ -28,7 +36,22 @@ public class GridApplication {
 
     public static void main(String[] args) {
         GridProperties properties = GridConfigLoader.load("application.properties");
-        GridStrategyConfig config = properties.strategyConfig();
+        EventLogger eventLogger = new CompositeEventLogger(List.of(
+                new StructuredEventLogger(),
+                new FileEventLogger(PathResolver.absolutePath(properties.runtimeSettings().logFilePath()))
+        ));
+        StateStore stateStore = new FileStateStore(PathResolver.absolutePath(properties.runtimeSettings().stateFilePath()));
+        FillStore fillStore = new SqliteFillStore(PathResolver.absolutePath(properties.runtimeSettings().fillsDbPath()));
+        GridStrategyConfig config = chooseStartupConfig(properties.strategyConfig(), stateStore, fillStore, eventLogger);
+        if (!config.equals(properties.strategyConfig())) {
+            properties = new GridProperties(
+                    config,
+                    properties.rebalanceSettings(),
+                    properties.bybitSdkConfig(),
+                    properties.runtimeSettings(),
+                    properties.rawProperties()
+            );
+        }
         BybitSdkClientFactory sdkClientFactory = new BybitSdkClientFactory(properties.bybitSdkConfig());
         BybitSdkMarketDataGateway marketDataGateway = new BybitSdkMarketDataGateway(
                 sdkClientFactory,
@@ -46,20 +69,23 @@ public class GridApplication {
                 instrumentSpec,
                 strategyLedger,
                 new GridTriggerEvaluator(),
-                new GridOrderPlanner(new ClientOrderIdFactory()),
+                new GridOrderPlanner(
+                        new ClientOrderIdFactory(),
+                        profitableReduceSideMultiplier(properties),
+                        (market, ledger, orderPrice) -> currentCycleMarketPnl(fillStore, market, orderPrice).signum() > 0
+                ),
                 true
         );
-        EventLogger eventLogger = new CompositeEventLogger(List.of(
-                new StructuredEventLogger(),
-                new FileEventLogger(PathResolver.absolutePath(properties.runtimeSettings().logFilePath()))
-        ));
         AlertService alertService = new AlertService(eventLogger);
         BybitSdkTradeGateway tradeGateway = new BybitSdkTradeGateway(sdkClientFactory, config.category());
-        StateStore stateStore = new FileStateStore(PathResolver.absolutePath(properties.runtimeSettings().stateFilePath()));
         StatusStore statusStore = new FileStatusStore(PathResolver.absolutePath(properties.runtimeSettings().statusFilePath()));
-        FillStore fillStore = new SqliteFillStore(PathResolver.absolutePath(properties.runtimeSettings().fillsDbPath()));
         WorkingOrderRegistry workingOrderRegistry = new WorkingOrderRegistry();
         RecoveryState recoveryState = new RecoveryBootstrap(stateStore, eventLogger).restore(engine, strategyLedger);
+        if (recoveryState.trackedWorkingOrders().isEmpty()
+                && engine.runtimeState().state() == GridState.INIT
+                && strategyLedger.snapshot().netQty().signum() == 0) {
+            restoreOpenCycleFromFills(config.symbol(), fillStore, snapshot, engine, strategyLedger, eventLogger);
+        }
         workingOrderRegistry.replaceAll(recoveryState.trackedWorkingOrders());
         StartupReconciliationService reconciliationService = new StartupReconciliationService(
                 new BybitSdkOrderQueryGateway(sdkClientFactory, config.category()),
@@ -77,6 +103,13 @@ public class GridApplication {
                     "message", e.getMessage()
             ));
         }
+        RebalanceService rebalanceService = buildRebalanceService(
+                properties,
+                sdkClientFactory,
+                workingOrderRegistry,
+                eventLogger,
+                alertService
+        );
         repairFilledWorkingOrders(config.symbol(), fillStore, workingOrderRegistry);
         RuntimeConsistencyResult consistencyResult = new ActivePairConsistencyService()
                 .reconcile(engine.runtimeState(), workingOrderRegistry.snapshot());
@@ -97,7 +130,8 @@ public class GridApplication {
                 engine.runtimeState(),
                 engine.activeSpacing(),
                 Set.copyOf(processedExecutionIds),
-                List.copyOf(workingOrderRegistry.snapshot())
+                List.copyOf(workingOrderRegistry.snapshot()),
+                config
         ));
         eventLogger.info("startup.ready", java.util.Map.of(
                 "symbol", config.symbol(),
@@ -175,12 +209,15 @@ public class GridApplication {
                     strategyLedger,
                     new LiveCommandExecutor(tradeGateway, workingOrderRegistry, new RiskGuardService(config), eventLogger, alertService),
                     new BybitSdkOrderQueryGateway(sdkClientFactory, config.category()),
+                    new BybitSdkFundingFeeQueryGateway(sdkClientFactory, config.category()),
                     stateStore,
                     workingOrderRegistry,
                     processedExecutionIds,
                     eventLogger,
                     alertService,
-                    statusStore
+                    statusStore,
+                    liveControlService::recordFill,
+                    liveControlService::recordFundingFee
             );
                  HttpStatusServer server = httpStatusServer) {
                 liveRunner.start();
@@ -196,6 +233,265 @@ public class GridApplication {
                 Thread.currentThread().interrupt();
             }
         }
+    }
+
+    private static RebalanceService buildRebalanceService(
+            GridProperties properties,
+            BybitSdkClientFactory sdkClientFactory,
+            WorkingOrderRegistry workingOrderRegistry,
+            EventLogger eventLogger,
+            AlertService alertService
+    ) {
+        RebalanceSettings settings = properties.rebalanceSettings();
+        BybitSdkMarketDataGateway rebalanceMarketDataGateway = new BybitSdkMarketDataGateway(
+                sdkClientFactory,
+                settings.category(),
+                new FourHourIndicatorCalculator(),
+                properties.strategyConfig().emaLength4h(),
+                properties.strategyConfig().bollLength4h(),
+                properties.strategyConfig().bollStdDevMultiplier()
+        );
+        return new RebalanceService(
+                settings,
+                rebalanceMarketDataGateway,
+                new BybitSdkAccountGateway(sdkClientFactory),
+                new BybitSdkTradeGateway(sdkClientFactory, settings.category()),
+                workingOrderRegistry,
+                new FileRebalanceStateStore(PathResolver.absolutePath(settings.stateFilePath())),
+                eventLogger,
+                alertService
+        );
+    }
+
+    private static GridStrategyConfig chooseStartupConfig(
+            GridStrategyConfig configured,
+            StateStore stateStore,
+            FillStore fillStore,
+            EventLogger eventLogger
+    ) {
+        CurrentCycleSummary openCycle = fillStore.latestOpenCycle(Instant.now(), null);
+        String stateSymbol = stateStore.load()
+                .filter(GridApplication::isResumableCycleState)
+                .map(StrategyStateSnapshot::ledgerSnapshot)
+                .map(snapshot -> snapshot.symbol() == null ? "" : snapshot.symbol().trim().toUpperCase())
+                .filter(symbol -> !symbol.isBlank())
+                .orElse("");
+        GridStrategyConfig persistedStateConfig = stateStore.load()
+                .filter(GridApplication::isResumableCycleState)
+                .map(StrategyStateSnapshot::cycleConfig)
+                .filter(stateConfig -> stateConfig != null
+                        && stateConfig.symbol() != null
+                        && !stateConfig.symbol().isBlank())
+                .orElse(null);
+        if (persistedStateConfig != null) {
+            if (!persistedStateConfig.symbol().equalsIgnoreCase(configured.symbol())) {
+                eventLogger.warn("startup.config.from-state", java.util.Map.of(
+                        "configuredSymbol", configured.symbol(),
+                        "stateSymbol", persistedStateConfig.symbol(),
+                        "baseGridQty", persistedStateConfig.baseGridQty(),
+                        "maxOrderQty", persistedStateConfig.maxOrderQty(),
+                        "maxInventoryQty", persistedStateConfig.maxInventoryQty(),
+                        "maxDirectionalInventoryQty", persistedStateConfig.maxDirectionalInventoryQty(),
+                        "reason", "persisted cycle config"
+                ));
+            }
+            return persistedStateConfig;
+        }
+        if (!stateSymbol.isBlank()) {
+            GridStrategyConfig symbolConfig = stateSymbol.equalsIgnoreCase(configured.symbol())
+                    ? configured
+                    : withSymbol(configured, stateSymbol);
+            if (!stateSymbol.equalsIgnoreCase(configured.symbol())) {
+                eventLogger.warn("startup.symbol.from-state", java.util.Map.of(
+                        "configuredSymbol", configured.symbol(),
+                        "stateSymbol", stateSymbol,
+                        "reason", "resumable cycle state"
+                ));
+            }
+            if (openCycle != null && stateSymbol.equalsIgnoreCase(openCycle.symbol())) {
+                GridStrategyConfig cycleConfig = withCycleSizing(symbolConfig, openCycle, fillStore.latestTradingFill(stateSymbol));
+                if (!cycleConfig.equals(symbolConfig)) {
+                    eventLogger.warn("startup.symbol.from-state", java.util.Map.of(
+                            "configuredSymbol", configured.symbol(),
+                            "stateSymbol", stateSymbol,
+                            "baseGridQty", cycleConfig.baseGridQty(),
+                            "maxOrderQty", cycleConfig.maxOrderQty(),
+                            "maxInventoryQty", cycleConfig.maxInventoryQty(),
+                            "maxDirectionalInventoryQty", cycleConfig.maxDirectionalInventoryQty(),
+                            "reason", "resumable cycle state with open cycle sizing"
+                    ));
+                }
+                return cycleConfig;
+            }
+            return symbolConfig;
+        }
+        if (openCycle == null || openCycle.symbol() == null || openCycle.symbol().isBlank()) {
+            return configured;
+        }
+        String symbol = openCycle.symbol().trim().toUpperCase();
+        GridStrategyConfig cycleConfig = withCycleSizing(configured, openCycle, fillStore.latestTradingFill(symbol));
+        if (symbol.equalsIgnoreCase(configured.symbol()) && cycleConfig.equals(configured)) {
+            return configured;
+        }
+        eventLogger.warn("startup.config.from-cycle", java.util.Map.of(
+                "configuredSymbol", configured.symbol(),
+                "cycleSymbol", symbol,
+                "baseGridQty", cycleConfig.baseGridQty(),
+                "maxOrderQty", cycleConfig.maxOrderQty(),
+                "maxInventoryQty", cycleConfig.maxInventoryQty(),
+                "maxDirectionalInventoryQty", cycleConfig.maxDirectionalInventoryQty(),
+                "reason", "open cycle in fill store"
+        ));
+        return cycleConfig;
+    }
+
+    private static boolean isResumableCycleState(StrategyStateSnapshot snapshot) {
+        if (snapshot == null || snapshot.ledgerSnapshot() == null || snapshot.runtimeState() == null) {
+            return false;
+        }
+        return snapshot.runtimeState().state() != GridState.INIT
+                && (snapshot.ledgerSnapshot().netQty().signum() != 0 || snapshot.runtimeState().activeOrderPair() != null);
+    }
+
+    private static GridStrategyConfig withSymbol(GridStrategyConfig config, String symbol) {
+        return new GridStrategyConfig(
+                config.category(),
+                symbol,
+                config.entryDirection(),
+                config.baseGridSpacing(),
+                config.gridRequoteShrinkFactor(),
+                config.baseGridQty(),
+                config.maxInitialSteps(),
+                config.maxOrderQty(),
+                config.maxInventoryQty(),
+                config.maxDirectionalInventoryQty(),
+                config.maxConsecutiveSameSideFills(),
+                config.emaLength4h(),
+                config.bollLength4h(),
+                config.bollStdDevMultiplier(),
+                config.deinventoryPnlThresholdRate(),
+                config.deinventoryBoostSlope(),
+                config.deinventoryBoostCap(),
+                config.classicReduceSizing(),
+                config.pairOrderTimeout(),
+                config.triggerCooldown()
+        );
+    }
+
+    private static GridStrategyConfig withCycleSizing(
+            GridStrategyConfig config,
+            CurrentCycleSummary cycle,
+            FillRecord latestFill
+    ) {
+        String symbol = cycle.symbol().trim().toUpperCase();
+        BigDecimal inferredBaseQty = inferBaseGridQty(config, cycle, latestFill);
+        BigDecimal currentAbsQty = cycle.cumulativeQty().abs();
+        BigDecimal maxOrderQty = config.maxOrderQty().max(inferredBaseQty);
+        BigDecimal inventoryLimit = currentAbsQty.add(inferredBaseQty).max(config.maxInventoryQty());
+        BigDecimal directionalLimit = currentAbsQty.add(inferredBaseQty).max(config.maxDirectionalInventoryQty());
+        return new GridStrategyConfig(
+                config.category(),
+                symbol,
+                config.entryDirection(),
+                config.baseGridSpacing(),
+                config.gridRequoteShrinkFactor(),
+                inferredBaseQty,
+                config.maxInitialSteps(),
+                maxOrderQty,
+                inventoryLimit,
+                directionalLimit,
+                config.maxConsecutiveSameSideFills(),
+                config.emaLength4h(),
+                config.bollLength4h(),
+                config.bollStdDevMultiplier(),
+                config.deinventoryPnlThresholdRate(),
+                config.deinventoryBoostSlope(),
+                config.deinventoryBoostCap(),
+                config.classicReduceSizing(),
+                config.pairOrderTimeout(),
+                config.triggerCooldown()
+        );
+    }
+
+    private static BigDecimal inferBaseGridQty(
+            GridStrategyConfig config,
+            CurrentCycleSummary cycle,
+            FillRecord latestFill
+    ) {
+        if (latestFill != null
+                && latestFill.qty() != null
+                && latestFill.qty().signum() > 0
+                && !com.btcgrid.common.model.ClientOrderIds.isInitialPositionOrder(latestFill.clientOrderId())) {
+            return latestFill.qty().max(config.baseGridQty());
+        }
+        if (cycle.fillCount() > 0 && cycle.cumulativeQty() != null && cycle.cumulativeQty().signum() != 0) {
+            BigDecimal averageCycleQty = cycle.buyQty().add(cycle.sellQty())
+                    .divide(new BigDecimal(cycle.fillCount()), java.math.MathContext.DECIMAL64);
+            if (averageCycleQty.signum() > 0) {
+                return averageCycleQty.max(config.baseGridQty());
+            }
+        }
+        return config.baseGridQty();
+    }
+
+    private static void restoreOpenCycleFromFills(
+            String symbol,
+            FillStore fillStore,
+            MarketSnapshot marketSnapshot,
+            GridStrategyEngine engine,
+            StrategyLedger strategyLedger,
+            EventLogger eventLogger
+    ) {
+        CurrentCycleSummary cycle = fillStore.currentCycle(
+                symbol,
+                Instant.now(),
+                marketSnapshot == null ? null : marketSnapshot.markPrice()
+        );
+        if (cycle == null || cycle.cumulativeQty() == null || cycle.cumulativeQty().signum() == 0) {
+            return;
+        }
+        TradeSide side = cycle.cumulativeQty().signum() > 0 ? TradeSide.BUY : TradeSide.SELL;
+        java.math.BigDecimal avgEntryPrice = cycle.cumulativeQty().signum() == 0
+                ? BigDecimal.ZERO
+                : cycle.cumulativeValue().divide(cycle.cumulativeQty(), java.math.MathContext.DECIMAL64);
+        java.math.BigDecimal markPrice = marketSnapshot == null ? cycle.latestFillPrice() : marketSnapshot.markPrice();
+        java.math.BigDecimal floatingPnl = cycle.cumulativeQty()
+                .multiply(markPrice.subtract(avgEntryPrice, java.math.MathContext.DECIMAL64), java.math.MathContext.DECIMAL64);
+        strategyLedger.restore(new StrategyLedgerSnapshot(
+                symbol,
+                cycle.cumulativeQty(),
+                avgEntryPrice.abs(),
+                BigDecimal.ZERO,
+                floatingPnl,
+                BigDecimal.ZERO,
+                cycle.latestFillPrice(),
+                side,
+                BandZone.INSIDE_BAND,
+                0,
+                0,
+                InventoryMode.NORMAL,
+                cycle.latestFillAt()
+        ));
+        engine.restore(new StrategyRuntimeState(GridState.WAITING_TRIGGER, null, cycle.latestFillAt()), null);
+        eventLogger.warn("startup.state.rebuilt-from-cycle", java.util.Map.of(
+                "symbol", symbol,
+                "netQty", cycle.cumulativeQty(),
+                "avgEntryPrice", avgEntryPrice.abs(),
+                "latestFillAt", cycle.latestFillAt().toString()
+        ));
+    }
+
+    private static BigDecimal profitableReduceSideMultiplier(GridProperties properties) {
+        return new BigDecimal(properties.rawProperties().getProperty("grid.profitable-reduce-side-multiplier", "1.10").trim());
+    }
+
+    private static BigDecimal currentCycleMarketPnl(FillStore fillStore, MarketSnapshot marketSnapshot, BigDecimal price) {
+        if (fillStore == null || marketSnapshot == null) {
+            return BigDecimal.ZERO;
+        }
+        BigDecimal pnlPrice = price == null || price.signum() <= 0 ? marketSnapshot.markPrice() : price;
+        CurrentCycleSummary cycle = fillStore.currentCycle(marketSnapshot.symbol(), Instant.now(), pnlPrice);
+        return cycle == null || cycle.markPricePnl() == null ? BigDecimal.ZERO : cycle.markPricePnl();
     }
 
     private static void repairFilledWorkingOrders(String symbol, FillStore fillStore, WorkingOrderRegistry workingOrderRegistry) {
