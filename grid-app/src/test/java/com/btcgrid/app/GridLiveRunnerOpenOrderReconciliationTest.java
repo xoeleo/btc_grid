@@ -50,7 +50,7 @@ class GridLiveRunnerOpenOrderReconciliationTest {
     @Test
     void missingRemoteOpenOrderWithExecutionIsHandledAsFill() throws Exception {
         WorkingOrderRegistry registry = new WorkingOrderRegistry();
-        registry.trackRemote(openOrder("GRID_SOLUSDT_PB_test"));
+        registry.trackRemote(openOrder("GRID_SOLUSDT_PB_test", Instant.now().minusSeconds(30)));
         FakeOrderQueryGateway orderQueryGateway = new FakeOrderQueryGateway(List.of(
                 fill("exec-1", "GRID_SOLUSDT_PB_test", "1", "84.99")
         ));
@@ -66,12 +66,23 @@ class GridLiveRunnerOpenOrderReconciliationTest {
     @Test
     void missingRemoteOpenOrderWithoutExecutionIsMarkedCanceled() throws Exception {
         WorkingOrderRegistry registry = new WorkingOrderRegistry();
-        registry.trackRemote(openOrder("GRID_SOLUSDT_PB_test"));
+        registry.trackRemote(openOrder("GRID_SOLUSDT_PB_test", Instant.now().minusSeconds(30)));
         GridLiveRunner runner = runner(registry, new FakeOrderQueryGateway(List.of()));
 
         invokeReconcileOpenOrders(runner);
 
         assertEquals(OrderStatus.CANCELED, onlyOrder(registry).status());
+    }
+
+    @Test
+    void newlyAcceptedOrderGetsVisibilityGraceBeforeMissingRemoteCancellation() throws Exception {
+        WorkingOrderRegistry registry = new WorkingOrderRegistry();
+        registry.trackRemote(openOrder("GRID_SOLUSDT_PB_recent", Instant.now()));
+        GridLiveRunner runner = runner(registry, new FakeOrderQueryGateway(List.of()));
+
+        invokeReconcileOpenOrders(runner);
+
+        assertEquals(OrderStatus.NEW, onlyOrder(registry).status());
     }
 
     private GridLiveRunner runner(WorkingOrderRegistry registry, BybitOrderQueryGateway orderQueryGateway) {
@@ -122,7 +133,7 @@ class GridLiveRunnerOpenOrderReconciliationTest {
         return orders.get(0);
     }
 
-    private WorkingOrder openOrder(String clientOrderId) {
+    private WorkingOrder openOrder(String clientOrderId, Instant createdAt) {
         return new WorkingOrder(
                 "SOLUSDT",
                 clientOrderId,
@@ -133,7 +144,7 @@ class GridLiveRunnerOpenOrderReconciliationTest {
                 new BigDecimal("1"),
                 false,
                 OrderStatus.NEW,
-                Instant.now(),
+                createdAt,
                 Instant.now()
         );
     }

@@ -840,6 +840,58 @@ class RebalanceServiceTest {
     }
 
     @Test
+    void activeCycleCancelsOrdersOutsideCurrentPair() throws Exception {
+        Path stateFile = Files.createTempFile("rebalance-state", ".json");
+        WorkingOrderRegistry registry = new WorkingOrderRegistry();
+        RecordingTradeGateway tradeGateway = new RecordingTradeGateway();
+        FakeMarketDataGateway marketDataGateway = new FakeMarketDataGateway(new BigDecimal("100"));
+        RebalanceService service = new RebalanceService(
+                new RebalanceSettings(
+                        true, ProductCategory.LINEAR, "BTCUSDT", "UNIFIED", "BTC", "USDT",
+                        List.of(new RebalanceBand(BigDecimal.ZERO, new BigDecimal("0.75"))),
+                        new BigDecimal("0.01"), new BigDecimal("0.01"), new BigDecimal("0.50"),
+                        new BigDecimal("0.005"), new BigDecimal("5"), new BigDecimal("0.100"),
+                        new BigDecimal("1.0"), new BigDecimal("0.001"), new BigDecimal("0.001"),
+                        Duration.ofMinutes(15), 1, "rebalance-config.properties", stateFile.toString()
+                ),
+                marketDataGateway,
+                (accountType, baseCoin, quoteCoin, positionCategory, symbol) -> new AccountAssetSnapshot(
+                        Instant.now(), accountType, baseCoin, quoteCoin, new BigDecimal("0.72"),
+                        BigDecimal.ZERO, BigDecimal.ZERO, new BigDecimal("0.72"), new BigDecimal("100")
+                ),
+                tradeGateway,
+                registry,
+                new FileRebalanceStateStore(stateFile),
+                new NoopEventLogger(),
+                new AlertService(new NoopEventLogger())
+        );
+        WorkingOrder currentBuy = openOrder("RBAL_BTCUSDT_PB_current", TradeSide.BUY, Instant.now());
+        WorkingOrder currentSell = openOrder("RBAL_BTCUSDT_PS_current", TradeSide.SELL, Instant.now());
+        WorkingOrder orphanBuy = openOrder("RBAL_BTCUSDT_PB_orphan", TradeSide.BUY, Instant.now().minusSeconds(60));
+        registry.trackRemote(currentBuy);
+        registry.trackRemote(currentSell);
+        registry.trackRemote(orphanBuy);
+        service.restoreActiveCycle(
+                List.of(new FillRecord(
+                        Instant.now().minusSeconds(120), "RBAL:BTCUSDT", "BUY", new BigDecimal("0.025"),
+                        new BigDecimal("100"), new BigDecimal("2.5"), BigDecimal.ZERO, "USDT",
+                        new BigDecimal("0.025"), new BigDecimal("2.5"), BigDecimal.ZERO,
+                        new BigDecimal("0.025"), new BigDecimal("100"), BigDecimal.ZERO, BigDecimal.ZERO,
+                        BigDecimal.ZERO, "RBAL_BTCUSDT_I_test", "initial"
+                )),
+                List.of(currentBuy, currentSell, orphanBuy)
+        );
+
+        service.cancelOrphanOrdersIfNeeded();
+
+        assertEquals(List.of(orphanBuy.clientOrderId()), tradeGateway.canceled);
+        assertEquals(OrderStatus.CANCELED, registry.snapshot().stream()
+                .filter(order -> order.clientOrderId().equals(orphanBuy.clientOrderId()))
+                .findFirst().orElseThrow().status());
+        Files.deleteIfExists(stateFile);
+    }
+
+    @Test
     void autoCycleStartsFixedBuyGridOnlyWhenTotalEquityExceedsSevenBtc() throws Exception {
         Path stateFile = Files.createTempFile("rebalance-auto-state", ".json");
         RecordingTradeGateway tradeGateway = new RecordingTradeGateway();
@@ -900,6 +952,14 @@ class RebalanceServiceTest {
                 new FileRebalanceStateStore(stateFile),
                 new NoopEventLogger(),
                 new AlertService(new NoopEventLogger())
+        );
+    }
+
+    private WorkingOrder openOrder(String clientOrderId, TradeSide side, Instant createdAt) {
+        return new WorkingOrder(
+                "BTCUSDT", clientOrderId, clientOrderId + "-exchange", side, OrderType.LIMIT,
+                new BigDecimal("100"), new BigDecimal("0.005"), false, OrderStatus.NEW,
+                createdAt, createdAt
         );
     }
 

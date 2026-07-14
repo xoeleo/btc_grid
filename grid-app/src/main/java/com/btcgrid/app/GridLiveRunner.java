@@ -44,6 +44,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 public class GridLiveRunner implements AutoCloseable, PrivateExecutionListener, PrivateFundingFeeListener, PrivateOrderListener, PrivateStreamLifecycleListener {
 
+    private static final Duration OPEN_ORDER_VISIBILITY_GRACE = Duration.ofSeconds(10);
+
     private final GridProperties properties;
     private final BybitSdkMarketDataGateway marketDataGateway;
     private final BybitPrivateStreamGateway privateStreamGateway;
@@ -755,11 +757,13 @@ public class GridLiveRunner implements AutoCloseable, PrivateExecutionListener, 
                     .collect(Collectors.toSet());
             remoteOpenOrders.forEach(workingOrderRegistry::trackRemote);
 
+            Instant visibilityCutoff = Instant.now().minus(OPEN_ORDER_VISIBILITY_GRACE);
             List<WorkingOrder> locallyOpenButMissingRemote = workingOrderRegistry.snapshot().stream()
                     .filter(GridLiveRunner::isActiveOrder)
                     .filter(order -> isStrategySymbol(order.symbol()))
                     .filter(order -> order.clientOrderId() != null && order.clientOrderId().startsWith("GRID_"))
                     .filter(order -> !remoteOpenClientOrderIds.contains(order.clientOrderId()))
+                    .filter(order -> order.createdAt() == null || !order.createdAt().isAfter(visibilityCutoff))
                     .toList();
             if (locallyOpenButMissingRemote.isEmpty()) {
                 return OpenOrderReconciliation.none();

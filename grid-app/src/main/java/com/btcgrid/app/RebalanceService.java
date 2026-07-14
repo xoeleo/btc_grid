@@ -164,6 +164,7 @@ public class RebalanceService {
                             reason));
                     return;
                 }
+                cancelOrphanOrdersIfNeeded();
                 requoteTimedOutPairIfNeeded(marketSnapshot);
                 recoverMissingPairIfNeeded(marketSnapshot);
                 save(stateForSnapshot("GRID_ACTIVE", marketSnapshot, accountSnapshot, lockedTargetRatio, currentRatio, samples,
@@ -706,6 +707,39 @@ public class RebalanceService {
         } else {
             eventLogger.info("rebalance.grid.recover-pair", Map.of("symbol", settings.symbol(), "count", commands.size()));
         }
+    }
+
+    void cancelOrphanOrdersIfNeeded() {
+        if (rebalanceEngine == null || rebalanceCommandExecutor == null || rebalanceLedger == null) {
+            return;
+        }
+        ActiveOrderPair activePair = rebalanceEngine.runtimeState().activeOrderPair();
+        if (activePair == null) {
+            return;
+        }
+        List<WorkingOrder> orphanOrders = activeRebalanceOrders().stream()
+                .filter(order -> !activePair.contains(order.clientOrderId()))
+                .toList();
+        if (orphanOrders.isEmpty()) {
+            return;
+        }
+        List<StrategyCommand> cancels = orphanOrders.stream()
+                .map(order -> StrategyCommand.cancel(order.symbol(), order.clientOrderId(), "rebalance-orphan-order"))
+                .toList();
+        List<String> failures = rebalanceCommandExecutor.execute(cancels, rebalanceLedger.snapshot());
+        if (!failures.isEmpty()) {
+            eventLogger.error("rebalance.grid.orphan.cancel.failed", Map.of(
+                    "symbol", settings.symbol(),
+                    "clientOrderIds", orphanOrders.stream().map(WorkingOrder::clientOrderId).toList(),
+                    "message", failures.get(0)
+            ));
+            return;
+        }
+        eventLogger.warn("rebalance.grid.orphan.canceled", Map.of(
+                "symbol", settings.symbol(),
+                "count", orphanOrders.size(),
+                "clientOrderIds", orphanOrders.stream().map(WorkingOrder::clientOrderId).toList()
+        ));
     }
 
     private boolean completePair(List<WorkingOrder> activeOrders) {

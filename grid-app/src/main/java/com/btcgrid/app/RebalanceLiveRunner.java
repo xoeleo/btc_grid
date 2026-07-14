@@ -30,6 +30,8 @@ import java.util.stream.Collectors;
 
 public class RebalanceLiveRunner implements AutoCloseable, PrivateExecutionListener, PrivateFundingFeeListener, PrivateOrderListener, PrivateStreamLifecycleListener {
 
+    private static final Duration OPEN_ORDER_VISIBILITY_GRACE = Duration.ofSeconds(10);
+
     private final RebalanceService rebalanceService;
     private final BybitPrivateStreamGateway privateStreamGateway;
     private final BybitOrderQueryGateway orderQueryGateway;
@@ -371,11 +373,13 @@ public class RebalanceLiveRunner implements AutoCloseable, PrivateExecutionListe
                     .collect(Collectors.toSet());
             remoteOpenOrders.forEach(workingOrderRegistry::trackRemote);
 
+            Instant visibilityCutoff = Instant.now().minus(OPEN_ORDER_VISIBILITY_GRACE);
             List<WorkingOrder> locallyOpenButMissingRemote = workingOrderRegistry.snapshot().stream()
                     .filter(RebalanceLiveRunner::isActiveOrder)
                     .filter(order -> order.symbol() != null && order.symbol().equalsIgnoreCase(symbol))
                     .filter(order -> RebalanceService.isRebalanceClientOrder(order.clientOrderId()))
                     .filter(order -> !remoteOpenClientOrderIds.contains(order.clientOrderId()))
+                    .filter(order -> order.createdAt() == null || !order.createdAt().isAfter(visibilityCutoff))
                     .toList();
             if (locallyOpenButMissingRemote.isEmpty()) {
                 return OpenOrderReconciliation.none();
