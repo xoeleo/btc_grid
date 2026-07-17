@@ -26,6 +26,8 @@ public interface FillStore {
 
     List<FillRecord> cycleFills(String cycleExecutionId);
 
+    CycleFillPage cycleFillsPage(String cycleExecutionId, int limit, int offset);
+
     List<FillRecord> currentCycleFills(String symbol);
 
     CurrentCycleSummary currentCycle(String symbol, Instant now, BigDecimal markPrice);

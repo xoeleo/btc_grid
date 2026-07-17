@@ -18,7 +18,9 @@ import com.btcgrid.common.indicator.FourHourIndicatorCalculator;
 import com.btcgrid.common.model.InstrumentSpec;
 import com.btcgrid.common.model.GridState;
 import com.btcgrid.common.model.MarketSnapshot;
+import com.btcgrid.common.model.OrderIntent;
 import com.btcgrid.common.model.OrderStatus;
+import com.btcgrid.common.model.OrderType;
 import com.btcgrid.common.model.ProductCategory;
 import com.btcgrid.common.model.TradeSide;
 import com.btcgrid.common.model.WorkingOrder;
@@ -34,10 +36,11 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.math.BigDecimal;
 import java.math.MathContext;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -51,6 +54,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class LiveControlService {
 
@@ -78,6 +82,9 @@ public class LiveControlService {
         return thread;
     });
     private final AtomicReference<FlattenStopStatus> flattenStopStatus = new AtomicReference<>(FlattenStopStatus.idle());
+    private final AtomicBoolean flattenStopLocked = new AtomicBoolean(false);
+    private final Path flattenStopLockPath;
+    private final Path solContractBollMonitorStatusPath;
     private volatile GridLiveRunner activeRunner;
     private volatile RebalanceLiveRunner activeRebalanceRunner;
     private volatile GridStrategyConfig lastConfig;
@@ -110,6 +117,10 @@ public class LiveControlService {
         this.statusStore = statusStore;
         this.fallbackWorkingOrderRegistry = fallbackWorkingOrderRegistry;
         this.fillStore = fillStore;
+        Path runtimeStatePath = PathResolver.absolutePath(baseProperties.runtimeSettings().stateFilePath());
+        this.flattenStopLockPath = Path.of(runtimeStatePath + ".flatten-stop.lock");
+        this.solContractBollMonitorStatusPath = runtimeStatePath.resolveSibling("sol-contract-boll-monitor.json");
+        this.flattenStopLocked.set(Files.exists(flattenStopLockPath));
         this.lastConfig = baseProperties.strategyConfig();
         RebalanceSettings rebalanceSettings = currentRebalanceSettings();
         if (rebalanceSettings.enabled()) {
@@ -118,6 +129,9 @@ public class LiveControlService {
     }
 
     public synchronized Map<String, Object> start(StartRequest request) {
+        if (flattenStopLocked.get()) {
+            return Map.of("ok", false, "message", "清仓停止锁已启用，请先在页面手动解除锁定");
+        }
         if (activeRunner != null && activeRunner.isRunning()) {
             return Map.of("ok", false, "message", "strategy already running");
         }
@@ -371,14 +385,26 @@ public class LiveControlService {
 
     public synchronized Map<String, Object> flattenAndStop() {
         GridLiveRunner runner = activeRunner;
-        if (runner == null || !runner.isRunning()) {
-            return Map.of("ok", false, "message", "strategy not running");
-        }
         FlattenStopStatus current = flattenStopStatus.get();
         if (current.running()) {
             return Map.of("ok", true, "message", "平仓并停止正在执行", "flattenStop", current);
         }
 
+        if (runner == null || !runner.isRunning()) {
+            if (!flattenStopLocked.get()) {
+                return Map.of("ok", false, "message", "strategy not running");
+            }
+            FlattenStopStatus submitted = FlattenStopStatus.running(Instant.now(), "按真实钱包余额重试清仓");
+            flattenStopStatus.set(submitted);
+            flattenStopExecutor.submit(() -> runDetachedSpotFlatten(lastConfig, submitted.startedAt()));
+            return Map.of("ok", true, "message", "重试清仓已提交，后台执行中", "flattenStop", submitted);
+        }
+
+        try {
+            persistFlattenStopLock();
+        } catch (RuntimeException e) {
+            return Map.of("ok", false, "message", e.getMessage());
+        }
         FlattenStopStatus submitted = FlattenStopStatus.running(Instant.now(), "撤单和平仓任务已提交");
         flattenStopStatus.set(submitted);
         flattenStopExecutor.submit(() -> runFlattenAndStop(runner, submitted.startedAt()));
@@ -386,6 +412,9 @@ public class LiveControlService {
     }
 
     public synchronized Map<String, Object> resume() {
+        if (flattenStopLocked.get()) {
+            return Map.of("ok", false, "message", "清仓停止锁已启用，请先在页面手动解除锁定");
+        }
         if (activeRunner != null && activeRunner.isRunning()) {
             return Map.of("ok", false, "message", "strategy already running");
         }
@@ -526,9 +555,30 @@ public class LiveControlService {
                 "rebalanceRunning", activeRebalanceRunner != null && activeRebalanceRunner.isRunning(),
                 "canResume", (runner == null || !runner.isRunning()) && canResume(snapshot),
                 "stopAfterCycle", runner != null && runner.isStopAfterCycleRequested(),
+                "flattenStopLocked", flattenStopLocked.get(),
                 "flattenStop", flattenStopStatus.get(),
                 "config", lastConfig
         );
+    }
+
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> solContractBollMonitorState() {
+        if (!Files.exists(solContractBollMonitorStatusPath)) {
+            return Map.of(
+                    "enabled", false,
+                    "state", "NOT_CONFIGURED",
+                    "message", "15分钟布林自动监控尚未运行"
+            );
+        }
+        try {
+            return OBJECT_MAPPER.readValue(Files.readString(solContractBollMonitorStatusPath), Map.class);
+        } catch (IOException e) {
+            return Map.of(
+                    "enabled", false,
+                    "state", "ERROR",
+                    "message", "读取自动监控状态失败: " + e.getMessage()
+            );
+        }
     }
 
     private void recordSpotInventoryDepletedCycleEnd(
@@ -610,11 +660,19 @@ public class LiveControlService {
     }
 
     public PageResult<FillRecord> rebalanceFillsPage(int limit, int offset) {
+        return rebalanceFillsPage(limit, offset, "");
+    }
+
+    public PageResult<FillRecord> rebalanceFillsPage(int limit, int offset, String price) {
         int normalizedLimit = normalizePageLimit(limit);
         int normalizedOffset = Math.max(0, offset);
         List<FillRecord> records = new ArrayList<>(fillStore.currentCycleFills(
                 rebalanceLedgerSymbol(currentRebalanceSettings().symbol())
         ));
+        BigDecimal priceFilter = parsePriceFilter(price);
+        if (priceFilter != null) {
+            records.removeIf(fill -> fill == null || fill.price() == null || fill.price().compareTo(priceFilter) != 0);
+        }
         java.util.Collections.reverse(records);
         if (normalizedOffset >= records.size()) {
             return new PageResult<>(List.of(), normalizedLimit, normalizedOffset, false);
@@ -628,6 +686,17 @@ public class LiveControlService {
                 normalizedOffset,
                 hasMore
         );
+    }
+
+    private static BigDecimal parsePriceFilter(String price) {
+        if (price == null || price.isBlank()) {
+            return null;
+        }
+        try {
+            return new BigDecimal(price.trim());
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
     }
 
     public List<FillRecord> rebalanceFundingFees() {
@@ -1172,6 +1241,11 @@ public class LiveControlService {
                     "startedAt", startedAt.toString()
             ));
             runner.flattenAndStop();
+            synchronized (this) {
+                if (activeRunner == runner) {
+                    activeRunner = null;
+                }
+            }
             FlattenStopStatus completed = FlattenStopStatus.completed(startedAt, Instant.now(), "平仓并停止已完成");
             flattenStopStatus.set(completed);
             eventLogger.info("flatten.stop.completed", Map.of(
@@ -1180,6 +1254,11 @@ public class LiveControlService {
                     "finishedAt", completed.finishedAt().toString()
             ));
         } catch (RuntimeException e) {
+            synchronized (this) {
+                if (activeRunner == runner) {
+                    activeRunner = null;
+                }
+            }
             FlattenStopStatus failed = FlattenStopStatus.failed(startedAt, Instant.now(), e.getMessage());
             flattenStopStatus.set(failed);
             eventLogger.error("flatten.stop.failed", Map.of(
@@ -1193,6 +1272,297 @@ public class LiveControlService {
         }
     }
 
+    private void runDetachedSpotFlatten(GridStrategyConfig config, Instant startedAt) {
+        try {
+            if (config.category() != ProductCategory.SPOT || !config.entryDirection().isSpotLongOnly()) {
+                throw new IllegalStateException("停止状态重试清仓目前仅支持现货多头模式");
+            }
+            String symbol = config.symbol();
+            eventLogger.info("flatten.stop.retry.started", Map.of(
+                    "symbol", symbol,
+                    "startedAt", startedAt.toString()
+            ));
+
+            BybitSdkTradeGateway tradeGateway = new BybitSdkTradeGateway(clientFactory, config.category());
+            List<String> cancelFailures = new ArrayList<>();
+            new BybitSdkOrderQueryGateway(clientFactory, config.category()).fetchOpenOrders(symbol).stream()
+                    .filter(order -> order.clientOrderId() != null && order.clientOrderId().startsWith("GRID_"))
+                    .forEach(order -> {
+                        try {
+                            tradeGateway.cancel(symbol, order.clientOrderId());
+                            eventLogger.info("command.cancel", Map.of(
+                                    "commandType", "CANCEL",
+                                    "symbol", symbol,
+                                    "clientOrderId", order.clientOrderId(),
+                                    "reason", "manual-flatten-retry"
+                            ));
+                        } catch (RuntimeException e) {
+                            cancelFailures.add(e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+                        }
+                    });
+            if (!cancelFailures.isEmpty()) {
+                throw new IllegalStateException("重试清仓撤单失败: " + String.join("; ", cancelFailures));
+            }
+
+            LiveCommandExecutor commandExecutor = new LiveCommandExecutor(
+                    tradeGateway,
+                    new WorkingOrderRegistry(),
+                    new RiskGuardService(config),
+                    eventLogger,
+                    alertService,
+                    config.category(),
+                    new BybitSdkAccountGateway(clientFactory)
+            );
+            BigDecimal walletQty = commandExecutor.spotBaseWalletBalance(symbol);
+            InstrumentSpec instrumentSpec = new BybitSdkMarketDataGateway(
+                    clientFactory,
+                    config.category(),
+                    new FourHourIndicatorCalculator(),
+                    config.emaLength4h(),
+                    config.bollLength4h(),
+                    config.bollStdDevMultiplier()
+            ).loadInstrumentSpec(symbol);
+            BigDecimal flattenQty = instrumentSpec.roundQtyDown(walletQty);
+            if (flattenQty.compareTo(instrumentSpec.minOrderQty()) >= 0) {
+                OrderIntent flatten = new OrderIntent(
+                        symbol,
+                        "MANUAL_FLATTEN_" + System.currentTimeMillis(),
+                        TradeSide.SELL,
+                        OrderType.MARKET,
+                        flattenQty,
+                        null,
+                        false,
+                        "manual-flatten-and-stop"
+                );
+                List<String> failures = commandExecutor.executeManualFlatten(flatten, fallbackStatusProvider.snapshot().ledgerSnapshot());
+                if (!failures.isEmpty()) {
+                    throw new IllegalStateException("重试清仓下单失败: " + String.join("; ", failures));
+                }
+                List<FillEvent> confirmedFills = awaitManualFlattenFills(symbol, flatten.clientOrderId(), flattenQty);
+                BigDecimal referencePrice = confirmedFills.get(0).fillPrice();
+                Instant referenceTime = confirmedFills.get(0).fillTime();
+                recordInventoryReconciliation(symbol, walletQty, referencePrice, referenceTime, flatten.clientOrderId());
+                confirmedFills.forEach(this::recordFill);
+                recordSpotCycleEnd(symbol, "manual flatten and stop");
+            } else {
+                eventLogger.info("manual-flatten.dust-skipped", Map.of(
+                        "symbol", symbol,
+                        "walletQty", walletQty,
+                        "qtyStep", instrumentSpec.qtyStep(),
+                        "minOrderQty", instrumentSpec.minOrderQty()
+                ));
+            }
+
+            FlattenStopStatus completed = FlattenStopStatus.completed(startedAt, Instant.now(),
+                    "清仓停止已完成，提交数量 " + flattenQty.stripTrailingZeros().toPlainString());
+            flattenStopStatus.set(completed);
+            eventLogger.info("flatten.stop.retry.completed", Map.of(
+                    "symbol", symbol,
+                    "walletQty", walletQty,
+                    "submittedQty", flattenQty,
+                    "finishedAt", completed.finishedAt().toString()
+            ));
+        } catch (RuntimeException e) {
+            FlattenStopStatus failed = FlattenStopStatus.failed(startedAt, Instant.now(),
+                    e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+            flattenStopStatus.set(failed);
+            eventLogger.error("flatten.stop.retry.failed", Map.of(
+                    "startedAt", startedAt.toString(),
+                    "finishedAt", failed.finishedAt().toString(),
+                    "message", failed.message()
+            ));
+            alertService.warning("FLATTEN_STOP_RETRY_FAILED", "Flatten stop retry failed", Map.of(
+                    "message", failed.message()
+            ));
+        }
+    }
+
+    private List<FillEvent> awaitManualFlattenFills(String symbol, String clientOrderId, BigDecimal expectedQty) {
+        BybitSdkOrderQueryGateway queryGateway = new BybitSdkOrderQueryGateway(clientFactory, ProductCategory.SPOT);
+        Instant deadline = Instant.now().plusSeconds(30);
+        while (Instant.now().isBefore(deadline)) {
+            List<FillEvent> fills = queryGateway.fetchRecentExecutions(symbol, Set.of(clientOrderId));
+            BigDecimal filledQty = fills.stream()
+                    .map(FillEvent::fillQty)
+                    .filter(java.util.Objects::nonNull)
+                    .reduce(BigDecimal.ZERO, BigDecimal::add);
+            if (!fills.isEmpty() && filledQty.compareTo(expectedQty) >= 0) {
+                return fills.stream().sorted(Comparator.comparing(FillEvent::fillTime)).toList();
+            }
+            try {
+                Thread.sleep(500L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("等待清仓成交时被中断", e);
+            }
+        }
+        throw new IllegalStateException("清仓订单已提交，但 30 秒内未确认完整成交: " + clientOrderId);
+    }
+
+    public synchronized Map<String, Object> reconcileFlattenCycle() {
+        GridLiveRunner runner = activeRunner;
+        if (runner != null && runner.isRunning()) {
+            return Map.of("ok", false, "message", "策略运行中，不能补录清仓 Cycle");
+        }
+        if (!flattenStopLocked.get()) {
+            return Map.of("ok", false, "message", "清仓停止锁未启用");
+        }
+        GridStrategyConfig config = lastConfig;
+        if (config.category() != ProductCategory.SPOT || !config.entryDirection().isSpotLongOnly()) {
+            return Map.of("ok", false, "message", "仅支持补录现货多头清仓 Cycle");
+        }
+        List<FillRecord> openCycle = fillStore.currentCycleFills(config.symbol());
+        if (openCycle.isEmpty()) {
+            return Map.of("ok", true, "message", "没有待补录的当前 Cycle", "fillsAdded", 0);
+        }
+        Instant after = openCycle.get(openCycle.size() - 1).time();
+        List<FillEvent> missing = new BybitSdkOrderQueryGateway(clientFactory, config.category())
+                .fetchRecentExecutions(config.symbol())
+                .stream()
+                .filter(fill -> fill.fillTime() != null && fill.fillTime().isAfter(after))
+                .sorted(Comparator.comparing(FillEvent::fillTime))
+                .map(this::normalizeUnlinkedFill)
+                .toList();
+        boolean hasFlattenFill = missing.stream()
+                .anyMatch(fill -> fill.clientOrderId() != null && fill.clientOrderId().startsWith("MANUAL_FLATTEN_"));
+        if (!hasFlattenFill) {
+            return Map.of("ok", false, "message", "Bybit 最近成交中未找到本次 MANUAL_FLATTEN 成交");
+        }
+        List<FillEvent> flattenFills = missing.stream()
+                .filter(fill -> fill.clientOrderId() != null && fill.clientOrderId().startsWith("MANUAL_FLATTEN_"))
+                .toList();
+        List<FillEvent> beforeFlatten = missing.stream()
+                .filter(fill -> fill.clientOrderId() == null || !fill.clientOrderId().startsWith("MANUAL_FLATTEN_"))
+                .toList();
+        beforeFlatten.forEach(this::recordFill);
+        BigDecimal currentWalletQty = new LiveCommandExecutor(
+                new BybitSdkTradeGateway(clientFactory, config.category()),
+                new WorkingOrderRegistry(),
+                new RiskGuardService(config),
+                eventLogger,
+                alertService,
+                config.category(),
+                new BybitSdkAccountGateway(clientFactory)
+        ).spotBaseWalletBalance(config.symbol());
+        BigDecimal flattenFilledQty = flattenFills.stream()
+                .map(FillEvent::fillQty)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        BigDecimal walletBeforeFlatten = currentWalletQty.add(flattenFilledQty, MATH_CONTEXT);
+        FillEvent firstFlattenFill = flattenFills.get(0);
+        recordInventoryReconciliation(
+                config.symbol(),
+                walletBeforeFlatten,
+                firstFlattenFill.fillPrice(),
+                firstFlattenFill.fillTime(),
+                firstFlattenFill.clientOrderId()
+        );
+        flattenFills.forEach(this::recordFill);
+        recordSpotCycleEnd(config.symbol(), "manual flatten and stop");
+        List<String> executionIds = missing.stream().map(FillEvent::executionId).toList();
+        eventLogger.info("flatten.cycle.reconciled", Map.of(
+                "symbol", config.symbol(),
+                "after", after.toString(),
+                "fillsAdded", missing.size(),
+                "executionIds", executionIds
+        ));
+        return Map.of(
+                "ok", true,
+                "message", "清仓成交与历史 Cycle 已补录",
+                "fillsAdded", missing.size(),
+                "executionIds", executionIds
+        );
+    }
+
+    private void recordInventoryReconciliation(
+            String symbol,
+            BigDecimal realWalletQty,
+            BigDecimal referencePrice,
+            Instant referenceTime,
+            String flattenClientOrderId
+    ) {
+        List<FillRecord> current = fillStore.currentCycleFills(symbol);
+        if (current.isEmpty()) {
+            return;
+        }
+        BigDecimal recordedQty = current.get(current.size() - 1).cumulativeQty();
+        BigDecimal delta = recordedQty.subtract(realWalletQty, MATH_CONTEXT);
+        if (delta.abs().compareTo(new BigDecimal("0.000001")) < 0) {
+            return;
+        }
+        TradeSide side = delta.signum() > 0 ? TradeSide.SELL : TradeSide.BUY;
+        BigDecimal qty = delta.abs();
+        String suffix = flattenClientOrderId == null ? Long.toString(System.currentTimeMillis()) : flattenClientOrderId;
+        FillEvent adjustment = new FillEvent(
+                "INVENTORY_RECONCILE_" + suffix,
+                symbol,
+                "INVENTORY_RECONCILE_" + suffix,
+                side,
+                qty,
+                referencePrice,
+                referenceTime.minusMillis(1),
+                qty.multiply(referencePrice, MATH_CONTEXT),
+                BigDecimal.ZERO,
+                "USDT"
+        );
+        recordFill(adjustment);
+        eventLogger.warn("flatten.inventory.reconciled", Map.of(
+                "symbol", symbol,
+                "recordedQty", recordedQty,
+                "realWalletQty", realWalletQty,
+                "adjustmentSide", side.name(),
+                "adjustmentQty", qty,
+                "referencePrice", referencePrice
+        ));
+    }
+
+    private FillEvent normalizeUnlinkedFill(FillEvent fill) {
+        if (fill.clientOrderId() != null && !fill.clientOrderId().isBlank()) {
+            return fill;
+        }
+        return new FillEvent(
+                fill.executionId(),
+                fill.symbol(),
+                "EXTERNAL_FILL_" + fill.executionId(),
+                fill.side(),
+                fill.fillQty(),
+                fill.fillPrice(),
+                fill.fillTime(),
+                fill.fillValue(),
+                fill.fee(),
+                fill.feeCurrency()
+        );
+    }
+
+    public synchronized Map<String, Object> unlockFlattenStop() {
+        GridLiveRunner runner = activeRunner;
+        if (runner != null && runner.isRunning()) {
+            return Map.of("ok", false, "message", "策略仍在运行，不能解除清仓停止锁");
+        }
+        try {
+            Files.deleteIfExists(flattenStopLockPath);
+            flattenStopLocked.set(false);
+            flattenStopStatus.set(FlattenStopStatus.idle());
+            eventLogger.info("flatten.stop.unlocked", Map.of("lockFile", flattenStopLockPath.toString()));
+            return Map.of("ok", true, "message", "清仓停止锁已解除");
+        } catch (IOException e) {
+            return Map.of("ok", false, "message", "解除清仓停止锁失败: " + e.getMessage());
+        }
+    }
+
+    private void persistFlattenStopLock() {
+        try {
+            Path parent = flattenStopLockPath.getParent();
+            if (parent != null) {
+                Files.createDirectories(parent);
+            }
+            Files.writeString(flattenStopLockPath, Instant.now().toString());
+            flattenStopLocked.set(true);
+            eventLogger.info("flatten.stop.locked", Map.of("lockFile", flattenStopLockPath.toString()));
+        } catch (IOException e) {
+            throw new IllegalStateException("无法写入清仓停止锁: " + e.getMessage(), e);
+        }
+    }
+
     public List<FillRecord> recentFills() {
         return fillStore.currentCycleFills(snapshot().symbol());
     }
@@ -1203,6 +1573,14 @@ public class LiveControlService {
 
     public List<FillRecord> cycleFills(String cycleExecutionId) {
         return fillStore.cycleFills(cycleExecutionId);
+    }
+
+    public CycleFillPage cycleFillsPage(String cycleExecutionId, int limit, int offset) {
+        return fillStore.cycleFillsPage(
+                cycleExecutionId,
+                normalizePageLimit(limit),
+                Math.max(0, offset)
+        );
     }
 
     private static int normalizePageLimit(int limit) {
@@ -1279,7 +1657,10 @@ public class LiveControlService {
                 : runtimeSnapshot.latestMarketSnapshot().markPrice();
         BigDecimal floatingPnlAtFill = cumulativeProfit(cumulativeQty, cumulativeValue, cumulativeFee, fillEvent.fillPrice());
         BigDecimal totalPnlAtFill = cumulativeProfit(cumulativeQty, cumulativeValue, cumulativeFee, markPrice);
-        String fillMetadataJson = profitReduceBoostMetadataJson(fillEvent, currentCycleFills, runtimeSnapshot);
+        String fillMetadataJson = fillEvent.clientOrderId() != null
+                && fillEvent.clientOrderId().startsWith("INVENTORY_RECONCILE_")
+                ? inventoryReconciliationMetadataJson(currentCycleFills)
+                : profitReduceBoostMetadataJson(fillEvent, currentCycleFills, runtimeSnapshot);
         FillRecord record = new FillRecord(
                 fillEvent.fillTime(),
                 fillEvent.symbol(),
@@ -1842,6 +2223,18 @@ public class LiveControlService {
             meta.put("profitReduceBoostBaseQty", boost.baseQty());
             meta.put("profitReduceBoostOrderQty", boost.boostedQty());
         }
+        try {
+            return OBJECT_MAPPER.writeValueAsString(meta);
+        } catch (JsonProcessingException e) {
+            return null;
+        }
+    }
+
+    private String inventoryReconciliationMetadataJson(List<FillRecord> currentCycleFills) {
+        Map<String, Object> meta = new LinkedHashMap<>();
+        meta.put("inventoryReconciliation", true);
+        meta.put("reason", "real wallet quantity differed from cycle ledger before manual flatten");
+        meta.put("cumulativeProfitReduceBoostQty", latestProfitReduceBoostCumulative(currentCycleFills));
         try {
             return OBJECT_MAPPER.writeValueAsString(meta);
         } catch (JsonProcessingException e) {

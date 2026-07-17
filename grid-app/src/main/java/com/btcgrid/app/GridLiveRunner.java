@@ -12,6 +12,7 @@ import com.btcgrid.common.model.FillEvent;
 import com.btcgrid.common.model.FundingFeeEvent;
 import com.btcgrid.common.model.GridState;
 import com.btcgrid.common.model.MarketSnapshot;
+import com.btcgrid.common.model.InstrumentSpec;
 import com.btcgrid.common.model.OrderIntent;
 import com.btcgrid.common.model.OrderStatus;
 import com.btcgrid.common.model.OrderType;
@@ -485,32 +486,60 @@ public class GridLiveRunner implements AutoCloseable, PrivateExecutionListener, 
     }
 
     public void flattenAndStop() {
-        cancelWorkingOrders();
-        BigDecimal netQty = strategyLedger.snapshot().netQty();
-        if (netQty.signum() != 0) {
-            TradeSide side = netQty.signum() > 0 ? TradeSide.SELL : TradeSide.BUY;
-            OrderIntent flatten = new OrderIntent(
-                    properties.strategyConfig().symbol(),
-                    "MANUAL_FLATTEN_" + System.currentTimeMillis(),
-                    side,
-                    OrderType.MARKET,
-                    netQty.abs(),
-                    null,
-                    !properties.strategyConfig().entryDirection().isSpotLongOnly(),
-                    "manual-flatten-and-stop"
-            );
-            commandExecutor.execute(List.of(StrategyCommand.place(flatten)), strategyLedger.snapshot());
+        RuntimeException failure = null;
+        try {
+            List<String> cancelFailures = cancelWorkingOrders();
+            if (!cancelFailures.isEmpty()) {
+                throw new IllegalStateException("撤单失败: " + String.join("; ", cancelFailures));
+            }
+            BigDecimal netQty = properties.strategyConfig().entryDirection().isSpotLongOnly()
+                    ? commandExecutor.spotBaseWalletBalance(properties.strategyConfig().symbol())
+                    : strategyLedger.snapshot().netQty();
+            if (netQty.signum() != 0) {
+                InstrumentSpec instrumentSpec = marketDataGateway.loadInstrumentSpec(properties.strategyConfig().symbol());
+                BigDecimal flattenQty = instrumentSpec.roundQtyDown(netQty.abs());
+                if (flattenQty.compareTo(instrumentSpec.minOrderQty()) < 0) {
+                    eventLogger.info("manual-flatten.dust-skipped", Map.of(
+                            "symbol", properties.strategyConfig().symbol(),
+                            "walletQty", netQty.abs(),
+                            "qtyStep", instrumentSpec.qtyStep(),
+                            "minOrderQty", instrumentSpec.minOrderQty()
+                    ));
+                    return;
+                }
+                TradeSide side = netQty.signum() > 0 ? TradeSide.SELL : TradeSide.BUY;
+                OrderIntent flatten = new OrderIntent(
+                        properties.strategyConfig().symbol(),
+                        "MANUAL_FLATTEN_" + System.currentTimeMillis(),
+                        side,
+                        OrderType.MARKET,
+                        flattenQty,
+                        null,
+                        !properties.strategyConfig().entryDirection().isSpotLongOnly(),
+                        "manual-flatten-and-stop"
+                );
+                List<String> flattenFailures = commandExecutor.executeManualFlatten(flatten, strategyLedger.snapshot());
+                if (!flattenFailures.isEmpty()) {
+                    throw new IllegalStateException("清仓下单失败: " + String.join("; ", flattenFailures));
+                }
+            }
+        } catch (RuntimeException e) {
+            failure = e;
+        } finally {
+            close();
         }
-        close();
+        if (failure != null) {
+            throw failure;
+        }
     }
 
-    private void cancelWorkingOrders() {
+    private List<String> cancelWorkingOrders() {
         List<StrategyCommand> cancels = new ArrayList<>();
         workingOrderRegistry.snapshot().stream()
                 .filter(order -> order != null && isStrategySymbol(order.symbol()))
                 .filter(order -> order.status() == OrderStatus.NEW)
                 .forEach(order -> cancels.add(StrategyCommand.cancel(order.symbol(), order.clientOrderId(), "manual-stop")));
-        commandExecutor.execute(cancels, strategyLedger.snapshot());
+        return commandExecutor.execute(cancels, strategyLedger.snapshot());
     }
 
     private synchronized void pollMarket() {

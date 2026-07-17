@@ -70,6 +70,15 @@ public class BybitSdkOrderQueryGateway implements BybitOrderQueryGateway {
         if (clientOrderIds == null || clientOrderIds.isEmpty()) {
             return List.of();
         }
+        return fetchRecentExecutionsInternal(symbol, clientOrderIds);
+    }
+
+    /** Returns recent executions for the symbol, including orders without an orderLinkId. */
+    public List<FillEvent> fetchRecentExecutions(String symbol) {
+        return fetchRecentExecutionsInternal(symbol, null);
+    }
+
+    private List<FillEvent> fetchRecentExecutionsInternal(String symbol, Set<String> clientOrderIds) {
         BybitApiTradeRestClient client = clientFactory.createTradeRestClient();
         TradeOrderRequest request = TradeOrderRequest.builder()
                 .category(BybitSdkMapper.toCategory(category))
@@ -84,7 +93,7 @@ public class BybitSdkOrderQueryGateway implements BybitOrderQueryGateway {
         }
         for (JsonNode node : list) {
             String clientOrderId = node.path("orderLinkId").asText("");
-            if (clientOrderId.isBlank() || !clientOrderIds.contains(clientOrderId)) {
+            if (clientOrderIds != null && (clientOrderId.isBlank() || !clientOrderIds.contains(clientOrderId))) {
                 continue;
             }
             String executionId = node.path("execId").asText("");

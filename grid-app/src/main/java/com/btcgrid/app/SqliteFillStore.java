@@ -256,14 +256,22 @@ public class SqliteFillStore implements FillStore {
 
     @Override
     public synchronized List<FillRecord> cycleFills(String cycleExecutionId) {
+        CycleFillPage page = cycleFillsPage(cycleExecutionId, Integer.MAX_VALUE, 0);
+        return page.items();
+    }
+
+    @Override
+    public synchronized CycleFillPage cycleFillsPage(String cycleExecutionId, int limit, int offset) {
+        int normalizedLimit = Math.max(1, limit);
+        int normalizedOffset = Math.max(0, offset);
         if (cycleExecutionId == null || cycleExecutionId.isBlank()) {
-            return List.of();
+            return CycleFillPage.empty(normalizedLimit, normalizedOffset);
         }
         FillRecord cycleEnd = cycleEnd(cycleExecutionId.trim());
         if (cycleEnd == null) {
-            return List.of();
+            return CycleFillPage.empty(normalizedLimit, normalizedOffset);
         }
-        String sql = """
+        String pageSql = """
                 select execution_id, fill_time_millis, symbol, side, qty, price,
                        value, fee, fee_currency, cumulative_qty, cumulative_value, cumulative_fee,
                        net_qty, avg_entry_price, realized_pnl, floating_pnl_at_fill,
@@ -271,32 +279,145 @@ public class SqliteFillStore implements FillStore {
                   from fills
                  where side in ('BUY', 'SELL', 'FUNDING_FEE')
                    and symbol = ?
+                   and (fill_time_millis > ? or (fill_time_millis = ? and rowid >= ?))
+                   and fill_time_millis < ?
+                 order by fill_time_millis asc, rowid asc
+                 limit ? offset ?
+                """;
+        try (Connection connection = connect()) {
+            CycleWindow window = cycleWindow(connection, cycleEnd);
+            long total = cycleFillCount(connection, cycleEnd.symbol(), cycleEnd.time(), window);
+            if (normalizedOffset >= total) {
+                return new CycleFillPage(List.of(), normalizedLimit, normalizedOffset, false, total, cycleTurnoverBefore(
+                        connection, cycleEnd.symbol(), cycleEnd.time(), window, normalizedOffset
+                ));
+            }
+            List<FillRecord> fills = new ArrayList<>();
+            try (PreparedStatement statement = connection.prepareStatement(pageSql)) {
+                bindCycleWindow(statement, cycleEnd.symbol(), cycleEnd.time(), window);
+                statement.setInt(6, normalizedLimit == Integer.MAX_VALUE ? Integer.MAX_VALUE : normalizedLimit + 1);
+                statement.setInt(7, normalizedOffset);
+                try (ResultSet rs = statement.executeQuery()) {
+                    while (rs.next()) {
+                        fills.add(record(rs));
+                    }
+                }
+            }
+            boolean hasMore = fills.size() > normalizedLimit;
+            List<FillRecord> items = hasMore ? List.copyOf(fills.subList(0, normalizedLimit)) : List.copyOf(fills);
+            return new CycleFillPage(
+                    items,
+                    normalizedLimit,
+                    normalizedOffset,
+                    hasMore,
+                    total,
+                    cycleTurnoverBefore(connection, cycleEnd.symbol(), cycleEnd.time(), window, normalizedOffset)
+            );
+        } catch (SQLException e) {
+            throw new IllegalStateException("Failed to read cycle fills", e);
+        }
+    }
+
+    private CycleWindow cycleWindow(Connection connection, FillRecord cycleEnd) throws SQLException {
+        String sql = """
+                select rowid, fill_time_millis, client_order_id
+                  from fills
+                 where side in ('BUY', 'SELL', 'FUNDING_FEE')
+                   and symbol = ?
                    and fill_time_millis < ?
                  order by fill_time_millis desc, rowid desc
                 """;
-        List<FillRecord> fills = new ArrayList<>();
         String initialClientOrderId = null;
-        try (Connection connection = connect();
-             PreparedStatement statement = connection.prepareStatement(sql)) {
+        long startTime = 0;
+        long startRowId = 0;
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
             statement.setString(1, cycleEnd.symbol());
             statement.setLong(2, toMillis(cycleEnd.time()));
             try (ResultSet rs = statement.executeQuery()) {
                 while (rs.next()) {
-                    FillRecord record = record(rs);
-                    if (initialClientOrderId != null && !initialClientOrderId.equals(record.clientOrderId())) {
+                    String clientOrderId = rs.getString("client_order_id");
+                    if (initialClientOrderId != null && !initialClientOrderId.equals(clientOrderId)) {
                         break;
                     }
-                    fills.add(record);
-                    if (initialClientOrderId == null && ClientOrderIds.isInitialPositionOrder(record.clientOrderId())) {
-                        initialClientOrderId = record.clientOrderId();
+                    if (initialClientOrderId == null && ClientOrderIds.isInitialPositionOrder(clientOrderId)) {
+                        initialClientOrderId = clientOrderId;
+                    }
+                    if (initialClientOrderId != null) {
+                        startTime = rs.getLong("fill_time_millis");
+                        startRowId = rs.getLong("rowid");
                     }
                 }
             }
-        } catch (SQLException e) {
-            throw new IllegalStateException("Failed to read cycle fills", e);
         }
-        Collections.reverse(fills);
-        return fills;
+        return new CycleWindow(startTime, startRowId);
+    }
+
+    private long cycleFillCount(Connection connection, String symbol, Instant endTime, CycleWindow window) throws SQLException {
+        String sql = """
+                select count(*)
+                  from fills
+                 where side in ('BUY', 'SELL', 'FUNDING_FEE')
+                   and symbol = ?
+                   and (fill_time_millis > ? or (fill_time_millis = ? and rowid >= ?))
+                   and fill_time_millis < ?
+                """;
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            bindCycleWindow(statement, symbol, endTime, window);
+            try (ResultSet rs = statement.executeQuery()) {
+                return rs.next() ? rs.getLong(1) : 0;
+            }
+        }
+    }
+
+    private BigDecimal cycleTurnoverBefore(
+            Connection connection,
+            String symbol,
+            Instant endTime,
+            CycleWindow window,
+            int offset
+    ) throws SQLException {
+        if (offset <= 0) {
+            return BigDecimal.ZERO;
+        }
+        String sql = """
+                select side, value
+                  from fills
+                 where side in ('BUY', 'SELL', 'FUNDING_FEE')
+                   and symbol = ?
+                   and (fill_time_millis > ? or (fill_time_millis = ? and rowid >= ?))
+                   and fill_time_millis < ?
+                 order by fill_time_millis asc, rowid asc
+                 limit ?
+                """;
+        BigDecimal turnover = BigDecimal.ZERO;
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            bindCycleWindow(statement, symbol, endTime, window);
+            statement.setInt(6, offset);
+            try (ResultSet rs = statement.executeQuery()) {
+                while (rs.next()) {
+                    if ("BUY".equals(rs.getString("side")) || "SELL".equals(rs.getString("side"))) {
+                        turnover = turnover.add(decimal(rs.getString("value")).abs());
+                    }
+                }
+            }
+        }
+        return turnover;
+    }
+
+    private void bindCycleWindow(
+            PreparedStatement statement,
+            String symbol,
+            Instant endTime,
+            CycleWindow window
+    ) throws SQLException {
+        statement.setString(1, symbol);
+        statement.setLong(2, window.startTimeMillis());
+        statement.setLong(3, window.startTimeMillis());
+        statement.setLong(4, window.startRowId());
+        statement.setLong(5, toMillis(endTime));
+    }
+
+    private record CycleWindow(long startTimeMillis, long startRowId) {
     }
 
     @Override
@@ -637,6 +758,7 @@ public class SqliteFillStore implements FillStore {
             ensureColumn(connection, "cumulative_fee", "text not null default '0'");
             ensureColumn(connection, "config_json", "text");
             statement.execute("create index if not exists idx_fills_time on fills(fill_time_millis desc)");
+            statement.execute("create index if not exists idx_fills_symbol_time on fills(symbol, fill_time_millis desc)");
             statement.execute("""
                     create unique index if not exists idx_funding_fee_once
                       on fills(symbol, side, fill_time_millis)

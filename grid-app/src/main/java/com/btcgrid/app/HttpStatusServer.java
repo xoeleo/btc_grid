@@ -78,6 +78,7 @@ public class HttpStatusServer implements AutoCloseable {
         httpServer.createContext("/health", exchange -> writeJson(exchange, Map.of("ok", true)));
         if (liveControlService != null) {
             httpServer.createContext("/api/control", exchange -> writeJson(exchange, liveControlService.controlState()));
+            httpServer.createContext("/api/sol-contract-boll-monitor", exchange -> writeJson(exchange, liveControlService.solContractBollMonitorState()));
             httpServer.createContext("/api/rebalance-config", exchange -> {
                 if ("GET".equalsIgnoreCase(exchange.getRequestMethod())) {
                     writeJson(exchange, liveControlService.rebalanceConfig());
@@ -92,7 +93,8 @@ public class HttpStatusServer implements AutoCloseable {
             httpServer.createContext("/api/rebalance-history", exchange -> writeJson(exchange, liveControlService.rebalanceHistory()));
             httpServer.createContext("/api/rebalance-fills", exchange -> writeJson(exchange, liveControlService.rebalanceFillsPage(
                     queryInt(exchange, "limit", 50),
-                    queryInt(exchange, "offset", 0)
+                    queryInt(exchange, "offset", 0),
+                    queryParam(exchange, "price")
             )));
             httpServer.createContext("/api/rebalance-funding-fees", exchange -> writeJson(exchange, liveControlService.rebalanceFundingFees()));
             httpServer.createContext("/api/rebalance-cycles", exchange -> writeJson(exchange, liveControlService.rebalanceCyclesPage(
@@ -112,7 +114,11 @@ public class HttpStatusServer implements AutoCloseable {
             httpServer.createContext("/api/fills", exchange -> writeJson(exchange, liveControlService.recentFills()));
             httpServer.createContext("/api/cycles", exchange -> writeJson(exchange, liveControlService.recentCycles()));
             httpServer.createContext("/api/current-cycle", exchange -> writeJson(exchange, liveControlService.currentCycle()));
-            httpServer.createContext("/api/cycle-fills", exchange -> writeJson(exchange, liveControlService.cycleFills(queryParam(exchange, "executionId"))));
+            httpServer.createContext("/api/cycle-fills", exchange -> writeJson(exchange, liveControlService.cycleFillsPage(
+                    queryParam(exchange, "executionId"),
+                    queryInt(exchange, "limit", 50),
+                    queryInt(exchange, "offset", 0)
+            )));
             httpServer.createContext("/api/cycle-config", exchange -> writeJson(exchange, liveControlService.cycleConfig(queryParam(exchange, "executionId"))));
             httpServer.createContext("/api/start", exchange -> {
                 requirePost(exchange);
@@ -130,6 +136,14 @@ public class HttpStatusServer implements AutoCloseable {
             httpServer.createContext("/api/flatten-stop", exchange -> {
                 requirePost(exchange);
                 writeJson(exchange, liveControlService.flattenAndStop());
+            });
+            httpServer.createContext("/api/unlock-flatten-stop", exchange -> {
+                requirePost(exchange);
+                writeJson(exchange, liveControlService.unlockFlattenStop());
+            });
+            httpServer.createContext("/api/reconcile-flatten-cycle", exchange -> {
+                requirePost(exchange);
+                writeJson(exchange, liveControlService.reconcileFlattenCycle());
             });
             httpServer.createContext("/api/cancel-order", exchange -> {
                 requirePost(exchange);
@@ -297,6 +311,8 @@ public class HttpStatusServer implements AutoCloseable {
                     .pnl-pos { color: #0f6b45; font-weight: 700; }
                     .pnl-neg { color: #a33125; font-weight: 700; }
                     .pnl-flat { color: #6f5a30; }
+                    .boost-fill-row { background: #edf8f1; }
+                    .boost-fill-badge { display: inline-flex; align-items: center; min-height: 24px; padding: 0 8px; border-radius: 999px; background: #cfeeda; color: #0f5c3f; font-size: 12px; font-weight: 800; }
                   </style>
                 </head>
                 <body>
@@ -316,6 +332,10 @@ public class HttpStatusServer implements AutoCloseable {
                       <div class="metric"><span>最新价 / 标记价</span><strong id="lastPrice">-</strong></div>
                       <div class="metric"><span>挂单数量</span><strong id="orderCount">0</strong></div>
                       <div class="metric"><span>最近订单</span><strong id="lastOrderStatus">-</strong></div>
+                      <div class="metric"><span id="solBollMonitorLabel">布林监控</span><strong id="solBollMonitorState">-</strong></div>
+                      <div class="metric"><span>SOL实时价 / 下轨</span><strong id="solBollPrice">-</strong></div>
+                      <div class="metric"><span>自动触发信号</span><strong id="solBollSignal">-</strong></div>
+                      <div class="metric"><span>自动网格参数</span><strong id="solBollGridConfig">-</strong></div>
                     </div>
                     <div class="grid" id="form"></div>
                     <p>
@@ -323,6 +343,7 @@ public class HttpStatusServer implements AutoCloseable {
                       <button id="resumeButton" class="start" onclick="post('/api/resume')">继续运行</button>
                       <button id="stopButton" class="stop" onclick="post('/api/stop')">停止</button>
                       <button id="flattenButton" class="danger" onclick="post('/api/flatten-stop')">清仓并停止</button>
+                      <button id="unlockFlattenButton" class="stop" onclick="unlockFlattenStop()">解除清仓停止锁</button>
                     </p>
                     <div id="actionNotice" class="notice"></div>
                     <p>本轮结束自动停止。</p>
@@ -387,6 +408,11 @@ public class HttpStatusServer implements AutoCloseable {
                       </table>
                     </div>
                     <h3>再平衡成交记录</h3>
+                    <div class="pager">
+                      <label>成交价格 <input id="rebalanceFillPrice" style="width:140px" inputmode="decimal" placeholder="输入一个价格" onkeydown="if(event.key==='Enter')applyRebalanceFillPriceFilter()"></label>
+                      <button class="compact" onclick="applyRebalanceFillPriceFilter()">查询</button>
+                      <button class="compact" onclick="clearRebalanceFillPriceFilter()">清空</button>
+                    </div>
                     <div id="rebalanceFillsPager" class="pager"></div>
                     <div class="table-wrap">
                       <table>
@@ -451,8 +477,8 @@ public class HttpStatusServer implements AutoCloseable {
                     </div>
                     <div class="table-wrap">
                       <table>
-                        <thead><tr><th>时间</th><th>标的</th><th>方向</th><th>数量</th><th>价格</th><th>较上笔</th><th>成交额</th><th>手续费/资金费</th><th>市场价盈亏</th><th>累计净数量</th><th>累计成交额</th><th>累计净费用</th><th>成本价</th><th>仓位均价</th><th>订单ID</th></tr></thead>
-                        <tbody id="fills"><tr><td colspan="15">暂无成交</td></tr></tbody>
+                        <thead><tr><th>时间</th><th>标的</th><th>方向</th><th>数量</th><th>减仓标记</th><th>价格</th><th>较上笔</th><th>成交额</th><th>手续费/资金费</th><th>市场价盈亏</th><th>累计净数量</th><th>累计成交额</th><th>累计净费用</th><th>成本价</th><th>仓位均价</th><th>订单ID</th></tr></thead>
+                        <tbody id="fills"><tr><td colspan="16">暂无成交</td></tr></tbody>
                       </table>
                     </div>
                     <h3>Cycle 历史</h3>
@@ -464,10 +490,11 @@ public class HttpStatusServer implements AutoCloseable {
                     </div>
                     <h3>Cycle 成交明细</h3>
                     <div id="cycleDetailNotice" class="notice"></div>
+                    <div id="cycleDetailPager" class="pager"></div>
                     <div class="table-wrap">
                       <table>
-                        <thead><tr><th>时间</th><th>标的</th><th>方向</th><th>数量</th><th>价格</th><th>成交额</th><th>手续费/资金费</th><th>市场价盈亏</th><th>累计净数量</th><th>累计成交额</th><th>累计净费用</th><th>成本价</th><th>仓位均价</th><th>订单ID</th></tr></thead>
-                        <tbody id="cycleDetail"><tr><td colspan="14">请选择一个历史 Cycle</td></tr></tbody>
+                        <thead><tr><th>时间</th><th>标的</th><th>方向</th><th>数量</th><th>减仓标记</th><th>价格</th><th>成交额</th><th>手续费/资金费</th><th>市场价盈亏</th><th>累计净数量</th><th>累计成交额</th><th>累计净费用</th><th>成本价</th><th>仓位均价</th><th>订单ID</th></tr></thead>
+                        <tbody id="cycleDetail"><tr><td colspan="15">请选择一个历史 Cycle</td></tr></tbody>
                       </table>
                     </div>
                     </div>
@@ -553,7 +580,14 @@ public class HttpStatusServer implements AutoCloseable {
                     let fillsPage = 0;
                     const rebalancePageSize = 50;
                     let rebalanceFillsOffset = 0;
+                    let rebalanceFillPrice = '';
+                    let rebalanceFillsRequestId = 0;
                     let rebalanceCyclesOffset = 0;
+                    const cycleDetailPageSize = 50;
+                    let cycleDetailOffset = 0;
+                    let cycleDetailExecutionId = '';
+                    let cycleDetailLabel = '';
+                    let cycleDetailRequestId = 0;
                     let latestFills = [];
                     let rebalanceDirty = false;
                     let savedRebalanceMode = 'price_target';
@@ -698,6 +732,10 @@ public class HttpStatusServer implements AutoCloseable {
                       }
                     }
                     function start() { post('/api/start', payload()); }
+                    function unlockFlattenStop() {
+                      if (!confirm('确认解除清仓停止锁？解除后策略才允许再次启动。')) return;
+                      post('/api/unlock-flatten-stop');
+                    }
                     function cancelOrder(clientOrderId, symbol) {
                       post('/api/cancel-order', {clientOrderId, symbol});
                     }
@@ -709,7 +747,16 @@ public class HttpStatusServer implements AutoCloseable {
                     document.addEventListener('click', event => {
                       const button = event.target.closest('[data-action="cycle-detail"]');
                       if (!button) return;
-                      loadCycleDetail(button.dataset.executionId, button.dataset.label);
+                      cycleDetailOffset = 0;
+                      cycleDetailExecutionId = button.dataset.executionId || '';
+                      cycleDetailLabel = button.dataset.label || '';
+                      loadCycleDetail();
+                    });
+                    document.addEventListener('click', event => {
+                      const button = event.target.closest('[data-action="cycle-detail-page"]');
+                      if (!button || !cycleDetailExecutionId) return;
+                      cycleDetailOffset = Math.max(0, cycleDetailOffset + Number(button.dataset.delta || 0) * cycleDetailPageSize);
+                      loadCycleDetail();
                     });
                     document.addEventListener('click', event => {
                       const button = event.target.closest('[data-action="cycle-load-config"]');
@@ -725,7 +772,7 @@ public class HttpStatusServer implements AutoCloseable {
                       const button = event.target.closest('[data-action="rebalance-fills-page"]');
                       if (!button) return;
                       rebalanceFillsOffset = Math.max(0, rebalanceFillsOffset + Number(button.dataset.delta || 0) * rebalancePageSize);
-                      refresh();
+                      loadRebalanceFillsPage();
                     });
                     document.addEventListener('click', event => {
                       const button = event.target.closest('[data-action="rebalance-cycles-page"]');
@@ -779,38 +826,47 @@ public class HttpStatusServer implements AutoCloseable {
                       return pageMode === 'rebalance' ? refreshRebalance() : refreshGrid();
                     }
                     async function refreshRebalance() {
-                      const [control, rebalanceConfig, rebalanceState, rebalanceOrders, rebalanceFills, rebalanceFundingFees, rebalanceCycles, rebalanceCurrentCycle] = await Promise.all([
+                      const rebalanceFillsPromise = loadRebalanceFillsPage();
+                      const [control, rebalanceConfig, rebalanceState, rebalanceOrders, rebalanceFundingFees, rebalanceCycles, rebalanceCurrentCycle] = await Promise.all([
                         fetch('/api/control').then(r=>r.json()),
                         fetch('/api/rebalance-config').then(r=>r.json()),
                         fetch('/api/rebalance-state').then(r=>r.json()),
                         fetch('/api/rebalance-orders').then(r=>r.json()),
-                        fetch(`/api/rebalance-fills?limit=${rebalancePageSize}&offset=${rebalanceFillsOffset}`).then(r=>r.json()),
                         fetch('/api/rebalance-funding-fees').then(r=>r.json()),
                         fetch(`/api/rebalance-cycles?limit=${rebalancePageSize}&offset=${rebalanceCyclesOffset}`).then(r=>r.json()),
                         fetch('/api/rebalance-current-cycle').then(r=>r.json())
                       ]);
-                      const rebalanceFillItems = rebalanceFills && rebalanceFills.items ? rebalanceFills.items : [];
                       const rebalanceCycleItems = rebalanceCycles && rebalanceCycles.items ? rebalanceCycles.items : [];
                       if (rebalanceConfig && rebalanceConfig.config) applyRebalanceConfig(rebalanceConfig.config);
                       renderRebalanceState(rebalanceState && rebalanceState.state ? rebalanceState.state : null, control);
                       renderRebalanceOrders((rebalanceOrders || []).filter(isActiveOrder), rebalanceCurrentCycle);
                       renderRebalanceCurrentCycle(rebalanceCurrentCycle, rebalanceState && rebalanceState.state ? rebalanceState.state : null);
                       renderRebalanceFundingFees(rebalanceFundingFees || []);
-                      renderSimpleFills('rebalanceFills', rebalanceFillItems, true);
-                      renderRebalancePager('rebalanceFillsPager', rebalanceFills, rebalanceFillsOffset, 'rebalance-fills-page');
                       renderRebalanceCycles(rebalanceCycleItems);
                       renderRebalancePager('rebalanceCyclesPager', rebalanceCycles, rebalanceCyclesOffset, 'rebalance-cycles-page');
+                      await rebalanceFillsPromise;
+                    }
+                    async function loadRebalanceFillsPage() {
+                      const requestId = ++rebalanceFillsRequestId;
+                      const offset = rebalanceFillsOffset;
+                      const price = rebalanceFillPrice;
+                      const page = await fetch(`/api/rebalance-fills?limit=${rebalancePageSize}&offset=${offset}${price ? '&price=' + encodeURIComponent(price) : ''}`).then(r=>r.json());
+                      if (requestId !== rebalanceFillsRequestId || offset !== rebalanceFillsOffset || price !== rebalanceFillPrice) return;
+                      renderSimpleFills('rebalanceFills', page && page.items ? page.items : [], true);
+                      renderRebalancePager('rebalanceFillsPager', page, offset, 'rebalance-fills-page');
                     }
                     async function refreshGrid() {
-                      const [control, status, fills, cycles, currentCycle] = await Promise.all([
+                      const [control, status, fills, cycles, currentCycle, solBollMonitor] = await Promise.all([
                         fetch('/api/control').then(r=>r.json()),
                         fetch('/status').then(r=>r.json()),
                         fetch('/api/fills').then(r=>r.json()),
                         fetch('/api/cycles').then(r=>r.json()),
-                        fetch('/api/current-cycle').then(r=>r.json())
+                        fetch('/api/current-cycle').then(r=>r.json()),
+                        fetch('/api/sol-contract-boll-monitor').then(r=>r.json())
                       ]);
                       const activeOrders = (status.workingOrders || []).filter(isActiveOrder);
                       renderSummary(control, status, activeOrders);
+                      renderSolBollMonitor(solBollMonitor);
                       renderOrders(activeOrders, status);
                       renderCurrentCycle(currentCycle);
                       renderFills(fills);
@@ -1008,16 +1064,34 @@ public class HttpStatusServer implements AutoCloseable {
                       const end = offset + count;
                       const hasPrev = offset > 0;
                       const hasNext = Boolean(page && page.hasMore);
+                      const filterText = action === 'rebalance-fills-page' && rebalanceFillPrice ? `，价格 ${esc(rebalanceFillPrice)}` : '';
                       el.innerHTML = `
                         <button class="compact" data-action="${action}" data-delta="-1" ${hasPrev ? '' : 'disabled'}>上一页</button>
-                        <span class="muted">第 ${Math.floor(offset / limit) + 1} 页，${start}-${end}</span>
+                        <span class="muted">第 ${Math.floor(offset / limit) + 1} 页，${start}-${end}${filterText}</span>
                         <button class="compact" data-action="${action}" data-delta="1" ${hasNext ? '' : 'disabled'}>下一页</button>
                       `;
+                    }
+                    function applyRebalanceFillPriceFilter() {
+                      const input = document.getElementById('rebalanceFillPrice');
+                      const value = input ? input.value.trim() : '';
+                      if (value && !Number.isFinite(Number(value))) return;
+                      rebalanceFillPrice = value;
+                      rebalanceFillsOffset = 0;
+                      loadRebalanceFillsPage();
+                    }
+                    function clearRebalanceFillPriceFilter() {
+                      const input = document.getElementById('rebalanceFillPrice');
+                      if (input) input.value = '';
+                      rebalanceFillPrice = '';
+                      rebalanceFillsOffset = 0;
+                      loadRebalanceFillsPage();
                     }
                     function renderSummary(control, status, activeOrders) {
                       const running = Boolean(control && control.running);
                       const flattenStop = control && control.flattenStop ? control.flattenStop : {};
                       const flattenRunning = Boolean(flattenStop.running);
+                      const flattenLocked = Boolean(control && control.flattenStopLocked);
+                      const canRetryFlatten = !running && flattenLocked;
                       const state = status && status.runtimeState ? status.runtimeState.state : '-';
                       const activeSymbol = (control && control.config && control.config.symbol) || (status && status.symbol) || '-';
                       const snapshot = status && status.latestMarketSnapshot ? status.latestMarketSnapshot : {};
@@ -1037,16 +1111,47 @@ public class HttpStatusServer implements AutoCloseable {
                       document.getElementById('lastOrderStatus').textContent = lastOrder
                         ? `${formatSide(lastOrder.side)} ${lastOrder.orderType} ${lastOrder.status}`
                         : '-';
-                      document.getElementById('startButton').disabled = running;
-                      document.getElementById('resumeButton').disabled = running || !Boolean(control && control.canResume);
+                      document.getElementById('startButton').disabled = running || flattenLocked;
+                      document.getElementById('resumeButton').disabled = running || flattenLocked || !Boolean(control && control.canResume);
                       document.getElementById('stopButton').disabled = !running || flattenRunning;
-                      document.getElementById('flattenButton').disabled = !running || flattenRunning;
+                      document.getElementById('flattenButton').textContent = canRetryFlatten ? '重试清仓' : '清仓并停止';
+                      document.getElementById('flattenButton').disabled = (!running && !canRetryFlatten) || flattenRunning;
+                      document.getElementById('unlockFlattenButton').disabled = running || !flattenLocked;
                       if (document.body.dataset.busy === 'true') {
                         document.getElementById('startButton').disabled = true;
                         document.getElementById('resumeButton').disabled = true;
                         document.getElementById('stopButton').disabled = true;
                         document.getElementById('flattenButton').disabled = true;
+                        document.getElementById('unlockFlattenButton').disabled = true;
                       }
+                    }
+                    function renderSolBollMonitor(monitor) {
+                      const stateLabels = {
+                        NOT_CONFIGURED: '尚未配置',
+                        MONITORING: '监控中',
+                        CYCLE_RUNNING: 'Cycle运行中',
+                        CYCLE_STARTED: 'Cycle已启动',
+                        TRIGGERING: '正在触发',
+                        BLOCKED_FLATTEN_LOCK: '清仓锁阻止启动',
+                        BLOCKED_OPEN_CYCLE: '存在未结束Cycle',
+                        BLOCKED_ACTIVE_ORDERS: '存在活动挂单',
+                        START_REJECTED: '启动被拒绝',
+                        ERROR: '监控异常'
+                      };
+                      const state = monitor && monitor.state ? monitor.state : 'NOT_CONFIGURED';
+                      const stateText = stateLabels[state] || state;
+                      const intervalMinutes = monitor && monitor.intervalMinutes != null ? Number(monitor.intervalMinutes) : null;
+                      setText('solBollMonitorLabel', intervalMinutes ? `${intervalMinutes}分钟布林监控` : '布林监控');
+                      setText('solBollMonitorState', monitor && monitor.message ? `${stateText}：${monitor.message}` : stateText);
+                      const lastPrice = monitor && monitor.lastPrice != null ? formatNumber(monitor.lastPrice) : '-';
+                      const lower = monitor && monitor.bollLower != null ? formatNumber(monitor.bollLower) : '-';
+                      setText('solBollPrice', `${lastPrice} / ${lower}`);
+                      const signal = monitor ? monitor.signal : null;
+                      setText('solBollSignal', signal === true ? '已跌破下轨' : (signal === false ? '尚未跌破' : '-'));
+                      const spacing = monitor && monitor.baseGridSpacing != null ? `${Number(monitor.baseGridSpacing) * 100}%` : '0.1%';
+                      const baseQty = monitor && monitor.baseGridQty != null ? monitor.baseGridQty : 0.5;
+                      const initialSteps = monitor && monitor.initialSteps != null ? monitor.initialSteps : 5;
+                      setText('solBollGridConfig', `间距 ${spacing}，每格 ${baseQty} SOL，首单 ${initialSteps} 步`);
                     }
                     function cycleLabel(control, status) {
                       if (control && control.flattenStop && control.flattenStop.running) return '平仓停止中';
@@ -1154,7 +1259,7 @@ public class HttpStatusServer implements AutoCloseable {
                       latestFills = tradingFills;
                       const filteredFills = filterFillsByPrice(tradingFills);
                       if (filteredFills.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="15">暂无成交</td></tr>';
+                        tbody.innerHTML = '<tr><td colspan="16">暂无成交</td></tr>';
                         setText('fillsPager', `0 / 0，${fillsCountText(filteredFills, tradingFills)}`);
                         return;
                       }
@@ -1166,12 +1271,15 @@ public class HttpStatusServer implements AutoCloseable {
                       const visibleFills = newestFirst.slice(fillsPage * fillsPageSize, (fillsPage + 1) * fillsPageSize);
                       const filteredText = newestFirst.length === tradingFills.length ? '' : `，筛选自 ${fillsCountText(tradingFills, tradingFills)}`;
                       setText('fillsPager', `${fillsPage + 1} / ${totalPages}，${fillsCountText(newestFirst, tradingFills)}${filteredText}`);
-                      tbody.innerHTML = visibleFills.map(f => `
-                        <tr>
+                      tbody.innerHTML = visibleFills.map(f => {
+                        const boost = profitReduceBoost(f);
+                        return `
+                        <tr class="${boost ? 'boost-fill-row' : ''}">
                           <td>${formatTime(f.time)}</td>
                           <td>${esc(f.symbol)}</td>
                           <td>${formatSide(f.side)}</td>
                           <td>${esc(f.qty)}</td>
+                          <td>${boost ? '<span class="boost-fill-badge">盈利加减仓 +' + esc(formatNumber(boost.extraQty)) + '</span>' : '-'}</td>
                           <td>${esc(f.price)}</td>
                           <td>${formatPriceDiff(priceDiffs.get(fillKey(f)))}</td>
                           <td>${esc(formatNumber(f.value))}</td>
@@ -1184,7 +1292,8 @@ public class HttpStatusServer implements AutoCloseable {
                           <td>${esc(formatNumber(f.avgEntryPrice))}</td>
                           <td>${esc(f.clientOrderId)}</td>
                         </tr>
-                      `).join('');
+                      `;
+                      }).join('');
                     }
                     function previousFillsPage() {
                       fillsPage = Math.max(0, fillsPage - 1);
@@ -1270,19 +1379,43 @@ public class HttpStatusServer implements AutoCloseable {
                         notice.textContent = err && err.message ? err.message : '读取 Cycle 参数失败';
                       }
                     }
-                    async function loadCycleDetail(executionId, label) {
+                    async function loadCycleDetail() {
+                      const executionId = cycleDetailExecutionId;
+                      const label = cycleDetailLabel;
+                      const offset = cycleDetailOffset;
+                      const requestId = ++cycleDetailRequestId;
                       const notice = document.getElementById('cycleDetailNotice');
                       notice.className = 'notice notice-info';
                       notice.textContent = '读取 Cycle 成交明细...';
                       try {
-                        const fills = await fetch(`/api/cycle-fills?executionId=${encodeURIComponent(executionId)}`).then(r => r.json());
-                        renderCycleDetail(fills);
+                        const page = await fetch(`/api/cycle-fills?executionId=${encodeURIComponent(executionId)}&limit=${cycleDetailPageSize}&offset=${offset}`).then(r => r.json());
+                        if (requestId !== cycleDetailRequestId || offset !== cycleDetailOffset) return;
+                        const fills = page && page.items ? page.items : [];
+                        renderCycleDetail(fills, Number(page && page.turnoverBefore ? page.turnoverBefore : 0));
+                        renderCycleDetailPager(page);
                         notice.className = 'notice notice-ok';
-                        notice.textContent = `${label || 'Cycle'}：${fills.length} 笔成交`;
+                        const total = Number(page && page.total ? page.total : fills.length);
+                        const start = fills.length ? offset + 1 : 0;
+                        const end = offset + fills.length;
+                        notice.textContent = `${label || 'Cycle'}：共 ${total} 条，当前显示 ${start}-${end}`;
                       } catch (err) {
                         notice.className = 'notice notice-error';
                         notice.textContent = err && err.message ? err.message : '读取 Cycle 成交明细失败';
                       }
+                    }
+                    function renderCycleDetailPager(page) {
+                      const pager = document.getElementById('cycleDetailPager');
+                      if (!pager) return;
+                      const total = Number(page && page.total ? page.total : 0);
+                      const limit = Number(page && page.limit ? page.limit : cycleDetailPageSize);
+                      const offset = Number(page && page.offset != null ? page.offset : cycleDetailOffset);
+                      const count = page && page.items ? page.items.length : 0;
+                      const totalPages = Math.max(1, Math.ceil(total / limit));
+                      pager.innerHTML = `
+                        <button class="compact" data-action="cycle-detail-page" data-delta="-1" ${offset > 0 ? '' : 'disabled'}>上一页</button>
+                        <span>第 ${Math.floor(offset / limit) + 1} / ${totalPages} 页，共 ${total} 条</span>
+                        <button class="compact" data-action="cycle-detail-page" data-delta="1" ${page && page.hasMore ? '' : 'disabled'}>下一页</button>
+                      `;
                     }
                     async function loadRebalanceCycleDetail(executionId) {
                       try {
@@ -1293,19 +1426,22 @@ public class HttpStatusServer implements AutoCloseable {
                         if (tbody) tbody.innerHTML = '<tr><td colspan="13" class="muted">读取失败</td></tr>';
                       }
                     }
-                    function renderCycleDetail(fills) {
+                    function renderCycleDetail(fills, turnoverBefore = 0) {
                       const tbody = document.getElementById('cycleDetail');
                       if (!fills || fills.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="14">暂无明细</td></tr>';
+                        tbody.innerHTML = '<tr><td colspan="15">暂无明细</td></tr>';
                         return;
                       }
-                      const cumulativeTurnover = cumulativeTurnoverMap(fills);
-                      tbody.innerHTML = fills.map(f => `
-                        <tr>
+                      const cumulativeTurnover = cumulativeTurnoverMap(fills, turnoverBefore);
+                      tbody.innerHTML = fills.map(f => {
+                        const boost = profitReduceBoost(f);
+                        return `
+                        <tr class="${boost ? 'boost-fill-row' : ''}">
                           <td>${formatTime(f.time)}</td>
                           <td>${esc(f.symbol)}</td>
                           <td>${formatSide(f.side)}</td>
                           <td>${esc(f.qty)}</td>
+                          <td>${boost ? '<span class="boost-fill-badge">盈利加减仓 +' + esc(formatNumber(boost.extraQty)) + '</span>' : '-'}</td>
                           <td>${esc(f.price)}</td>
                           <td>${esc(formatNumber(f.value))}</td>
                           <td>${esc(formatNumber(f.fee))} ${esc(f.feeCurrency || '')}</td>
@@ -1317,16 +1453,28 @@ public class HttpStatusServer implements AutoCloseable {
                           <td>${esc(formatNumber(f.avgEntryPrice))}</td>
                           <td>${esc(f.clientOrderId)}</td>
                         </tr>
-                      `).join('');
+                      `;
+                      }).join('');
+                    }
+                    function profitReduceBoost(fill) {
+                      if (!fill || !fill.configJson) return null;
+                      try {
+                        const metadata = typeof fill.configJson === 'string' ? JSON.parse(fill.configJson) : fill.configJson;
+                        const extraQty = Number(metadata && metadata.profitReduceBoostExtraQty);
+                        if (!Number.isFinite(extraQty) || extraQty <= 0) return null;
+                        return {extraQty};
+                      } catch (ignored) {
+                        return null;
+                      }
                     }
                     function fillKey(fill) {
                       return `${fill.executionId || fill.clientOrderId || ''}|${fill.time || ''}`;
                     }
-                    function cumulativeTurnoverMap(fills) {
+                    function cumulativeTurnoverMap(fills, initialTotal = 0) {
                       const sorted = [...(fills || [])]
                         .filter(f => f)
                         .sort((a, b) => Number(a.time || 0) - Number(b.time || 0));
-                      let total = 0;
+                      let total = Number(initialTotal || 0);
                       const byKey = new Map();
                       sorted.forEach(fill => {
                         if (fill.side === 'BUY' || fill.side === 'SELL') {
@@ -1444,6 +1592,8 @@ public class HttpStatusServer implements AutoCloseable {
                       const rows = (latestFills || []).filter(f => f.side === 'FUNDING_FEE');
                       const tbody = document.getElementById('cycleDetail');
                       const notice = document.getElementById('cycleDetailNotice');
+                      const pager = document.getElementById('cycleDetailPager');
+                      if (pager) pager.innerHTML = '';
                       if (rows.length === 0) {
                         tbody.innerHTML = '<tr><td colspan="14">当前 Cycle 暂无资金费记录</td></tr>';
                         notice.className = 'notice notice-warning';

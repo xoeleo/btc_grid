@@ -59,11 +59,20 @@ class HttpStatusServerTest {
                     HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/orders")).GET().build(),
                     HttpResponse.BodyHandlers.ofString()
             );
+            HttpResponse<String> grid = client.send(
+                    HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port + "/grid")).GET().build(),
+                    HttpResponse.BodyHandlers.ofString()
+            );
 
             assertEquals(200, health.statusCode());
             assertTrue(health.body().contains("\"ok\":true"));
             assertEquals(200, orders.statusCode());
             assertEquals("[]", orders.body());
+            assertEquals(200, grid.statusCode());
+            assertTrue(grid.body().contains("<th>数量</th><th>减仓标记</th><th>价格</th>"));
+            assertTrue(grid.body().contains("盈利加减仓 +"));
+            assertTrue(!grid.body().contains("<th>基础数量</th>"));
+            assertTrue(grid.body().contains("function profitReduceBoost(fill)"));
         }
     }
 

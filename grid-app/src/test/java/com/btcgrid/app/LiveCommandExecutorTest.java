@@ -85,6 +85,37 @@ class LiveCommandExecutorTest {
         assertTrue(failures.get(0).contains("170131"));
     }
 
+    @Test
+    void manualFlattenBypassesGridMaxOrderQtyAndUsesRealWalletBalance() {
+        CapturingTradeGateway tradeGateway = new CapturingTradeGateway();
+        LiveCommandExecutor executor = executor(tradeGateway, new FixedAccountGateway(new BigDecimal("45.216015900")));
+        OrderIntent flatten = new OrderIntent(
+                "SOLUSDT", "MANUAL_FLATTEN_TEST", TradeSide.SELL, OrderType.MARKET,
+                new BigDecimal("45.216015900"), null, false, "manual-flatten-and-stop"
+        );
+
+        List<String> failures = executor.executeManualFlatten(flatten, ledger());
+
+        assertTrue(failures.isEmpty());
+        assertEquals(1, tradeGateway.submitted.size());
+        assertEquals(new BigDecimal("45.216015900"), tradeGateway.submitted.get(0).qty());
+    }
+
+    @Test
+    void manualFlattenReturnsSubmissionFailure() {
+        CapturingTradeGateway tradeGateway = new CapturingTradeGateway();
+        tradeGateway.submitFailure = new RuntimeException("exchange rejected flatten");
+        LiveCommandExecutor executor = executor(tradeGateway, new FixedAccountGateway(new BigDecimal("45.216")));
+        OrderIntent flatten = new OrderIntent(
+                "SOLUSDT", "MANUAL_FLATTEN_TEST", TradeSide.SELL, OrderType.MARKET,
+                new BigDecimal("45.216"), null, false, "manual-flatten-and-stop"
+        );
+
+        List<String> failures = executor.executeManualFlatten(flatten, ledger());
+
+        assertEquals(List.of("exchange rejected flatten"), failures);
+    }
+
     private LiveCommandExecutor executor(CapturingTradeGateway tradeGateway, BybitAccountGateway accountGateway) {
         return executor(tradeGateway, accountGateway, null);
     }

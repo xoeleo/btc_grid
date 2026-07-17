@@ -1,6 +1,8 @@
 package com.btcgrid.app;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.math.BigDecimal;
 import java.nio.file.Path;
@@ -475,6 +477,55 @@ class SqliteFillStoreTest {
         assertEquals(2, fills.size());
         assertEquals("new-initial", fills.get(0).executionId());
         assertEquals("new-buy", fills.get(1).executionId());
+    }
+
+    @Test
+    void pagesHistoricalCycleFillsWithoutLoadingTheWholeCycle() {
+        Path dbPath = tempDir.resolve("cycle-detail-page.sqlite");
+        SqliteFillStore store = new SqliteFillStore(dbPath);
+        for (int index = 0; index < 75; index++) {
+            store.save(fill(
+                    Instant.ofEpochSecond(1000L + index),
+                    index % 2 == 0 ? "BUY" : "SELL",
+                    new BigDecimal("0.001"),
+                    new BigDecimal("100"),
+                    BigDecimal.ZERO,
+                    index == 0 ? "GRID_BTCUSDT_INIT_page" : "GRID_BTCUSDT_PB_page_" + index,
+                    "page-fill-" + index
+            ));
+        }
+        store.save(new FillRecord(
+                Instant.ofEpochSecond(1100L),
+                "BTCUSDT",
+                "CYCLE_END",
+                BigDecimal.ZERO,
+                new BigDecimal("100"),
+                BigDecimal.ZERO,
+                BigDecimal.ZERO,
+                "USDT",
+                BigDecimal.ZERO,
+                BigDecimal.ZERO,
+                BigDecimal.ZERO,
+                BigDecimal.ZERO,
+                BigDecimal.ZERO,
+                BigDecimal.ZERO,
+                BigDecimal.ZERO,
+                BigDecimal.ZERO,
+                "CYCLE_END_GRID_BTCUSDT_PB_page",
+                "cycle-end-page"
+        ));
+
+        CycleFillPage first = store.cycleFillsPage("cycle-end-page", 50, 0);
+        CycleFillPage second = store.cycleFillsPage("cycle-end-page", 50, 50);
+
+        assertEquals(75, first.total());
+        assertEquals(50, first.items().size());
+        assertTrue(first.hasMore());
+        assertEquals("page-fill-0", first.items().get(0).executionId());
+        assertEquals(25, second.items().size());
+        assertFalse(second.hasMore());
+        assertEquals("page-fill-50", second.items().get(0).executionId());
+        assertEquals(0, second.turnoverBefore().compareTo(new BigDecimal("5.000")));
     }
 
     @Test
