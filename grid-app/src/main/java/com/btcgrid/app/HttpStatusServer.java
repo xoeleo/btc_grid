@@ -2,13 +2,17 @@ package com.btcgrid.app;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import com.btcgrid.common.model.OrderStatus;
 import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.Base64;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -21,6 +25,10 @@ public class HttpStatusServer implements AutoCloseable {
     private final Supplier<RuntimeStatusSnapshot> runtimeStatusSupplier;
     private final LiveControlService liveControlService;
     private final EventLogger eventLogger;
+    private final String httpUsername;
+    private final String httpPassword;
+    private final String gridUiUrl;
+    private final String rebalanceUiUrl;
     private final ObjectMapper objectMapper = new ObjectMapper().registerModule(new JavaTimeModule());
 
     public HttpStatusServer(int port, RuntimeStatusProvider runtimeStatusProvider, EventLogger eventLogger) {
@@ -33,6 +41,30 @@ public class HttpStatusServer implements AutoCloseable {
             Supplier<RuntimeStatusSnapshot> runtimeStatusSupplier,
             LiveControlService liveControlService,
             EventLogger eventLogger
+    ) {
+        this(
+                host,
+                port,
+                runtimeStatusSupplier,
+                liveControlService,
+                eventLogger,
+                System.getenv("GRID_HTTP_USERNAME"),
+                System.getenv("GRID_HTTP_PASSWORD"),
+                System.getenv("GRID_MANUAL_UI_URL"),
+                System.getenv("GRID_REBALANCE_UI_URL")
+        );
+    }
+
+    HttpStatusServer(
+            String host,
+            int port,
+            Supplier<RuntimeStatusSnapshot> runtimeStatusSupplier,
+            LiveControlService liveControlService,
+            EventLogger eventLogger,
+            String httpUsername,
+            String httpPassword,
+            String gridUiUrl,
+            String rebalanceUiUrl
     ) {
         try {
             this.httpServer = HttpServer.create(new InetSocketAddress(host, port), 0);
@@ -48,6 +80,13 @@ public class HttpStatusServer implements AutoCloseable {
         this.runtimeStatusSupplier = runtimeStatusSupplier;
         this.liveControlService = liveControlService;
         this.eventLogger = eventLogger;
+        this.httpUsername = normalized(httpUsername);
+        this.httpPassword = normalized(httpPassword);
+        this.gridUiUrl = normalized(gridUiUrl);
+        this.rebalanceUiUrl = normalized(rebalanceUiUrl);
+        if (this.httpUsername.isBlank() != this.httpPassword.isBlank()) {
+            throw new IllegalStateException("GRID_HTTP_USERNAME and GRID_HTTP_PASSWORD must both be set");
+        }
         registerContexts();
     }
 
@@ -70,16 +109,17 @@ public class HttpStatusServer implements AutoCloseable {
     }
 
     private void registerContexts() {
-        httpServer.createContext("/", this::writeIndex);
-        httpServer.createContext("/status", exchange -> writeJson(exchange, runtimeStatusSupplier.get()));
-        httpServer.createContext("/ledger", exchange -> writeJson(exchange, runtimeStatusSupplier.get().ledgerSnapshot()));
-        httpServer.createContext("/runtime", exchange -> writeJson(exchange, runtimeStatusSupplier.get().runtimeState()));
-        httpServer.createContext("/orders", exchange -> writeJson(exchange, runtimeStatusSupplier.get().workingOrders()));
+        createProtectedContext("/", this::writeIndex);
+        createProtectedContext("/status", exchange -> writeJson(exchange, runtimeStatusSupplier.get()));
+        createProtectedContext("/ledger", exchange -> writeJson(exchange, runtimeStatusSupplier.get().ledgerSnapshot()));
+        createProtectedContext("/runtime", exchange -> writeJson(exchange, runtimeStatusSupplier.get().runtimeState()));
+        createProtectedContext("/orders", exchange -> writeJson(exchange, runtimeStatusSupplier.get().workingOrders()));
         httpServer.createContext("/health", exchange -> writeJson(exchange, Map.of("ok", true)));
         if (liveControlService != null) {
-            httpServer.createContext("/api/control", exchange -> writeJson(exchange, liveControlService.controlState()));
-            httpServer.createContext("/api/sol-contract-boll-monitor", exchange -> writeJson(exchange, liveControlService.solContractBollMonitorState()));
-            httpServer.createContext("/api/rebalance-config", exchange -> {
+            createProtectedContext("/api/control", exchange -> writeJson(exchange, liveControlService.controlState()));
+            createProtectedContext("/api/active-status", exchange -> writeJson(exchange, activeStatusSnapshot()));
+            createProtectedContext("/api/sol-contract-boll-monitor", exchange -> writeJson(exchange, liveControlService.solContractBollMonitorState()));
+            createProtectedContext("/api/rebalance-config", exchange -> {
                 if ("GET".equalsIgnoreCase(exchange.getRequestMethod())) {
                     writeJson(exchange, liveControlService.rebalanceConfig());
                     return;
@@ -88,69 +128,145 @@ public class HttpStatusServer implements AutoCloseable {
                 LiveControlService.RebalanceConfigRequest request = objectMapper.readValue(exchange.getRequestBody(), LiveControlService.RebalanceConfigRequest.class);
                 writeJson(exchange, liveControlService.saveRebalanceConfig(request));
             });
-            httpServer.createContext("/api/rebalance-state", exchange -> writeJson(exchange, liveControlService.rebalanceState()));
-            httpServer.createContext("/api/rebalance-orders", exchange -> writeJson(exchange, liveControlService.rebalanceOrders()));
-            httpServer.createContext("/api/rebalance-history", exchange -> writeJson(exchange, liveControlService.rebalanceHistory()));
-            httpServer.createContext("/api/rebalance-fills", exchange -> writeJson(exchange, liveControlService.rebalanceFillsPage(
+            createProtectedContext("/api/rebalance-state", exchange -> writeJson(exchange, liveControlService.rebalanceState()));
+            createProtectedContext("/api/rebalance-orders", exchange -> writeJson(exchange, liveControlService.rebalanceOrders()));
+            createProtectedContext("/api/rebalance-history", exchange -> writeJson(exchange, liveControlService.rebalanceHistory()));
+            createProtectedContext("/api/rebalance-fills", exchange -> writeJson(exchange, liveControlService.rebalanceFillsPage(
                     queryInt(exchange, "limit", 50),
                     queryInt(exchange, "offset", 0),
                     queryParam(exchange, "price")
             )));
-            httpServer.createContext("/api/rebalance-funding-fees", exchange -> writeJson(exchange, liveControlService.rebalanceFundingFees()));
-            httpServer.createContext("/api/rebalance-cycles", exchange -> writeJson(exchange, liveControlService.rebalanceCyclesPage(
+            createProtectedContext("/api/rebalance-funding-fees", exchange -> writeJson(exchange, liveControlService.rebalanceFundingFees()));
+            createProtectedContext("/api/rebalance-cycles", exchange -> writeJson(exchange, liveControlService.rebalanceCyclesPage(
                     queryInt(exchange, "limit", 50),
                     queryInt(exchange, "offset", 0)
             )));
-            httpServer.createContext("/api/rebalance-current-cycle", exchange -> writeJson(exchange, liveControlService.rebalanceCurrentCycle()));
-            httpServer.createContext("/api/rebalance-cycle-fills", exchange -> writeJson(exchange, liveControlService.rebalanceCycleFills(queryParam(exchange, "executionId"))));
-            httpServer.createContext("/api/rebalance-start", exchange -> {
+            createProtectedContext("/api/rebalance-current-cycle", exchange -> writeJson(exchange, liveControlService.rebalanceCurrentCycle()));
+            createProtectedContext("/api/rebalance-cycle-fills", exchange -> writeJson(exchange, liveControlService.rebalanceCycleFills(queryParam(exchange, "executionId"))));
+            createProtectedContext("/api/rebalance-start", exchange -> {
                 requirePost(exchange);
                 writeJson(exchange, liveControlService.startRebalance());
             });
-            httpServer.createContext("/api/rebalance-stop", exchange -> {
+            createProtectedContext("/api/rebalance-stop", exchange -> {
                 requirePost(exchange);
                 writeJson(exchange, liveControlService.stopRebalance());
             });
-            httpServer.createContext("/api/fills", exchange -> writeJson(exchange, liveControlService.recentFills()));
-            httpServer.createContext("/api/cycles", exchange -> writeJson(exchange, liveControlService.recentCycles()));
-            httpServer.createContext("/api/current-cycle", exchange -> writeJson(exchange, liveControlService.currentCycle()));
-            httpServer.createContext("/api/cycle-fills", exchange -> writeJson(exchange, liveControlService.cycleFillsPage(
+            createProtectedContext("/api/fills", exchange -> writeJson(exchange, liveControlService.recentFills()));
+            createProtectedContext("/api/recent-fills", exchange -> writeJson(
+                    exchange,
+                    tail(liveControlService.recentFills(), queryInt(exchange, "limit", 200))
+            ));
+            createProtectedContext("/api/cycles", exchange -> writeJson(exchange, liveControlService.recentCycles()));
+            createProtectedContext("/api/current-cycle", exchange -> writeJson(exchange, liveControlService.currentCycle()));
+            createProtectedContext("/api/cycle-fills", exchange -> writeJson(exchange, liveControlService.cycleFillsPage(
                     queryParam(exchange, "executionId"),
                     queryInt(exchange, "limit", 50),
                     queryInt(exchange, "offset", 0)
             )));
-            httpServer.createContext("/api/cycle-config", exchange -> writeJson(exchange, liveControlService.cycleConfig(queryParam(exchange, "executionId"))));
-            httpServer.createContext("/api/start", exchange -> {
+            createProtectedContext("/api/cycle-config", exchange -> writeJson(exchange, liveControlService.cycleConfig(queryParam(exchange, "executionId"))));
+            createProtectedContext("/api/start", exchange -> {
                 requirePost(exchange);
                 LiveControlService.StartRequest request = objectMapper.readValue(exchange.getRequestBody(), LiveControlService.StartRequest.class);
                 writeJson(exchange, liveControlService.start(request));
             });
-            httpServer.createContext("/api/stop", exchange -> {
+            createProtectedContext("/api/stop", exchange -> {
                 requirePost(exchange);
                 writeJson(exchange, liveControlService.stop());
             });
-            httpServer.createContext("/api/resume", exchange -> {
+            createProtectedContext("/api/resume", exchange -> {
                 requirePost(exchange);
                 writeJson(exchange, liveControlService.resume());
             });
-            httpServer.createContext("/api/flatten-stop", exchange -> {
+            createProtectedContext("/api/flatten-stop", exchange -> {
                 requirePost(exchange);
                 writeJson(exchange, liveControlService.flattenAndStop());
             });
-            httpServer.createContext("/api/unlock-flatten-stop", exchange -> {
+            createProtectedContext("/api/unlock-flatten-stop", exchange -> {
                 requirePost(exchange);
                 writeJson(exchange, liveControlService.unlockFlattenStop());
             });
-            httpServer.createContext("/api/reconcile-flatten-cycle", exchange -> {
+            createProtectedContext("/api/reconcile-flatten-cycle", exchange -> {
                 requirePost(exchange);
                 writeJson(exchange, liveControlService.reconcileFlattenCycle());
             });
-            httpServer.createContext("/api/cancel-order", exchange -> {
+            createProtectedContext("/api/cancel-order", exchange -> {
                 requirePost(exchange);
                 LiveControlService.CancelOrderRequest request = objectMapper.readValue(exchange.getRequestBody(), LiveControlService.CancelOrderRequest.class);
                 writeJson(exchange, liveControlService.cancelOrder(request));
             });
         }
+    }
+
+    private void createProtectedContext(String path, HttpHandler handler) {
+        httpServer.createContext(path, exchange -> {
+            if (!authenticate(exchange)) {
+                return;
+            }
+            handler.handle(exchange);
+        });
+    }
+
+    private RuntimeStatusSnapshot activeStatusSnapshot() {
+        RuntimeStatusSnapshot snapshot = runtimeStatusSupplier.get();
+        return new RuntimeStatusSnapshot(
+                snapshot.generatedAt(),
+                snapshot.symbol(),
+                snapshot.runtimeState(),
+                snapshot.ledgerSnapshot(),
+                snapshot.latestMarketSnapshot(),
+                snapshot.processedExecutionCount(),
+                snapshot.workingOrders().stream()
+                        .filter(order -> order.status() == OrderStatus.NEW)
+                        .toList()
+        );
+    }
+
+    private <T> java.util.List<T> tail(java.util.List<T> values, int requestedLimit) {
+        int limit = Math.min(500, Math.max(1, requestedLimit));
+        int start = Math.max(0, values.size() - limit);
+        return java.util.List.copyOf(values.subList(start, values.size()));
+    }
+
+    private boolean authenticate(HttpExchange exchange) throws IOException {
+        if (httpUsername.isBlank()) {
+            return true;
+        }
+        String authorization = exchange.getRequestHeaders().getFirst("Authorization");
+        if (authorization != null && authorization.regionMatches(true, 0, "Basic ", 0, 6)) {
+            try {
+                String credentials = new String(
+                        Base64.getDecoder().decode(authorization.substring(6).trim()),
+                        StandardCharsets.UTF_8
+                );
+                int separator = credentials.indexOf(':');
+                if (separator >= 0
+                        && constantTimeEquals(httpUsername, credentials.substring(0, separator))
+                        && constantTimeEquals(httpPassword, credentials.substring(separator + 1))) {
+                    return true;
+                }
+            } catch (IllegalArgumentException ignored) {
+                // Invalid Base64 is handled as an authentication failure.
+            }
+        }
+        byte[] body = "Authentication required".getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("WWW-Authenticate", "Basic realm=\"BTC Grid\", charset=\"UTF-8\"");
+        exchange.getResponseHeaders().set("Cache-Control", "no-store");
+        exchange.sendResponseHeaders(401, body.length);
+        try (OutputStream outputStream = exchange.getResponseBody()) {
+            outputStream.write(body);
+        }
+        return false;
+    }
+
+    private boolean constantTimeEquals(String expected, String actual) {
+        return MessageDigest.isEqual(
+                expected.getBytes(StandardCharsets.UTF_8),
+                actual.getBytes(StandardCharsets.UTF_8)
+        );
+    }
+
+    private String normalized(String value) {
+        return value == null ? "" : value.trim();
     }
 
     private void requirePost(HttpExchange exchange) throws IOException {
@@ -166,6 +282,14 @@ public class HttpStatusServer implements AutoCloseable {
 
     private void writeIndex(HttpExchange exchange) throws IOException {
         String path = exchange.getRequestURI().getPath();
+        if ("/grid".equals(path) && !gridUiUrl.isBlank()) {
+            redirect(exchange, gridUiUrl);
+            return;
+        }
+        if ("/rebalance".equals(path) && !rebalanceUiUrl.isBlank()) {
+            redirect(exchange, rebalanceUiUrl);
+            return;
+        }
         String html = "/grid".equals(path) || "/rebalance".equals(path) ? indexHtml() : landingHtml();
         byte[] bytes = html.getBytes(StandardCharsets.UTF_8);
         exchange.getResponseHeaders().add("Content-Type", "text/html; charset=utf-8");
@@ -173,6 +297,12 @@ public class HttpStatusServer implements AutoCloseable {
         try (OutputStream outputStream = exchange.getResponseBody()) {
             outputStream.write(bytes);
         }
+    }
+
+    private void redirect(HttpExchange exchange, String location) throws IOException {
+        exchange.getResponseHeaders().set("Location", location);
+        exchange.sendResponseHeaders(302, -1);
+        exchange.close();
     }
 
     private String landingHtml() {
@@ -199,14 +329,17 @@ public class HttpStatusServer implements AutoCloseable {
                     <div class="panel">
                       <h1>BTC Grid 入口</h1>
                       <div class="entry">
-                        <a href="/grid"><strong>手动网格</strong><span>启动、停止、清仓、查看 Cycle 和成交。</span></a>
-                        <a href="/rebalance"><strong>BTC 再平衡</strong><span>配置资产占比目标，独立监控和运行再平衡。</span></a>
+                        <a href="%s"><strong>手动网格</strong><span>启动、停止、清仓、查看 Cycle 和成交。</span></a>
+                        <a href="%s"><strong>BTC 再平衡</strong><span>配置资产占比目标，独立监控和运行再平衡。</span></a>
                       </div>
                     </div>
                   </div>
                 </body>
                 </html>
-                """;
+                """.formatted(
+                        gridUiUrl.isBlank() ? "/grid" : gridUiUrl,
+                        rebalanceUiUrl.isBlank() ? "/rebalance" : rebalanceUiUrl
+                );
     }
 
     private String queryParam(HttpExchange exchange, String name) {
@@ -319,8 +452,8 @@ public class HttpStatusServer implements AutoCloseable {
                   <div class="card">
                     <h2>BTC Grid 控制台</h2>
                     <p class="nav">
-                      <a href="/grid">手动网格</a>
-                      <a href="/rebalance">BTC 再平衡</a>
+                      <a href="__GRID_UI_URL__">手动网格</a>
+                      <a href="__REBALANCE_UI_URL__">BTC 再平衡</a>
                     </p>
                     <div class="manual-section">
                     <div class="summary">
@@ -391,7 +524,7 @@ public class HttpStatusServer implements AutoCloseable {
                       <div class="metric"><span>当前总资产（BTC）</span><strong id="rebalanceCycleTotalEquityBtc">-</strong></div>
                       <div class="metric"><span>成本价格</span><strong id="rebalanceCycleCostPrice">-</strong></div>
                       <div class="metric"><span>成本价相对当前价</span><strong id="rebalanceCycleCostPriceChange">-</strong></div>
-                      <div class="metric"><span>预计下跌至 100% 库存价格</span><strong id="rebalanceCycleFullInventoryPrice">-</strong></div>
+                      <div class="metric"><span>单边下跌至 100% BTC 比例（理论）</span><strong id="rebalanceCycleFullInventoryPrice">-</strong></div>
                       <div class="metric"><span>买入 / 卖出次数</span><strong id="rebalanceCycleCounts">-</strong></div>
                       <div class="metric"><span>买入 / 卖出数量</span><strong id="rebalanceCycleQty">-</strong></div>
                       <div class="metric"><span>持续时长</span><strong id="rebalanceCycleDuration">-</strong></div>
@@ -822,8 +955,19 @@ public class HttpStatusServer implements AutoCloseable {
                       banner.className = `action-banner active action-banner-${type}`;
                       banner.textContent = title || '';
                     }
+                    let refreshInFlight = false;
                     async function refresh() {
-                      return pageMode === 'rebalance' ? refreshRebalance() : refreshGrid();
+                      if (refreshInFlight) return;
+                      refreshInFlight = true;
+                      try {
+                        return await (pageMode === 'rebalance' ? refreshRebalance() : refreshGrid());
+                      } catch (error) {
+                        const message = `刷新失败：${error && error.message ? error.message : error}`;
+                        if (pageMode === 'rebalance') showRebalanceResult('error', message);
+                        else showActionResult('error', message);
+                      } finally {
+                        refreshInFlight = false;
+                      }
                     }
                     async function refreshRebalance() {
                       const rebalanceFillsPromise = loadRebalanceFillsPage();
@@ -839,8 +983,13 @@ public class HttpStatusServer implements AutoCloseable {
                       const rebalanceCycleItems = rebalanceCycles && rebalanceCycles.items ? rebalanceCycles.items : [];
                       if (rebalanceConfig && rebalanceConfig.config) applyRebalanceConfig(rebalanceConfig.config);
                       renderRebalanceState(rebalanceState && rebalanceState.state ? rebalanceState.state : null, control);
-                      renderRebalanceOrders((rebalanceOrders || []).filter(isActiveOrder), rebalanceCurrentCycle);
-                      renderRebalanceCurrentCycle(rebalanceCurrentCycle, rebalanceState && rebalanceState.state ? rebalanceState.state : null);
+                      const activeRebalanceOrders = (rebalanceOrders || []).filter(isActiveOrder);
+                      renderRebalanceOrders(activeRebalanceOrders, rebalanceCurrentCycle);
+                      renderRebalanceCurrentCycle(
+                        rebalanceCurrentCycle,
+                        rebalanceState && rebalanceState.state ? rebalanceState.state : null,
+                        activeRebalanceOrders
+                      );
                       renderRebalanceFundingFees(rebalanceFundingFees || []);
                       renderRebalanceCycles(rebalanceCycleItems);
                       renderRebalancePager('rebalanceCyclesPager', rebalanceCycles, rebalanceCyclesOffset, 'rebalance-cycles-page');
@@ -858,8 +1007,8 @@ public class HttpStatusServer implements AutoCloseable {
                     async function refreshGrid() {
                       const [control, status, fills, cycles, currentCycle, solBollMonitor] = await Promise.all([
                         fetch('/api/control').then(r=>r.json()),
-                        fetch('/status').then(r=>r.json()),
-                        fetch('/api/fills').then(r=>r.json()),
+                        fetch('/api/active-status').then(r=>r.json()),
+                        fetch('/api/recent-fills?limit=200').then(r=>r.json()),
                         fetch('/api/cycles').then(r=>r.json()),
                         fetch('/api/current-cycle').then(r=>r.json()),
                         fetch('/api/sol-contract-boll-monitor').then(r=>r.json())
@@ -918,7 +1067,7 @@ public class HttpStatusServer implements AutoCloseable {
                         </tr>
                       `).join('');
                     }
-                    function renderRebalanceCurrentCycle(cycle, state) {
+                    function renderRebalanceCurrentCycle(cycle, state, activeOrders) {
                       if (!cycle || !cycle.startedAt) {
                         setText('rebalanceCyclePnl', '-');
                         setText('rebalanceCycleDirection', '-');
@@ -961,9 +1110,10 @@ public class HttpStatusServer implements AutoCloseable {
                       setText('rebalanceCycleCostPriceChange', Number.isFinite(cycleCostPrice) && Number.isFinite(btcPrice) && btcPrice > 0
                         ? formatPercent(cycleCostPrice / btcPrice - 1)
                         : '-');
-                      setText('rebalanceCycleFullInventoryPrice', Number.isFinite(equityUsdt) && Number.isFinite(netBtcQty) && netBtcQty > 0
-                        ? formatPrice2(estimateFullInventoryPrice(state, btcPrice))
-                        : '-');
+                      const fullInventoryEstimate = Number.isFinite(equityUsdt) && Number.isFinite(netBtcQty) && netBtcQty > 0
+                        ? estimateFullInventoryPrice(state, btcPrice, cycle, activeOrders)
+                        : null;
+                      setText('rebalanceCycleFullInventoryPrice', formatFullInventoryEstimate(fullInventoryEstimate));
                       setText('rebalanceCycleCounts', `${cycle.buyCount || 0} / ${cycle.sellCount || 0}，共 ${cycle.fillCount || 0}`);
                       setText('rebalanceCycleQty', `${formatNumber(cycle.buyQty)} / ${formatNumber(cycle.sellQty)}`);
                       setText('rebalanceCycleDuration', formatDuration(cycle.durationSeconds));
@@ -1632,23 +1782,57 @@ public class HttpStatusServer implements AutoCloseable {
                       const n = Number(value);
                       return Number.isFinite(n) ? n.toFixed(2) : '-';
                     }
-                    function estimateFullInventoryPrice(state, currentPrice) {
+                    function estimateFullInventoryPrice(state, currentPrice, cycle, activeOrders) {
                       const equity = Number(state && state.totalEquityUsdt);
                       const netQty = Number(state && state.netBaseQty);
                       const spacing = Number(latestRebalanceConfig && latestRebalanceConfig.baseGridSpacing);
-                      const buyQty = Number(latestRebalanceConfig && (latestRebalanceConfig.autoBaseGridQty || latestRebalanceConfig.baseGridQty));
+                      const baseBuyQty = Number(latestRebalanceConfig && (latestRebalanceConfig.autoBaseGridQty || latestRebalanceConfig.baseGridQty));
+                      const maxInventoryQty = Number(latestRebalanceConfig && latestRebalanceConfig.maxInventoryQty);
+                      const cycleQty = Math.max(0, Number(cycle && cycle.cumulativeQty) || 0);
+                      const activeBuy = (activeOrders || []).find(order =>
+                        order && order.side === 'BUY' && Number.isFinite(Number(order.price)) && Number(order.price) > 0
+                      );
+                      const latestFillPrice = Number(cycle && cycle.latestFillPrice);
+                      let price = activeBuy
+                        ? Number(activeBuy.price)
+                        : (Number.isFinite(latestFillPrice) && latestFillPrice > 0 ? latestFillPrice * (1 - spacing) : NaN);
+                      let buyQty = activeBuy ? Number(activeBuy.qty) : baseBuyQty;
                       if (!Number.isFinite(equity) || !Number.isFinite(netQty) || !Number.isFinite(currentPrice)
-                          || !Number.isFinite(spacing) || !Number.isFinite(buyQty)
-                          || equity <= 0 || netQty < 0 || currentPrice <= 0 || spacing <= 0 || spacing >= 1 || buyQty <= 0) return null;
+                          || !Number.isFinite(spacing) || !Number.isFinite(baseBuyQty)
+                          || !Number.isFinite(price) || !Number.isFinite(buyQty)
+                          || equity <= 0 || netQty < 0 || currentPrice <= 0 || spacing <= 0 || spacing >= 1
+                          || baseBuyQty <= 0 || price <= 0 || buyQty <= 0) return null;
                       let nonBtcValue = equity - netQty * currentPrice;
-                      if (nonBtcValue <= 0) return currentPrice;
-                      let price = currentPrice;
-                      for (let step = 0; step < 100000; step += 1) {
-                        price *= (1 - spacing);
+                      if (nonBtcValue <= 0) {
+                        return {price: currentPrice, requiredQty: 0, maxAdditionalQty: 0, reachable: true};
+                      }
+                      let requiredQty = 0;
+                      for (let step = 0; step < 100000 && price > 0; step += 1) {
                         nonBtcValue -= buyQty * price;
-                        if (nonBtcValue <= 0) return price;
+                        requiredQty += buyQty;
+                        if (nonBtcValue <= 0) {
+                          const maxAdditionalQty = Number.isFinite(maxInventoryQty) && maxInventoryQty > 0
+                            ? Math.max(0, maxInventoryQty - cycleQty)
+                            : null;
+                          return {
+                            price,
+                            requiredQty,
+                            maxAdditionalQty,
+                            reachable: maxAdditionalQty === null || requiredQty <= maxAdditionalQty + 1e-12
+                          };
+                        }
+                        price *= (1 - spacing);
+                        buyQty = baseBuyQty;
                       }
                       return null;
+                    }
+                    function formatFullInventoryEstimate(estimate) {
+                      if (!estimate || !Number.isFinite(Number(estimate.price))) return '-';
+                      const price = formatPrice2(estimate.price);
+                      const required = formatNumber(estimate.requiredQty);
+                      if (estimate.reachable) return `${price}（预计再增加 ${required} BTC）`;
+                      const available = formatNumber(estimate.maxAdditionalQty);
+                      return `${price}（需增加 ${required} BTC；当前上限仅 ${available}，不可达）`;
                     }
                     function formatPercent(value) {
                       if (value === null || value === undefined || value === '') return '-';
@@ -1676,10 +1860,12 @@ public class HttpStatusServer implements AutoCloseable {
                       document.getElementById(id).innerHTML = value;
                     }
                     applyPageMode();
-                    refresh(); setInterval(refresh, 5000);
+                    refresh(); setInterval(() => refresh(), 5000);
                   </script>
                 </body>
                 </html>
-                """);
+                """)
+                .replace("__GRID_UI_URL__", gridUiUrl.isBlank() ? "/grid" : gridUiUrl)
+                .replace("__REBALANCE_UI_URL__", rebalanceUiUrl.isBlank() ? "/rebalance" : rebalanceUiUrl);
     }
 }

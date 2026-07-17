@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Start one SOLUSDT linear grid cycle when price falls below the 5m Bollinger lower band."""
 
+import base64
 import json
 import math
 import os
@@ -13,6 +14,8 @@ from datetime import datetime, timezone
 
 
 BASE_URL = os.environ.get("GRID_CONTROL_URL", "http://127.0.0.1:8787").rstrip("/")
+GRID_HTTP_USERNAME = os.environ.get("GRID_HTTP_USERNAME", "").strip()
+GRID_HTTP_PASSWORD = os.environ.get("GRID_HTTP_PASSWORD", "").strip()
 BYBIT_PUBLIC_BASE = os.environ.get("BYBIT_PUBLIC_BASE", "https://api.bybit.com").rstrip("/")
 POLL_SECONDS = max(5, int(os.environ.get("POLL_SECONDS", "15")))
 STATUS_FILE = os.environ.get(
@@ -53,10 +56,11 @@ def log(message, **fields):
     print(f"{now_iso()} {message}" + (f" {suffix}" if suffix else ""), flush=True)
 
 
-def request_json(url, payload=None, timeout=15):
+def request_json(url, payload=None, timeout=15, extra_headers=None):
     data = None
     method = "GET"
     headers = {"user-agent": "btc-grid-sol-contract-boll-watch/1.0"}
+    headers.update(extra_headers or {})
     if payload is not None:
         data = json.dumps(payload, separators=(",", ":")).encode()
         method = "POST"
@@ -68,7 +72,13 @@ def request_json(url, payload=None, timeout=15):
 
 
 def control_json(path, payload=None):
-    return request_json(BASE_URL + path, payload)
+    headers = {}
+    if GRID_HTTP_USERNAME or GRID_HTTP_PASSWORD:
+        if not GRID_HTTP_USERNAME or not GRID_HTTP_PASSWORD:
+            raise RuntimeError("GRID_HTTP_USERNAME and GRID_HTTP_PASSWORD must both be set")
+        credentials = f"{GRID_HTTP_USERNAME}:{GRID_HTTP_PASSWORD}".encode()
+        headers["authorization"] = "Basic " + base64.b64encode(credentials).decode()
+    return request_json(BASE_URL + path, payload, extra_headers=headers)
 
 
 def bybit_public(path, params):
