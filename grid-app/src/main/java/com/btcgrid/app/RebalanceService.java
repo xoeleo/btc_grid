@@ -376,7 +376,20 @@ public class RebalanceService {
         boolean cycleWasActive = rebalanceCycleActive();
         TradeSide cycleSide = cycleEntrySide();
         boolean fillObserved = false;
-        if (rebalanceEngine != null && rebalanceLedger != null && rebalanceCommandExecutor != null) {
+        if (isAccountingOnlyCorrectionOrder(fillEvent.clientOrderId()) && rebalanceLedger != null) {
+            rebalanceLedger.applyFill(fillEvent);
+            if (afterLedgerApplied != null) {
+                afterLedgerApplied.run();
+            }
+            fillObserved = true;
+            eventLogger.info("rebalance.fill.correction-applied", Map.of(
+                    "executionId", fillEvent.executionId(),
+                    "clientOrderId", fillEvent.clientOrderId(),
+                    "symbol", fillEvent.symbol(),
+                    "side", fillEvent.side().name(),
+                    "qty", fillEvent.fillQty()
+            ));
+        } else if (rebalanceEngine != null && rebalanceLedger != null && rebalanceCommandExecutor != null) {
             MarketSnapshot marketSnapshot = marketDataGateway.latestSnapshot(settings.symbol());
             List<StrategyCommand> commands = rebalanceEngine.onFill(fillEvent, marketSnapshot, afterLedgerApplied);
             fillObserved = true;
@@ -451,6 +464,10 @@ public class RebalanceService {
 
     public static boolean isRebalanceClientOrder(String clientOrderId) {
         return clientOrderId != null && clientOrderId.startsWith(CLIENT_ORDER_PREFIX);
+    }
+
+    static boolean isAccountingOnlyCorrectionOrder(String clientOrderId) {
+        return clientOrderId != null && clientOrderId.contains("_PS_fix");
     }
 
     public String symbol() {

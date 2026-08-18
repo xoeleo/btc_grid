@@ -26,6 +26,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -851,6 +852,20 @@ class RebalanceServiceTest {
         ), "test");
         int submittedAfterPair = tradeGateway.submitted.size();
         assertEquals(3, submittedAfterPair);
+
+        AtomicInteger correctionRecorded = new AtomicInteger();
+        service.onExecution(new FillEvent(
+                "correction-fill",
+                "BTCUSDT",
+                "RBAL_BTCUSDT_PS_fix025_test",
+                TradeSide.SELL,
+                new BigDecimal("0.005"),
+                new BigDecimal("101"),
+                marketDataGateway.timestamp
+        ), "test", correctionRecorded::incrementAndGet);
+
+        assertEquals(1, correctionRecorded.get());
+        assertEquals(submittedAfterPair, tradeGateway.submitted.size());
 
         marketDataGateway.advance(Duration.ofMinutes(2));
         service.onPoll();
