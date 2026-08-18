@@ -55,6 +55,7 @@ public class RebalanceService {
     private final AlertService alertService;
     private final InstrumentSpec instrumentSpec;
     private final Consumer<String> cycleEndObserver;
+    private final GridOrderPlanner orderPlanner;
 
     private RebalanceState state;
     private GridStrategyEngine rebalanceEngine;
@@ -83,7 +84,8 @@ public class RebalanceService {
                 eventLogger,
                 alertService,
                 reason -> {
-                }
+                },
+                null
         );
     }
 
@@ -98,6 +100,32 @@ public class RebalanceService {
             AlertService alertService,
             Consumer<String> cycleEndObserver
     ) {
+        this(
+                settings,
+                marketDataGateway,
+                accountGateway,
+                tradeGateway,
+                workingOrderRegistry,
+                stateStore,
+                eventLogger,
+                alertService,
+                cycleEndObserver,
+                null
+        );
+    }
+
+    public RebalanceService(
+            RebalanceSettings settings,
+            BybitSdkMarketDataGateway marketDataGateway,
+            BybitAccountGateway accountGateway,
+            BybitTradeGateway tradeGateway,
+            WorkingOrderRegistry workingOrderRegistry,
+            FileRebalanceStateStore stateStore,
+            EventLogger eventLogger,
+            AlertService alertService,
+            Consumer<String> cycleEndObserver,
+            GridOrderPlanner orderPlanner
+    ) {
         this.settings = settings;
         this.marketDataGateway = marketDataGateway;
         this.accountGateway = accountGateway;
@@ -108,6 +136,7 @@ public class RebalanceService {
         this.alertService = alertService;
         this.cycleEndObserver = cycleEndObserver == null ? reason -> {
         } : cycleEndObserver;
+        this.orderPlanner = orderPlanner;
         this.instrumentSpec = settings.enabled() ? marketDataGateway.loadInstrumentSpec(settings.symbol()) : null;
         this.state = stateStore.load().orElseGet(() -> RebalanceState.initial(settings.enabled(), settings.symbol()));
         if (state.activeOrder() != null && isRebalanceClientOrder(state.activeOrder().clientOrderId())) {
@@ -283,6 +312,15 @@ public class RebalanceService {
     }
 
     public synchronized boolean onExecution(FillEvent fillEvent, String source) {
+        return onExecution(fillEvent, source, () -> {
+        });
+    }
+
+    public synchronized boolean onExecution(
+            FillEvent fillEvent,
+            String source,
+            Runnable afterLedgerApplied
+    ) {
         if (!isRebalanceFill(fillEvent)) {
             return false;
         }
@@ -312,9 +350,11 @@ public class RebalanceService {
         ));
         boolean cycleWasActive = rebalanceCycleActive();
         TradeSide cycleSide = cycleEntrySide();
+        boolean fillObserved = false;
         if (rebalanceEngine != null && rebalanceLedger != null && rebalanceCommandExecutor != null) {
             MarketSnapshot marketSnapshot = marketDataGateway.latestSnapshot(settings.symbol());
-            List<StrategyCommand> commands = rebalanceEngine.onFill(fillEvent, marketSnapshot);
+            List<StrategyCommand> commands = rebalanceEngine.onFill(fillEvent, marketSnapshot, afterLedgerApplied);
+            fillObserved = true;
             List<String> failures = rebalanceCommandExecutor.execute(commands, rebalanceLedger.snapshot());
             if (!failures.isEmpty()) {
                 eventLogger.error("rebalance.grid.command.failed", Map.of(
@@ -328,6 +368,9 @@ public class RebalanceService {
                 save(stateWith("IDLE", reason));
                 return true;
             }
+        }
+        if (!fillObserved && afterLedgerApplied != null) {
+            afterLedgerApplied.run();
         }
         boolean cycleStillActive = cycleWasActive || rebalanceCycleActive();
         save(new RebalanceState(
@@ -516,7 +559,9 @@ public class RebalanceService {
                     instrumentSpec,
                     rebalanceLedger,
                     new GridTriggerEvaluator(),
-                    new GridOrderPlanner(new ClientOrderIdFactory("RBAL")),
+                    orderPlanner == null
+                            ? new GridOrderPlanner(new ClientOrderIdFactory("RBAL"))
+                            : orderPlanner,
                     true
             );
             rebalanceCommandExecutor = new LiveCommandExecutor(

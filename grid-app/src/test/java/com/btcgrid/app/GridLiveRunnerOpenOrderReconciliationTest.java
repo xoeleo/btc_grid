@@ -64,14 +64,46 @@ class GridLiveRunnerOpenOrderReconciliationTest {
     }
 
     @Test
-    void missingRemoteOpenOrderWithoutExecutionIsMarkedCanceled() throws Exception {
+    void missingRemoteOpenOrderWithoutTerminalStatusRemainsPending() throws Exception {
         WorkingOrderRegistry registry = new WorkingOrderRegistry();
         registry.trackRemote(openOrder("GRID_SOLUSDT_PB_test", Instant.now().minusSeconds(30)));
         GridLiveRunner runner = runner(registry, new FakeOrderQueryGateway(List.of()));
 
         invokeReconcileOpenOrders(runner);
+        invokeReconcileOpenOrders(runner);
+
+        assertEquals(OrderStatus.NEW, onlyOrder(registry).status());
+    }
+
+    @Test
+    void missingRemoteOpenOrderWithConfirmedCanceledStatusIsMarkedCanceled() throws Exception {
+        WorkingOrderRegistry registry = new WorkingOrderRegistry();
+        WorkingOrder order = openOrder("GRID_SOLUSDT_PB_test", Instant.now().minusSeconds(30));
+        registry.trackRemote(order);
+        FakeOrderQueryGateway gateway = new FakeOrderQueryGateway(List.of());
+        gateway.recentOrders = List.of(withStatus(order, OrderStatus.CANCELED));
+        GridLiveRunner runner = runner(registry, gateway);
+
+        invokeReconcileOpenOrders(runner);
 
         assertEquals(OrderStatus.CANCELED, onlyOrder(registry).status());
+    }
+
+    @Test
+    void missingRemoteOpenOrderThatReappearsIsNotCanceled() throws Exception {
+        WorkingOrderRegistry registry = new WorkingOrderRegistry();
+        WorkingOrder order = openOrder("GRID_SOLUSDT_PB_test", Instant.now().minusSeconds(30));
+        registry.trackRemote(order);
+        FakeOrderQueryGateway gateway = new FakeOrderQueryGateway(List.of());
+        GridLiveRunner runner = runner(registry, gateway);
+
+        invokeReconcileOpenOrders(runner);
+        gateway.openOrders = List.of(order);
+        invokeReconcileOpenOrders(runner);
+        gateway.openOrders = List.of();
+        invokeReconcileOpenOrders(runner);
+
+        assertEquals(OrderStatus.NEW, onlyOrder(registry).status());
     }
 
     @Test
@@ -145,6 +177,22 @@ class GridLiveRunnerOpenOrderReconciliationTest {
                 false,
                 OrderStatus.NEW,
                 createdAt,
+                Instant.now()
+        );
+    }
+
+    private WorkingOrder withStatus(WorkingOrder order, OrderStatus status) {
+        return new WorkingOrder(
+                order.symbol(),
+                order.clientOrderId(),
+                order.exchangeOrderId(),
+                order.side(),
+                order.orderType(),
+                order.price(),
+                order.qty(),
+                order.reduceOnly(),
+                status,
+                order.createdAt(),
                 Instant.now()
         );
     }
@@ -246,6 +294,8 @@ class GridLiveRunnerOpenOrderReconciliationTest {
 
     private static class FakeOrderQueryGateway implements BybitOrderQueryGateway {
         private final List<FillEvent> executions;
+        private List<WorkingOrder> openOrders = List.of();
+        private List<WorkingOrder> recentOrders = List.of();
         private Set<String> executionQueryClientOrderIds = Set.of();
 
         private FakeOrderQueryGateway(List<FillEvent> executions) {
@@ -254,7 +304,12 @@ class GridLiveRunnerOpenOrderReconciliationTest {
 
         @Override
         public List<WorkingOrder> fetchOpenOrders(String symbol) {
-            return List.of();
+            return openOrders;
+        }
+
+        @Override
+        public List<WorkingOrder> fetchRecentOrders(String symbol, Set<String> clientOrderIds) {
+            return recentOrders;
         }
 
         @Override

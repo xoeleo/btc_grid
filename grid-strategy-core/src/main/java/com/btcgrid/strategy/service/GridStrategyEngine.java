@@ -160,7 +160,19 @@ public class GridStrategyEngine {
     }
 
     public List<StrategyCommand> onFill(FillEvent fillEvent, MarketSnapshot marketSnapshot) {
+        return onFill(fillEvent, marketSnapshot, () -> {
+        });
+    }
+
+    public List<StrategyCommand> onFill(
+            FillEvent fillEvent,
+            MarketSnapshot marketSnapshot,
+            Runnable afterLedgerApplied
+    ) {
         strategyLedger.applyFill(fillEvent);
+        if (afterLedgerApplied != null) {
+            afterLedgerApplied.run();
+        }
         StrategyLedgerSnapshot ledgerSnapshot = strategyLedger.snapshot();
         List<StrategyCommand> commands = new ArrayList<>();
         boolean boostReduceSide = shouldBoostReduceSide(marketSnapshot.indicators(), marketSnapshot, ledgerSnapshot);

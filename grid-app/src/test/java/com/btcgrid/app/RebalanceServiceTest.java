@@ -15,6 +15,9 @@ import com.btcgrid.common.model.OrderType;
 import com.btcgrid.common.model.ProductCategory;
 import com.btcgrid.common.model.TradeSide;
 import com.btcgrid.common.model.WorkingOrder;
+import com.btcgrid.strategy.model.ProfitSizingState;
+import com.btcgrid.strategy.service.ClientOrderIdFactory;
+import com.btcgrid.strategy.service.GridOrderPlanner;
 import java.math.BigDecimal;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -29,6 +32,24 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class RebalanceServiceTest {
+
+    @Test
+    void splitsFundingFeeReconciliationIntoBybitSevenDayWindows() {
+        Instant start = Instant.parse("2026-07-21T08:03:39Z");
+        Instant end = start.plus(Duration.ofDays(8)).plusSeconds(30);
+
+        List<RebalanceLiveRunner.FundingFeeQueryWindow> windows =
+                RebalanceLiveRunner.fundingFeeQueryWindows(start, end);
+
+        assertEquals(2, windows.size());
+        assertEquals(start, windows.get(0).startInclusive());
+        assertEquals(Duration.ofDays(7).minusMillis(1), Duration.between(
+                windows.get(0).startInclusive(),
+                windows.get(0).endInclusive()
+        ));
+        assertEquals(windows.get(0).endInclusive().plusMillis(1), windows.get(1).startInclusive());
+        assertEquals(end, windows.get(1).endInclusive());
+    }
 
     @Test
     void placesBuyOrderWhenBtcRatioIsBelowPriceBandTarget() throws Exception {
@@ -836,6 +857,78 @@ class RebalanceServiceTest {
         assertEquals(5, tradeGateway.submitted.size());
         assertTrue(tradeGateway.submitted.subList(submittedAfterPair, tradeGateway.submitted.size()).stream()
                 .allMatch(order -> order.clientOrderId().startsWith(RebalanceService.CLIENT_ORDER_PREFIX)));
+        Files.deleteIfExists(stateFile);
+    }
+
+    @Test
+    void rebalanceGridUsesAccumulatedProfitReduceSizingState() throws Exception {
+        Path stateFile = Files.createTempFile("rebalance-profit-sizing", ".json");
+        WorkingOrderRegistry registry = new WorkingOrderRegistry();
+        RecordingTradeGateway tradeGateway = new RecordingTradeGateway();
+        FakeMarketDataGateway marketDataGateway = new FakeMarketDataGateway(new BigDecimal("100"));
+        GridOrderPlanner planner = new GridOrderPlanner(
+                new ClientOrderIdFactory("RBAL"),
+                new BigDecimal("1.10"),
+                (market, ledger, price, qty) -> true,
+                (market, ledger, price, qty) -> false,
+                symbol -> new ProfitSizingState(
+                        new BigDecimal("0.0005"),
+                        BigDecimal.ZERO,
+                        BigDecimal.ZERO,
+                        BigDecimal.ZERO
+                )
+        );
+        RebalanceService service = new RebalanceService(
+                new RebalanceSettings(
+                        true, ProductCategory.LINEAR, "BTCUSDT", "UNIFIED", "BTC", "USDT",
+                        List.of(new RebalanceBand(BigDecimal.ZERO, new BigDecimal("0.75"))),
+                        new BigDecimal("0.01"), new BigDecimal("0.01"), new BigDecimal("0.85"),
+                        new BigDecimal("0.005"), new BigDecimal("5"), new BigDecimal("0.100"),
+                        new BigDecimal("1.0"), new BigDecimal("0.001"), new BigDecimal("0.001"),
+                        Duration.ofMinutes(15), 1, "rebalance-config.properties", stateFile.toString()
+                ),
+                marketDataGateway,
+                (accountType, baseCoin, quoteCoin, positionCategory, symbol) -> new AccountAssetSnapshot(
+                        marketDataGateway.timestamp,
+                        accountType,
+                        baseCoin,
+                        quoteCoin,
+                        new BigDecimal("0.72"),
+                        BigDecimal.ZERO,
+                        BigDecimal.ZERO,
+                        new BigDecimal("0.72"),
+                        new BigDecimal("100")
+                ),
+                tradeGateway,
+                registry,
+                new FileRebalanceStateStore(stateFile),
+                new NoopEventLogger(),
+                new AlertService(new NoopEventLogger()),
+                reason -> {
+                },
+                planner
+        );
+
+        service.onPoll();
+        OrderIntent initial = tradeGateway.submitted.get(0);
+        service.onExecution(new FillEvent(
+                "initial-fill-profit-sizing",
+                "BTCUSDT",
+                initial.clientOrderId(),
+                TradeSide.BUY,
+                initial.qty(),
+                new BigDecimal("100"),
+                marketDataGateway.timestamp
+        ), "test");
+
+        OrderIntent boostedReduce = tradeGateway.submitted.stream()
+                .filter(order -> order.type() == OrderType.LIMIT && order.side() == TradeSide.SELL)
+                .findFirst()
+                .orElseThrow();
+        assertEquals(new BigDecimal("0.006"), boostedReduce.qty());
+        assertTrue(boostedReduce.reason().contains(
+                "profit-reduce-boost:base=0.005,order=0.006,intended=0.0005,carry=0.0005,applied=0.001"
+        ));
         Files.deleteIfExists(stateFile);
     }
 

@@ -5,6 +5,7 @@ import java.time.Instant;
 import java.util.Collection;
 import java.util.List;
 import java.util.Set;
+import com.btcgrid.strategy.model.ProfitSizingState;
 
 public interface FillStore {
 
@@ -30,7 +31,30 @@ public interface FillStore {
 
     List<FillRecord> currentCycleFills(String symbol);
 
+    FundingFeePage currentCycleFundingFeesPage(String symbol, int limit, int offset);
+
+    CurrentCycleFillPage currentCycleFillsPage(
+            String symbol,
+            int limit,
+            int offset,
+            BigDecimal minPrice,
+            BigDecimal maxPrice
+    );
+
+    default CurrentCycleFillPage currentCycleFillsPage(
+            String symbol,
+            int limit,
+            int offset,
+            BigDecimal minPrice,
+            BigDecimal maxPrice,
+            boolean maxPriceExclusive
+    ) {
+        return currentCycleFillsPage(symbol, limit, offset, minPrice, maxPrice);
+    }
+
     CurrentCycleSummary currentCycle(String symbol, Instant now, BigDecimal markPrice);
+
+    ProfitSizingState profitSizingState(String symbol);
 
     CurrentCycleSummary latestOpenCycle(Instant now, BigDecimal markPrice);
 

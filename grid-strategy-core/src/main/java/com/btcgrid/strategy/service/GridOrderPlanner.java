@@ -9,19 +9,34 @@ import com.btcgrid.common.model.OrderType;
 import com.btcgrid.common.model.TradeSide;
 import com.btcgrid.ledger.model.StrategyLedgerSnapshot;
 import com.btcgrid.strategy.model.OrderPairPlan;
+import com.btcgrid.strategy.model.ProfitSizingState;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.util.function.BiPredicate;
 
 public class GridOrderPlanner {
 
+    private static final BigDecimal EXTRA_REDUCE_NET_QTY_CAP_RATIO = new BigDecimal("0.5");
+
     private final ClientOrderIdFactory clientOrderIdFactory;
     private final BigDecimal profitableReduceSideMultiplier;
     private final ProfitStateEvaluator profitableStateEvaluator;
+    private final ProfitStateEvaluator lossStateEvaluator;
+    private final ProfitSizingStateProvider profitSizingStateProvider;
 
     @FunctionalInterface
     public interface ProfitStateEvaluator {
-        boolean test(MarketSnapshot marketSnapshot, StrategyLedgerSnapshot ledgerSnapshot, BigDecimal orderPrice);
+        boolean test(
+                MarketSnapshot marketSnapshot,
+                StrategyLedgerSnapshot ledgerSnapshot,
+                BigDecimal orderPrice,
+                BigDecimal orderQty
+        );
+    }
+
+    @FunctionalInterface
+    public interface ProfitSizingStateProvider {
+        ProfitSizingState state(String symbol);
     }
 
     public GridOrderPlanner(ClientOrderIdFactory clientOrderIdFactory) {
@@ -46,7 +61,8 @@ public class GridOrderPlanner {
                 profitableReduceSideMultiplier,
                 profitableStateEvaluator == null
                         ? null
-                        : (marketSnapshot, ledgerSnapshot, orderPrice) -> profitableStateEvaluator.test(marketSnapshot, ledgerSnapshot)
+                        : (marketSnapshot, ledgerSnapshot, orderPrice, orderQty) ->
+                                profitableStateEvaluator.test(marketSnapshot, ledgerSnapshot)
         );
     }
 
@@ -55,13 +71,35 @@ public class GridOrderPlanner {
             BigDecimal profitableReduceSideMultiplier,
             ProfitStateEvaluator profitableStateEvaluator
     ) {
+        this(
+                clientOrderIdFactory,
+                profitableReduceSideMultiplier,
+                profitableStateEvaluator,
+                (marketSnapshot, ledgerSnapshot, orderPrice, orderQty) -> false,
+                symbol -> ProfitSizingState.empty()
+        );
+    }
+
+    public GridOrderPlanner(
+            ClientOrderIdFactory clientOrderIdFactory,
+            BigDecimal profitableReduceSideMultiplier,
+            ProfitStateEvaluator profitableStateEvaluator,
+            ProfitStateEvaluator lossStateEvaluator,
+            ProfitSizingStateProvider profitSizingStateProvider
+    ) {
         this.clientOrderIdFactory = clientOrderIdFactory;
         this.profitableReduceSideMultiplier = profitableReduceSideMultiplier == null || profitableReduceSideMultiplier.compareTo(BigDecimal.ONE) < 0
                 ? BigDecimal.ONE
                 : profitableReduceSideMultiplier;
         this.profitableStateEvaluator = profitableStateEvaluator == null
-                ? (marketSnapshot, ledgerSnapshot, orderPrice) -> false
+                ? (marketSnapshot, ledgerSnapshot, orderPrice, orderQty) -> false
                 : profitableStateEvaluator;
+        this.lossStateEvaluator = lossStateEvaluator == null
+                ? (marketSnapshot, ledgerSnapshot, orderPrice, orderQty) -> false
+                : lossStateEvaluator;
+        this.profitSizingStateProvider = profitSizingStateProvider == null
+                ? symbol -> ProfitSizingState.empty()
+                : profitSizingStateProvider;
     }
 
     public OrderIntent planInitialOrder(
@@ -202,15 +240,32 @@ public class GridOrderPlanner {
         boolean sellReduceQtyApplied = false;
         boolean buyProfitBoostApplied = false;
         boolean sellProfitBoostApplied = false;
+        String buySizingReason = null;
+        String sellSizingReason = null;
+        ProfitSizingState sizingState = profitSizingStateProvider.state(marketSnapshot.symbol());
 
         if (config.entryDirection().isSpotLongOnly()) {
             buyQty = capAddQty(config, instrumentSpec, buyQty, ledgerSnapshot);
+            SizingAdjustment buyRelease = lossAddSideAdjustment(
+                    config, instrumentSpec, marketSnapshot, ledgerSnapshot, buyQty, buyPrice, sizingState
+            );
+            buyQty = buyRelease.qty();
+            buySizingReason = buyRelease.reason();
             sellQty = clampTradableQty(instrumentSpec, sellNormalQty.min(ledgerSnapshot.netQty().max(BigDecimal.ZERO)), config.maxOrderQty(), sellPrice);
             sellQtyBeforeProfitBoost = sellQty;
-            sellQty = profitableReduceSideQty(config, instrumentSpec, marketSnapshot, ledgerSnapshot, sellQty, sellPrice);
+            SizingAdjustment sellBoost = profitableReduceSideAdjustment(
+                    config, instrumentSpec, marketSnapshot, ledgerSnapshot, sellQty, sellPrice, sizingState
+            );
+            sellQty = sellBoost.qty();
+            sellSizingReason = sellBoost.reason();
             sellProfitBoostApplied = sellQty.compareTo(sellQtyBeforeProfitBoost) > 0;
         } else if (ledgerSnapshot.netQty().signum() > 0) {
             buyQty = capAddQty(config, instrumentSpec, buyQty, ledgerSnapshot);
+            SizingAdjustment buyRelease = lossAddSideAdjustment(
+                    config, instrumentSpec, marketSnapshot, ledgerSnapshot, buyQty, buyPrice, sizingState
+            );
+            buyQty = buyRelease.qty();
+            buySizingReason = buyRelease.reason();
             BigDecimal reducedSellQty = config.classicReduceSizing()
                     ? BigDecimal.ZERO
                     : reduceSideQty(config, instrumentSpec, ledgerSnapshot, referencePrice, sellPrice, marketSnapshot.indicators().bollUpper4h());
@@ -224,10 +279,19 @@ public class GridOrderPlanner {
                 sellQty = boostedReduceQty(config, instrumentSpec, ledgerSnapshot, sellQty).min(ledgerSnapshot.netQty().abs());
             }
             sellQtyBeforeProfitBoost = sellQty;
-            sellQty = profitableReduceSideQty(config, instrumentSpec, marketSnapshot, ledgerSnapshot, sellQty, sellPrice);
+            SizingAdjustment sellBoost = profitableReduceSideAdjustment(
+                    config, instrumentSpec, marketSnapshot, ledgerSnapshot, sellQty, sellPrice, sizingState
+            );
+            sellQty = sellBoost.qty();
+            sellSizingReason = sellBoost.reason();
             sellProfitBoostApplied = sellQty.compareTo(sellQtyBeforeProfitBoost) > 0;
         } else if (ledgerSnapshot.netQty().signum() < 0) {
             sellQty = capAddQty(config, instrumentSpec, sellQty, ledgerSnapshot);
+            SizingAdjustment sellRelease = lossAddSideAdjustment(
+                    config, instrumentSpec, marketSnapshot, ledgerSnapshot, sellQty, sellPrice, sizingState
+            );
+            sellQty = sellRelease.qty();
+            sellSizingReason = sellRelease.reason();
             BigDecimal reducedBuyQty = config.classicReduceSizing()
                     ? BigDecimal.ZERO
                     : reduceSideQty(config, instrumentSpec, ledgerSnapshot, referencePrice, buyPrice, marketSnapshot.indicators().bollLower4h());
@@ -241,7 +305,11 @@ public class GridOrderPlanner {
                 buyQty = boostedReduceQty(config, instrumentSpec, ledgerSnapshot, buyQty).min(ledgerSnapshot.netQty().abs());
             }
             buyQtyBeforeProfitBoost = buyQty;
-            buyQty = profitableReduceSideQty(config, instrumentSpec, marketSnapshot, ledgerSnapshot, buyQty, buyPrice);
+            SizingAdjustment buyBoost = profitableReduceSideAdjustment(
+                    config, instrumentSpec, marketSnapshot, ledgerSnapshot, buyQty, buyPrice, sizingState
+            );
+            buyQty = buyBoost.qty();
+            buySizingReason = buyBoost.reason();
             buyProfitBoostApplied = buyQty.compareTo(buyQtyBeforeProfitBoost) > 0;
         }
         if (buyQty.signum() == 0 && sellQty.signum() == 0) {
@@ -256,7 +324,7 @@ public class GridOrderPlanner {
                 buyQty,
                 buyPrice,
                 false,
-                pairSideReason(pairReason, "buy", buyReduceQtyApplied, buyProfitBoostApplied, buyQtyBeforeProfitBoost, buyQty)
+                pairSideReason(pairReason, "buy", buyReduceQtyApplied, buyProfitBoostApplied, buyQtyBeforeProfitBoost, buyQty, buySizingReason)
         );
         OrderIntent sell = sellQty.signum() == 0 ? null : new OrderIntent(
                 marketSnapshot.symbol(),
@@ -266,7 +334,7 @@ public class GridOrderPlanner {
                 sellQty,
                 sellPrice,
                 false,
-                pairSideReason(pairReason, "sell", sellReduceQtyApplied, sellProfitBoostApplied, sellQtyBeforeProfitBoost, sellQty)
+                pairSideReason(pairReason, "sell", sellReduceQtyApplied, sellProfitBoostApplied, sellQtyBeforeProfitBoost, sellQty, sellSizingReason)
         );
         return new OrderPairPlan(buy, sell);
     }
@@ -306,13 +374,16 @@ public class GridOrderPlanner {
             boolean reduceQtyApplied,
             boolean profitBoostApplied,
             BigDecimal baseQty,
-            BigDecimal boostedQty
+            BigDecimal boostedQty,
+            String sizingReason
     ) {
         String baseReason = pairReason == null
                 ? ("buy".equals(sideTag) ? "grid-buy" : "grid-sell")
                 : pairReason + "|" + sideTag;
         String reason = reduceQtyApplied ? baseReason + "|reduce-qty" : baseReason;
-        if (profitBoostApplied) {
+        if (sizingReason != null && !sizingReason.isBlank()) {
+            reason += "|" + sizingReason;
+        } else if (profitBoostApplied) {
             reason += "|profit-reduce-boost:base=" + baseQty.stripTrailingZeros().toPlainString()
                     + ",boosted=" + boostedQty.stripTrailingZeros().toPlainString();
         }
@@ -424,23 +495,156 @@ public class GridOrderPlanner {
         return clampTradableQty(instrumentSpec, boostedQty.min(reduceCap), config.maxOrderQty(), ledgerSnapshot.lastFillPrice());
     }
 
-    private BigDecimal profitableReduceSideQty(
+    private SizingAdjustment profitableReduceSideAdjustment(
             GridStrategyConfig config,
             InstrumentSpec instrumentSpec,
             MarketSnapshot marketSnapshot,
             StrategyLedgerSnapshot ledgerSnapshot,
             BigDecimal normalQty,
-            BigDecimal price
+            BigDecimal price,
+            ProfitSizingState state
     ) {
         if (normalQty == null || normalQty.signum() <= 0 || profitableReduceSideMultiplier.compareTo(BigDecimal.ONE) <= 0) {
-            return normalQty;
-        }
-        if (!profitableStateEvaluator.test(marketSnapshot, ledgerSnapshot, price)) {
-            return normalQty;
+            return SizingAdjustment.none(normalQty);
         }
         BigDecimal reduceCap = ledgerSnapshot.netQty().abs();
-        BigDecimal boostedQty = tradableQty(instrumentSpec, normalQty.multiply(profitableReduceSideMultiplier), price);
-        return clampTradableQty(instrumentSpec, boostedQty.min(reduceCap), config.maxOrderQty(), price);
+        BigDecimal intended = normalQty.multiply(profitableReduceSideMultiplier.subtract(BigDecimal.ONE));
+        BigDecimal carryBefore = state == null ? BigDecimal.ZERO : state.pendingReduceCarryQty();
+        BigDecimal available = carryBefore.add(intended);
+        BigDecimal permanentRemaining = state == null
+                ? BigDecimal.ZERO
+                : state.permanentReduceRemainingQty();
+        BigDecimal orderAndInventoryRoom = reduceCap.subtract(normalQty)
+                .min(config.maxOrderQty().subtract(normalQty))
+                .max(BigDecimal.ZERO);
+        BigDecimal reserveCapacity = extraReduceCapacityAfterNormalReduction(
+                reduceCap,
+                normalQty,
+                state == null ? BigDecimal.ZERO : state.releasableQty()
+        );
+        BigDecimal maxExtra = orderAndInventoryRoom.min(permanentRemaining.add(reserveCapacity));
+        boolean reserveCapBinding = maxExtra.compareTo(available) < 0;
+        BigDecimal applied = instrumentSpec.roundQtyDown(available.min(maxExtra));
+        if (reserveCapBinding && applied.signum() == 0) {
+            return SizingAdjustment.none(normalQty);
+        }
+        BigDecimal finalQty = clampTradableQty(
+                instrumentSpec,
+                normalQty.add(applied).min(reduceCap),
+                config.maxOrderQty(),
+                price
+        );
+        applied = finalQty.subtract(normalQty).max(BigDecimal.ZERO);
+        if (!profitableStateEvaluator.test(marketSnapshot, ledgerSnapshot, price, finalQty)) {
+            return SizingAdjustment.none(normalQty);
+        }
+        BigDecimal permanentApplied = applied.min(permanentRemaining);
+        return new SizingAdjustment(finalQty, sizingReason(
+                "profit-reduce-boost",
+                normalQty,
+                finalQty,
+                intended,
+                carryBefore,
+                applied,
+                null,
+                permanentApplied
+        ));
+    }
+
+    private BigDecimal extraReduceCapacityAfterNormalReduction(
+            BigDecimal currentNetQty,
+            BigDecimal normalReduceQty,
+            BigDecimal currentExtraReduceReserve
+    ) {
+        BigDecimal projectedNetBeforeExtra = currentNetQty
+                .subtract(normalReduceQty)
+                .max(BigDecimal.ZERO);
+        BigDecimal numerator = projectedNetBeforeExtra
+                .multiply(EXTRA_REDUCE_NET_QTY_CAP_RATIO)
+                .subtract(currentExtraReduceReserve)
+                .max(BigDecimal.ZERO);
+        return numerator.divide(
+                BigDecimal.ONE.add(EXTRA_REDUCE_NET_QTY_CAP_RATIO),
+                18,
+                RoundingMode.DOWN
+        );
+    }
+
+    private SizingAdjustment lossAddSideAdjustment(
+            GridStrategyConfig config,
+            InstrumentSpec instrumentSpec,
+            MarketSnapshot marketSnapshot,
+            StrategyLedgerSnapshot ledgerSnapshot,
+            BigDecimal normalQty,
+            BigDecimal price,
+            ProfitSizingState state
+    ) {
+        if (normalQty == null || normalQty.signum() <= 0 || state == null || state.releasableQty().signum() <= 0
+                || profitableReduceSideMultiplier.compareTo(BigDecimal.ONE) <= 0) {
+            return SizingAdjustment.none(normalQty);
+        }
+        BigDecimal carryBefore = state.pendingAddCarryQty().min(state.releasableQty());
+        BigDecimal roomAfterCarry = state.releasableQty().subtract(carryBefore).max(BigDecimal.ZERO);
+        BigDecimal intended = normalQty.multiply(profitableReduceSideMultiplier.subtract(BigDecimal.ONE))
+                .min(roomAfterCarry);
+        BigDecimal available = carryBefore.add(intended).min(state.releasableQty());
+        BigDecimal inventoryRoom = maxAddQty(config, ledgerSnapshot.netQty().abs()).subtract(normalQty);
+        BigDecimal orderRoom = config.maxOrderQty().subtract(normalQty);
+        BigDecimal applied = instrumentSpec.roundQtyDown(
+                available.min(inventoryRoom).min(orderRoom).max(BigDecimal.ZERO)
+        );
+        BigDecimal finalQty = clampTradableQty(
+                instrumentSpec,
+                normalQty.add(applied),
+                normalQty.add(inventoryRoom.max(BigDecimal.ZERO)).min(config.maxOrderQty()),
+                price
+        );
+        applied = finalQty.subtract(normalQty).max(BigDecimal.ZERO);
+        if (!lossStateEvaluator.test(marketSnapshot, ledgerSnapshot, price, finalQty)) {
+            return SizingAdjustment.none(normalQty);
+        }
+        return new SizingAdjustment(finalQty, sizingReason(
+                "loss-add-release",
+                normalQty,
+                finalQty,
+                intended,
+                carryBefore,
+                applied,
+                state.releasableQty(),
+                BigDecimal.ZERO
+        ));
+    }
+
+    private String sizingReason(
+            String tag,
+            BigDecimal baseQty,
+            BigDecimal orderQty,
+            BigDecimal intendedQty,
+            BigDecimal carryBefore,
+            BigDecimal appliedQty,
+            BigDecimal reserveBefore,
+            BigDecimal permanentAppliedQty
+    ) {
+        String reason = tag
+                + ":base=" + plain(baseQty)
+                + ",order=" + plain(orderQty)
+                + ",intended=" + plain(intendedQty)
+                + ",carry=" + plain(carryBefore)
+                + ",applied=" + plain(appliedQty);
+        if (permanentAppliedQty != null && permanentAppliedQty.signum() > 0) {
+            reason += ",permanent=" + plain(permanentAppliedQty);
+        }
+        return reserveBefore == null ? reason : reason + ",reserve=" + plain(reserveBefore);
+    }
+
+    private String plain(BigDecimal value) {
+        return (value == null ? BigDecimal.ZERO : value).stripTrailingZeros().toPlainString();
+    }
+
+    private record SizingAdjustment(BigDecimal qty, String reason) {
+        private static SizingAdjustment none(BigDecimal qty) {
+            return new SizingAdjustment(qty, null);
+        }
     }
 
     private BigDecimal capAddQty(
@@ -566,7 +770,7 @@ public class GridOrderPlanner {
         BigDecimal previousLegDistance = previousLegDistance(ledgerSnapshot, orderSide);
         BigDecimal multiplier = placementMultiplier(ledgerSnapshot, orderSide);
         BigDecimal placementDistance = previousLegDistance.signum() > 0
-                ? previousLegDistance.multiply(multiplier)
+                ? previousLegDistance.multiply(multiplier).max(baseSpacing)
                 : baseSpacing;
         BigDecimal derivedSteps = baseSpacing.signum() <= 0
                 ? BigDecimal.ZERO

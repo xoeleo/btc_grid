@@ -36,12 +36,14 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.math.BigDecimal;
 import java.math.MathContext;
+import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.Instant;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -122,6 +124,7 @@ public class LiveControlService {
         this.solContractBollMonitorStatusPath = runtimeStatePath.resolveSibling("sol-contract-boll-monitor.json");
         this.flattenStopLocked.set(Files.exists(flattenStopLockPath));
         this.lastConfig = baseProperties.strategyConfig();
+        finalizeFlatOpenCycleIfNeeded();
         RebalanceSettings rebalanceSettings = currentRebalanceSettings();
         if (rebalanceSettings.enabled()) {
             startRebalanceRunner(rebalanceSettings);
@@ -557,6 +560,9 @@ public class LiveControlService {
                 "stopAfterCycle", runner != null && runner.isStopAfterCycleRequested(),
                 "flattenStopLocked", flattenStopLocked.get(),
                 "flattenStop", flattenStopStatus.get(),
+                "profitSizingPolicy", Map.of(
+                        "lossAddTriggerRate", gridLossAddTriggerRate()
+                ),
                 "config", lastConfig
         );
     }
@@ -603,6 +609,10 @@ public class LiveControlService {
     }
 
     private void recordSpotCycleEnd(String symbol, String reason) {
+        recordSpotCycleEnd(symbol, reason, Instant.now());
+    }
+
+    private void recordSpotCycleEnd(String symbol, String reason, Instant endTime) {
         if (symbol == null || symbol.isBlank()) {
             return;
         }
@@ -610,7 +620,7 @@ public class LiveControlService {
         if (fills.isEmpty()) {
             return;
         }
-        Instant now = Instant.now();
+        Instant now = endTime == null ? Instant.now() : endTime;
         FillRecord first = fills.get(0);
         FillRecord last = fills.get(fills.size() - 1);
         BigDecimal price = last.price() == null ? BigDecimal.ZERO : last.price();
@@ -659,33 +669,40 @@ public class LiveControlService {
         return fillStore.currentCycleFills(rebalanceLedgerSymbol(currentRebalanceSettings().symbol()));
     }
 
-    public PageResult<FillRecord> rebalanceFillsPage(int limit, int offset) {
+    public CurrentCycleFillPage rebalanceFillsPage(int limit, int offset) {
         return rebalanceFillsPage(limit, offset, "");
     }
 
-    public PageResult<FillRecord> rebalanceFillsPage(int limit, int offset, String price) {
+    public CurrentCycleFillPage rebalanceFillsPage(int limit, int offset, String price) {
         int normalizedLimit = normalizePageLimit(limit);
         int normalizedOffset = Math.max(0, offset);
-        List<FillRecord> records = new ArrayList<>(fillStore.currentCycleFills(
-                rebalanceLedgerSymbol(currentRebalanceSettings().symbol())
-        ));
-        BigDecimal priceFilter = parsePriceFilter(price);
-        if (priceFilter != null) {
-            records.removeIf(fill -> fill == null || fill.price() == null || fill.price().compareTo(priceFilter) != 0);
-        }
-        java.util.Collections.reverse(records);
-        if (normalizedOffset >= records.size()) {
-            return new PageResult<>(List.of(), normalizedLimit, normalizedOffset, false);
-        }
-        int endExclusive = Math.min(records.size(), normalizedOffset + normalizedLimit + 1);
-        List<FillRecord> page = records.subList(normalizedOffset, endExclusive);
-        boolean hasMore = page.size() > normalizedLimit;
-        return new PageResult<>(
-                hasMore ? page.subList(0, normalizedLimit) : page,
+        RebalancePriceBucket priceBucket = rebalancePriceBucket(price);
+        return fillStore.currentCycleFillsPage(
+                rebalanceLedgerSymbol(currentRebalanceSettings().symbol()),
                 normalizedLimit,
                 normalizedOffset,
-                hasMore
+                priceBucket == null ? null : priceBucket.minInclusive(),
+                priceBucket == null ? null : priceBucket.maxExclusive(),
+                true
         );
+    }
+
+    static RebalancePriceBucket rebalancePriceBucket(String price) {
+        if (price == null || price.isBlank()) {
+            return null;
+        }
+        try {
+            BigDecimal value = new BigDecimal(price.trim());
+            BigDecimal minInclusive = value
+                    .divide(BigDecimal.TEN, 0, java.math.RoundingMode.FLOOR)
+                    .multiply(BigDecimal.TEN);
+            return new RebalancePriceBucket(minInclusive, minInclusive.add(BigDecimal.TEN));
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
+    record RebalancePriceBucket(BigDecimal minInclusive, BigDecimal maxExclusive) {
     }
 
     private static BigDecimal parsePriceFilter(String price) {
@@ -699,14 +716,12 @@ public class LiveControlService {
         }
     }
 
-    public List<FillRecord> rebalanceFundingFees() {
-        List<FillRecord> records = new ArrayList<>(fillStore.currentCycleFills(
-                rebalanceLedgerSymbol(currentRebalanceSettings().symbol())
-        ).stream()
-                .filter(fill -> fill != null && "FUNDING_FEE".equals(fill.side()))
-                .toList());
-        java.util.Collections.reverse(records);
-        return records;
+    public FundingFeePage rebalanceFundingFeesPage(int limit, int offset) {
+        return fillStore.currentCycleFundingFeesPage(
+                rebalanceLedgerSymbol(currentRebalanceSettings().symbol()),
+                normalizePageLimit(limit),
+                Math.max(0, offset)
+        );
     }
 
     public List<Map<String, Object>> rebalanceCycles() {
@@ -831,7 +846,20 @@ public class LiveControlService {
         return new GridOrderPlanner(
                 new ClientOrderIdFactory(),
                 new BigDecimal(baseProperties.rawProperties().getProperty("grid.profitable-reduce-side-multiplier", "1.10").trim()),
-                (market, ledger, orderPrice) -> currentCycleMarketPnl(market, orderPrice).signum() > 0
+                (market, ledger, orderPrice, orderQty) -> GridApplication.afterEstimatedOrderFee(
+                        currentCycleMarketPnl(market, orderPrice),
+                        orderPrice,
+                        orderQty,
+                        profitSizingEstimatedFeeRate()
+                ).signum() > 0,
+                (market, ledger, orderPrice, orderQty) -> GridApplication.currentCycleLossRateAfterEstimatedFee(
+                        fillStore,
+                        market,
+                        orderPrice,
+                        orderQty,
+                        profitSizingEstimatedFeeRate()
+                ).compareTo(gridLossAddTriggerRate().negate()) < 0,
+                fillStore::profitSizingState
         );
     }
 
@@ -847,7 +875,18 @@ public class LiveControlService {
     public Map<String, Object> rebalanceConfig() {
         return Map.of(
                 "ok", true,
-                "config", currentRebalanceConfig()
+                "config", currentRebalanceConfig(),
+                "profitSizingPolicy", Map.of(
+                        "lossAddTriggerRate", rebalanceLossAddTriggerRate(),
+                        "permanentReduceTargetQty", rebalancePermanentReduceTarget(
+                                currentRebalanceSettings().symbol()
+                        ),
+                        "permanentReduceCycleStartMillis", baseProperties.rawProperties()
+                                .getProperty(
+                                        "rebalance.permanent-profit-reduce-cycle-start-millis",
+                                        "0"
+                                )
+                )
         );
     }
 
@@ -1027,8 +1066,122 @@ public class LiveControlService {
                 new FileRebalanceStateStore(PathResolver.absolutePath(settings.stateFilePath())),
                 eventLogger,
                 alertService,
-                reason -> recordRebalanceCycleEnd(settings.symbol(), reason)
+                reason -> recordRebalanceCycleEnd(settings.symbol(), reason),
+                rebalanceGridOrderPlanner(settings)
         );
+    }
+
+    private GridOrderPlanner rebalanceGridOrderPlanner(RebalanceSettings settings) {
+        return new GridOrderPlanner(
+                new ClientOrderIdFactory("RBAL"),
+                new BigDecimal(baseProperties.rawProperties()
+                        .getProperty("grid.profitable-reduce-side-multiplier", "1.10")
+                        .trim()),
+                (market, ledger, orderPrice, orderQty) -> GridApplication.afterEstimatedOrderFee(
+                        rebalanceCycleMarketPnl(settings.symbol(), market, orderPrice),
+                        orderPrice,
+                        orderQty,
+                        profitSizingEstimatedFeeRate()
+                ).signum() > 0,
+                (market, ledger, orderPrice, orderQty) -> rebalanceCycleLossRateAfterEstimatedFee(
+                        settings.symbol(),
+                        market,
+                        orderPrice,
+                        orderQty
+                ).compareTo(rebalanceLossAddTriggerRate().negate()) < 0,
+                symbol -> fillStore.profitSizingState(rebalanceLedgerSymbol(symbol))
+                        .withPermanentReduceTarget(rebalancePermanentReduceTarget(settings.symbol()))
+        );
+    }
+
+    private BigDecimal rebalanceCycleMarketPnl(
+            String symbol,
+            com.btcgrid.common.model.MarketSnapshot marketSnapshot,
+            BigDecimal price
+    ) {
+        if (marketSnapshot == null) {
+            return BigDecimal.ZERO;
+        }
+        BigDecimal pnlPrice = price == null || price.signum() <= 0 ? marketSnapshot.markPrice() : price;
+        CurrentCycleSummary cycle = fillStore.currentCycle(
+                rebalanceLedgerSymbol(symbol),
+                Instant.now(),
+                pnlPrice
+        );
+        return cycle == null || cycle.markPricePnl() == null ? BigDecimal.ZERO : cycle.markPricePnl();
+    }
+
+    private BigDecimal rebalanceCycleLossRateAfterEstimatedFee(
+            String symbol,
+            com.btcgrid.common.model.MarketSnapshot marketSnapshot,
+            BigDecimal price,
+            BigDecimal orderQty
+    ) {
+        if (marketSnapshot == null) {
+            return BigDecimal.ZERO;
+        }
+        BigDecimal pnlPrice = price == null || price.signum() <= 0 ? marketSnapshot.markPrice() : price;
+        CurrentCycleSummary cycle = fillStore.currentCycle(
+                rebalanceLedgerSymbol(symbol),
+                Instant.now(),
+                pnlPrice
+        );
+        if (cycle == null || cycle.markPricePnl() == null
+                || cycle.cumulativeValue() == null || cycle.cumulativeValue().signum() == 0) {
+            return BigDecimal.ZERO;
+        }
+        BigDecimal pnlAfterFee = GridApplication.afterEstimatedOrderFee(
+                cycle.markPricePnl(),
+                pnlPrice,
+                orderQty,
+                profitSizingEstimatedFeeRate()
+        );
+        return pnlAfterFee.divide(cycle.cumulativeValue().abs(), 8, RoundingMode.HALF_UP);
+    }
+
+    private BigDecimal rebalanceLossAddTriggerRate() {
+        return new BigDecimal(baseProperties.rawProperties()
+                .getProperty("rebalance.loss-add-trigger-rate", "0.01")
+                .trim()).max(BigDecimal.ZERO);
+    }
+
+    private BigDecimal gridLossAddTriggerRate() {
+        return new BigDecimal(baseProperties.rawProperties()
+                .getProperty("grid.loss-add-trigger-rate", "0.01")
+                .trim()).max(BigDecimal.ZERO);
+    }
+
+    private BigDecimal rebalancePermanentReduceTarget(String symbol) {
+        BigDecimal target = new BigDecimal(baseProperties.rawProperties()
+                .getProperty("rebalance.permanent-profit-reduce-target-qty", "0")
+                .trim()).max(BigDecimal.ZERO);
+        if (target.signum() == 0) {
+            return BigDecimal.ZERO;
+        }
+        long configuredStartMillis;
+        try {
+            configuredStartMillis = Long.parseLong(baseProperties.rawProperties()
+                    .getProperty("rebalance.permanent-profit-reduce-cycle-start-millis", "0")
+                    .trim());
+        } catch (RuntimeException e) {
+            return BigDecimal.ZERO;
+        }
+        CurrentCycleSummary cycle = fillStore.currentCycle(
+                rebalanceLedgerSymbol(symbol),
+                Instant.now(),
+                BigDecimal.ZERO
+        );
+        if (cycle == null || cycle.startedAt() == null
+                || cycle.startedAt().toEpochMilli() != configuredStartMillis) {
+            return BigDecimal.ZERO;
+        }
+        return target;
+    }
+
+    private BigDecimal profitSizingEstimatedFeeRate() {
+        return new BigDecimal(baseProperties.rawProperties()
+                .getProperty("grid.profit-sizing-estimated-fee-rate", "0.0002")
+                .trim());
     }
 
     private List<RebalanceBand> parseRebalanceBands(String value) {
@@ -1082,6 +1235,24 @@ public class LiveControlService {
             properties.setProperty("rebalance.band-hysteresis-ratio", normalized.bandHysteresisRatio());
             properties.setProperty("rebalance.order-ttl-minutes", normalized.orderTtlMinutes());
             properties.setProperty("rebalance.confirmation-samples", normalized.confirmationSamples());
+            properties.setProperty(
+                    "rebalance.loss-add-trigger-rate",
+                    baseProperties.rawProperties().getProperty("rebalance.loss-add-trigger-rate", "0.01")
+            );
+            properties.setProperty(
+                    "rebalance.permanent-profit-reduce-target-qty",
+                    baseProperties.rawProperties().getProperty(
+                            "rebalance.permanent-profit-reduce-target-qty",
+                            "0"
+                    )
+            );
+            properties.setProperty(
+                    "rebalance.permanent-profit-reduce-cycle-start-millis",
+                    baseProperties.rawProperties().getProperty(
+                            "rebalance.permanent-profit-reduce-cycle-start-millis",
+                            "0"
+                    )
+            );
             Path path = PathResolver.absolutePath(baseProperties.rebalanceSettings().configFilePath());
             Files.createDirectories(path.getParent());
             try (java.io.OutputStream outputStream = Files.newOutputStream(path)) {
@@ -1168,9 +1339,34 @@ public class LiveControlService {
         RebalanceState persistedState = new FileRebalanceStateStore(PathResolver.absolutePath(settings.stateFilePath()))
                 .load()
                 .orElseGet(() -> RebalanceState.initial(settings.enabled(), settings.symbol()));
-        if (isActiveRebalanceCycleStatus(persistedState.status()) || !activeOpenOrders.isEmpty()) {
+        List<FillRecord> currentCycleFills = latestRebalanceCycleFills(settings.symbol());
+        boolean openCycleInLedger = !currentCycleFills.isEmpty()
+                && currentCycleFills.get(currentCycleFills.size() - 1).cumulativeQty() != null
+                && currentCycleFills.get(currentCycleFills.size() - 1).cumulativeQty().signum() != 0;
+        boolean recoveryExpected = isActiveRebalanceCycleStatus(persistedState.status())
+                || !activeOpenOrders.isEmpty()
+                || openCycleInLedger;
+        if (recoveryExpected && currentCycleFills.isEmpty()) {
+            eventLogger.error("rebalance.recovery.blocked", Map.of(
+                    "symbol", settings.symbol(),
+                    "persistedStatus", persistedState.status(),
+                    "openOrders", activeOpenOrders.size(),
+                    "reason", "active cycle evidence exists but no complete cycle fills were recovered"
+            ));
+            alertService.warning(
+                    "REBALANCE_RECOVERY_BLOCKED",
+                    "Rebalance recovery blocked to prevent a duplicate initial order",
+                    Map.of(
+                            "symbol", settings.symbol(),
+                            "persistedStatus", persistedState.status(),
+                            "openOrders", activeOpenOrders.size()
+                    )
+            );
+            return;
+        }
+        if (recoveryExpected) {
             rebalanceService.restoreActiveCycle(
-                    latestRebalanceCycleFills(settings.symbol()),
+                    currentCycleFills,
                     activeOpenOrders
             );
         }
@@ -1567,6 +1763,22 @@ public class LiveControlService {
         return fillStore.currentCycleFills(snapshot().symbol());
     }
 
+    public CurrentCycleFillPage fillsPage(int limit, int offset, String minPrice, String maxPrice) {
+        return fillStore.currentCycleFillsPage(
+                snapshot().symbol(),
+                normalizePageLimit(limit),
+                Math.max(0, offset),
+                parsePriceFilter(minPrice),
+                parsePriceFilter(maxPrice)
+        );
+    }
+
+    public List<FillRecord> fundingFees() {
+        return fillStore.currentCycleFills(snapshot().symbol()).stream()
+                .filter(fill -> fill != null && "FUNDING_FEE".equals(fill.side()))
+                .toList();
+    }
+
     public List<FillRecord> recentCycles() {
         return fillStore.recentCycles(200);
     }
@@ -1660,7 +1872,7 @@ public class LiveControlService {
         String fillMetadataJson = fillEvent.clientOrderId() != null
                 && fillEvent.clientOrderId().startsWith("INVENTORY_RECONCILE_")
                 ? inventoryReconciliationMetadataJson(currentCycleFills)
-                : profitReduceBoostMetadataJson(fillEvent, currentCycleFills, runtimeSnapshot);
+                : profitSizingMetadataJson(fillEvent, currentCycleFills, runtimeSnapshot);
         FillRecord record = new FillRecord(
                 fillEvent.fillTime(),
                 fillEvent.symbol(),
@@ -1683,7 +1895,7 @@ public class LiveControlService {
                 fillMetadataJson
         );
         fillStore.save(record);
-        if (isCycleEnd(runtimeSnapshot)) {
+        if (shouldRecordCycleEndAfterFill(ledgerSnapshot.netQty())) {
             fillStore.save(cycleEndRecord(fillEvent, ledgerSnapshot, totalPnlAtFill, cumulativeQty, cumulativeValue, cumulativeFee));
         }
     }
@@ -1750,7 +1962,9 @@ public class LiveControlService {
         }
         cumulativeFee = cumulativeFee.add(fee, MATH_CONTEXT);
         BigDecimal totalPnlAtFill = cumulativeProfit(cumulativeQty, cumulativeValue, cumulativeFee, fillEvent.fillPrice());
-        String configJson = previous == null ? rebalanceStartMetadataJson() : null;
+        String configJson = previous == null
+                ? rebalanceStartMetadataJson()
+                : rebalanceProfitSizingMetadataJson(fillEvent, currentCycleFills);
         fillStore.save(new FillRecord(
                 fillEvent.fillTime(),
                 ledgerSymbol,
@@ -2056,26 +2270,7 @@ public class LiveControlService {
     }
 
     private List<FillRecord> latestRebalanceCycleFills(String symbol) {
-        String ledgerSymbol = rebalanceLedgerSymbol(symbol);
-        List<FillRecord> recent = fillStore.recent(ledgerSymbol, 1000).stream()
-                .filter(fill -> !"CYCLE_END".equals(fill.side()))
-                .toList();
-        if (recent.isEmpty()) {
-            return List.of();
-        }
-        List<FillRecord> newestFirst = recent;
-        List<FillRecord> cycle = new ArrayList<>();
-        for (FillRecord fill : newestFirst) {
-            cycle.add(fill);
-            if (ClientOrderIds.isInitialPositionOrder(fill.clientOrderId())) {
-                break;
-            }
-        }
-        if (cycle.isEmpty() || !ClientOrderIds.isInitialPositionOrder(cycle.get(cycle.size() - 1).clientOrderId())) {
-            return List.of();
-        }
-        java.util.Collections.reverse(cycle);
-        return cycle;
+        return fillStore.currentCycleFills(rebalanceLedgerSymbol(symbol));
     }
 
     private static String rebalanceLedgerSymbol(String symbol) {
@@ -2101,6 +2296,32 @@ public class LiveControlService {
     private boolean isCycleEnd(RuntimeStatusSnapshot snapshot) {
         return snapshot.ledgerSnapshot().netQty().signum() == 0
                 && snapshot.runtimeState().state() == com.btcgrid.common.model.GridState.INIT;
+    }
+
+    static boolean shouldRecordCycleEndAfterFill(BigDecimal netQty) {
+        return netQty != null && netQty.signum() == 0;
+    }
+
+    private void finalizeFlatOpenCycleIfNeeded() {
+        RuntimeStatusSnapshot snapshot = fallbackStatusProvider.snapshot();
+        if (snapshot == null || !isCycleEnd(snapshot) || snapshot.symbol() == null || snapshot.symbol().isBlank()) {
+            return;
+        }
+        List<FillRecord> fills = fillStore.currentCycleFills(snapshot.symbol());
+        if (fills.isEmpty()) {
+            return;
+        }
+        FillRecord last = fills.get(fills.size() - 1);
+        if (last.cumulativeQty() == null || last.cumulativeQty().signum() != 0) {
+            return;
+        }
+        Instant repairedEndTime = last.time() == null ? Instant.now() : last.time().plusMillis(1);
+        recordSpotCycleEnd(snapshot.symbol(), "flat cycle end marker repaired at startup", repairedEndTime);
+        eventLogger.warn("cycle.end.repaired", Map.of(
+                "symbol", snapshot.symbol(),
+                "lastFillExecutionId", last.executionId() == null ? "" : last.executionId(),
+                "lastFillTime", last.time() == null ? "" : last.time().toString()
+        ));
     }
 
     private boolean canResume(RuntimeStatusSnapshot snapshot) {
@@ -2204,24 +2425,91 @@ public class LiveControlService {
         }
     }
 
-    private String profitReduceBoostMetadataJson(
+    private String profitSizingMetadataJson(
             FillEvent fillEvent,
             List<FillRecord> currentCycleFills,
             RuntimeStatusSnapshot runtimeSnapshot
     ) {
-        BigDecimal previousCumulative = latestProfitReduceBoostCumulative(currentCycleFills);
-        ProfitReduceBoost boost = profitReduceBoost(fillEvent, runtimeSnapshot);
-        BigDecimal extraQty = boost == null ? BigDecimal.ZERO : boost.extraFillQty(fillEvent.fillQty());
-        BigDecimal cumulative = previousCumulative.add(extraQty, MATH_CONTEXT);
-        if (extraQty.signum() <= 0 && cumulative.signum() <= 0) {
+        List<WorkingOrder> workingOrders = runtimeSnapshot == null
+                ? List.of()
+                : runtimeSnapshot.workingOrders();
+        return profitSizingMetadataJson(
+                fillEvent,
+                currentCycleFills,
+                orderSizingReason(fillEvent, workingOrders, "profit-reduce-boost"),
+                orderSizingReason(fillEvent, workingOrders, "loss-add-release")
+        );
+    }
+
+    private String rebalanceProfitSizingMetadataJson(
+            FillEvent fillEvent,
+            List<FillRecord> currentCycleFills
+    ) {
+        Collection<WorkingOrder> workingOrders = rebalanceWorkingOrderRegistry.snapshot();
+        return profitSizingMetadataJson(
+                fillEvent,
+                currentCycleFills,
+                orderSizingReason(fillEvent, workingOrders, "profit-reduce-boost"),
+                orderSizingReason(fillEvent, workingOrders, "loss-add-release")
+        );
+    }
+
+    private String profitSizingMetadataJson(
+            FillEvent fillEvent,
+            List<FillRecord> currentCycleFills,
+            SizingReason reduce,
+            SizingReason add
+    ) {
+        BigDecimal cumulativeReduce = metadataSum(currentCycleFills, "profitReduceBoostExtraQty");
+        BigDecimal cumulativeAdd = metadataSum(currentCycleFills, "lossAddBoostExtraQty");
+        BigDecimal cumulativePermanentReduce = metadataSum(
+                currentCycleFills,
+                "permanentProfitReduceExtraQty"
+        );
+        BigDecimal reduceCarry = latestMetadataDecimal(currentCycleFills, "profitReduceCarryQty");
+        BigDecimal addCarry = latestMetadataDecimal(currentCycleFills, "lossAddCarryQty");
+        BigDecimal extraReduceQty = reduce == null ? BigDecimal.ZERO : reduce.scaledApplied(fillEvent.fillQty());
+        BigDecimal extraAddQty = add == null ? BigDecimal.ZERO : add.scaledApplied(fillEvent.fillQty());
+        BigDecimal permanentReduceQty = reduce == null
+                ? BigDecimal.ZERO
+                : reduce.scaledPermanentApplied(fillEvent.fillQty());
+        if (reduce != null) {
+            reduceCarry = reduceCarry.add(reduce.scaledIntended(fillEvent.fillQty()), MATH_CONTEXT)
+                    .subtract(extraReduceQty, MATH_CONTEXT)
+                    .max(BigDecimal.ZERO);
+        }
+        if (add != null) {
+            addCarry = addCarry.add(add.scaledIntended(fillEvent.fillQty()), MATH_CONTEXT)
+                    .subtract(extraAddQty, MATH_CONTEXT)
+                    .max(BigDecimal.ZERO);
+        }
+        cumulativeReduce = cumulativeReduce.add(extraReduceQty, MATH_CONTEXT);
+        cumulativeAdd = cumulativeAdd.add(extraAddQty, MATH_CONTEXT);
+        cumulativePermanentReduce = cumulativePermanentReduce.add(permanentReduceQty, MATH_CONTEXT);
+        BigDecimal releaseReserve = cumulativeReduce
+                .subtract(cumulativePermanentReduce)
+                .subtract(cumulativeAdd)
+                .max(BigDecimal.ZERO);
+        addCarry = addCarry.min(releaseReserve);
+        if (reduce == null && add == null && cumulativeReduce.signum() <= 0
+                && reduceCarry.signum() <= 0 && addCarry.signum() <= 0) {
             return null;
         }
         Map<String, Object> meta = new LinkedHashMap<>();
-        meta.put("profitReduceBoostExtraQty", extraQty);
-        meta.put("cumulativeProfitReduceBoostQty", cumulative);
-        if (boost != null) {
-            meta.put("profitReduceBoostBaseQty", boost.baseQty());
-            meta.put("profitReduceBoostOrderQty", boost.boostedQty());
+        meta.put("profitReduceBoostExtraQty", extraReduceQty);
+        meta.put("cumulativeProfitReduceBoostQty", cumulativeReduce);
+        meta.put("permanentProfitReduceExtraQty", permanentReduceQty);
+        meta.put("cumulativePermanentProfitReduceQty", cumulativePermanentReduce);
+        meta.put("profitReduceCarryQty", reduceCarry);
+        meta.put("lossAddBoostExtraQty", extraAddQty);
+        meta.put("cumulativeLossAddBoostQty", cumulativeAdd);
+        meta.put("lossAddCarryQty", addCarry);
+        meta.put("profitReleaseReserveQty", releaseReserve);
+        if (reduce != null) {
+            putSizingMetadata(meta, "profitReduceBoost", reduce);
+        }
+        if (add != null) {
+            putSizingMetadata(meta, "lossAddBoost", add);
         }
         try {
             return OBJECT_MAPPER.writeValueAsString(meta);
@@ -2235,6 +2523,9 @@ public class LiveControlService {
         meta.put("inventoryReconciliation", true);
         meta.put("reason", "real wallet quantity differed from cycle ledger before manual flatten");
         meta.put("cumulativeProfitReduceBoostQty", latestProfitReduceBoostCumulative(currentCycleFills));
+        meta.put("cumulativeLossAddBoostQty", metadataSum(currentCycleFills, "lossAddBoostExtraQty"));
+        meta.put("profitReduceCarryQty", latestMetadataDecimal(currentCycleFills, "profitReduceCarryQty"));
+        meta.put("lossAddCarryQty", latestMetadataDecimal(currentCycleFills, "lossAddCarryQty"));
         try {
             return OBJECT_MAPPER.writeValueAsString(meta);
         } catch (JsonProcessingException e) {
@@ -2256,22 +2547,58 @@ public class LiveControlService {
         return BigDecimal.ZERO;
     }
 
-    private ProfitReduceBoost profitReduceBoost(FillEvent fillEvent, RuntimeStatusSnapshot runtimeSnapshot) {
-        if (fillEvent == null || runtimeSnapshot == null || runtimeSnapshot.workingOrders() == null) {
+    private BigDecimal metadataSum(List<FillRecord> fills, String key) {
+        if (fills == null || fills.isEmpty()) {
+            return BigDecimal.ZERO;
+        }
+        BigDecimal total = BigDecimal.ZERO;
+        for (FillRecord fill : fills) {
+            total = total.add(metadataDecimal(fill, key), MATH_CONTEXT);
+        }
+        return total;
+    }
+
+    private BigDecimal latestMetadataDecimal(List<FillRecord> fills, String key) {
+        if (fills == null || fills.isEmpty()) {
+            return BigDecimal.ZERO;
+        }
+        for (int i = fills.size() - 1; i >= 0; i--) {
+            Object value = metadataValue(fills.get(i), key);
+            BigDecimal decimal = value == null ? null : decimalOrNull(String.valueOf(value));
+            if (decimal != null) {
+                return decimal;
+            }
+        }
+        return BigDecimal.ZERO;
+    }
+
+    private void putSizingMetadata(Map<String, Object> meta, String prefix, SizingReason sizing) {
+        meta.put(prefix + "BaseQty", sizing.baseQty());
+        meta.put(prefix + "OrderQty", sizing.orderQty());
+        meta.put(prefix + "IntendedQty", sizing.intendedQty());
+        meta.put(prefix + "AppliedQty", sizing.appliedQty());
+    }
+
+    private SizingReason orderSizingReason(
+            FillEvent fillEvent,
+            Collection<WorkingOrder> workingOrders,
+            String tag
+    ) {
+        if (fillEvent == null) {
             return null;
         }
-        Optional<ProfitReduceBoost> currentOrderBoost = runtimeSnapshot.workingOrders().stream()
+        Optional<SizingReason> currentOrderSizing = (workingOrders == null ? List.<WorkingOrder>of() : workingOrders).stream()
                 .filter(order -> order != null && fillEvent.clientOrderId() != null
                         && fillEvent.clientOrderId().equals(order.clientOrderId()))
-                .map(order -> parseProfitReduceBoost(order.reason()))
+                .map(order -> parseSizingReason(order.reason(), tag))
                 .filter(Optional::isPresent)
                 .map(Optional::get)
                 .findFirst();
-        if (currentOrderBoost.isPresent()) {
-            return currentOrderBoost.get();
+        if (currentOrderSizing.isPresent()) {
+            return currentOrderSizing.get();
         }
         return commandPlaceReason(fillEvent.clientOrderId())
-                .flatMap(this::parseProfitReduceBoost)
+                .flatMap(reason -> parseSizingReason(reason, tag))
                 .orElse(null);
     }
 
@@ -2324,17 +2651,21 @@ public class LiveControlService {
         return Optional.of(reason);
     }
 
-    private Optional<ProfitReduceBoost> parseProfitReduceBoost(String reason) {
-        if (reason == null || !reason.contains("profit-reduce-boost:")) {
+    private Optional<SizingReason> parseSizingReason(String reason, String tag) {
+        String marker = tag + ":";
+        if (reason == null || !reason.contains(marker)) {
             return Optional.empty();
         }
-        String payload = reason.substring(reason.indexOf("profit-reduce-boost:") + "profit-reduce-boost:".length());
+        String payload = reason.substring(reason.indexOf(marker) + marker.length());
         int end = payload.indexOf('|');
         if (end >= 0) {
             payload = payload.substring(0, end);
         }
         BigDecimal baseQty = null;
-        BigDecimal boostedQty = null;
+        BigDecimal orderQty = null;
+        BigDecimal intendedQty = null;
+        BigDecimal appliedQty = null;
+        BigDecimal permanentAppliedQty = BigDecimal.ZERO;
         for (String token : payload.split(",")) {
             String[] parts = token.split("=", 2);
             if (parts.length != 2) {
@@ -2342,14 +2673,35 @@ public class LiveControlService {
             }
             if ("base".equals(parts[0])) {
                 baseQty = decimalOrNull(parts[1]);
-            } else if ("boosted".equals(parts[0])) {
-                boostedQty = decimalOrNull(parts[1]);
+            } else if ("order".equals(parts[0]) || "boosted".equals(parts[0])) {
+                orderQty = decimalOrNull(parts[1]);
+            } else if ("intended".equals(parts[0])) {
+                intendedQty = decimalOrNull(parts[1]);
+            } else if ("applied".equals(parts[0])) {
+                appliedQty = decimalOrNull(parts[1]);
+            } else if ("permanent".equals(parts[0])) {
+                permanentAppliedQty = decimalOrNull(parts[1]);
             }
         }
-        if (baseQty == null || boostedQty == null || boostedQty.compareTo(baseQty) <= 0) {
+        if (baseQty == null || orderQty == null || orderQty.compareTo(baseQty) < 0) {
             return Optional.empty();
         }
-        return Optional.of(new ProfitReduceBoost(baseQty, boostedQty));
+        if (appliedQty == null) {
+            appliedQty = orderQty.subtract(baseQty).max(BigDecimal.ZERO);
+        }
+        if (intendedQty == null) {
+            intendedQty = appliedQty;
+        }
+        if (permanentAppliedQty == null) {
+            permanentAppliedQty = BigDecimal.ZERO;
+        }
+        return Optional.of(new SizingReason(
+                baseQty,
+                orderQty,
+                intendedQty,
+                appliedQty,
+                permanentAppliedQty
+        ));
     }
 
     private BigDecimal metadataDecimal(FillRecord record, String key) {
@@ -2372,17 +2724,31 @@ public class LiveControlService {
         }
     }
 
-    private record ProfitReduceBoost(BigDecimal baseQty, BigDecimal boostedQty) {
-        private BigDecimal extraFillQty(BigDecimal fillQty) {
-            if (fillQty == null || fillQty.signum() <= 0 || boostedQty.signum() <= 0) {
+    private record SizingReason(
+            BigDecimal baseQty,
+            BigDecimal orderQty,
+            BigDecimal intendedQty,
+            BigDecimal appliedQty,
+            BigDecimal permanentAppliedQty
+    ) {
+        private BigDecimal scaledIntended(BigDecimal fillQty) {
+            return scaled(intendedQty, fillQty);
+        }
+
+        private BigDecimal scaledApplied(BigDecimal fillQty) {
+            return scaled(appliedQty, fillQty);
+        }
+
+        private BigDecimal scaledPermanentApplied(BigDecimal fillQty) {
+            return scaled(permanentAppliedQty, fillQty);
+        }
+
+        private BigDecimal scaled(BigDecimal value, BigDecimal fillQty) {
+            if (fillQty == null || fillQty.signum() <= 0 || orderQty.signum() <= 0 || value.signum() <= 0) {
                 return BigDecimal.ZERO;
             }
-            BigDecimal extraOrderQty = boostedQty.subtract(baseQty).max(BigDecimal.ZERO);
-            if (extraOrderQty.signum() <= 0) {
-                return BigDecimal.ZERO;
-            }
-            BigDecimal fillRatio = fillQty.divide(boostedQty, MathContext.DECIMAL64).min(BigDecimal.ONE);
-            return extraOrderQty.multiply(fillRatio, MathContext.DECIMAL64);
+            BigDecimal fillRatio = fillQty.divide(orderQty, MathContext.DECIMAL64).min(BigDecimal.ONE);
+            return value.multiply(fillRatio, MathContext.DECIMAL64);
         }
     }
 

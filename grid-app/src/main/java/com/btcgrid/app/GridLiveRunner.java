@@ -29,6 +29,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -66,6 +67,7 @@ public class GridLiveRunner implements AutoCloseable, PrivateExecutionListener, 
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
     private final AtomicReference<MarketSnapshot> latestSnapshot = new AtomicReference<>();
     private final Set<String> processedExecutionIds;
+    private final Map<String, Integer> missingOpenOrderObservations = new ConcurrentHashMap<>();
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean shutdown = new AtomicBoolean(false);
     private final AtomicBoolean privateStreamConnected = new AtomicBoolean(false);
@@ -784,6 +786,7 @@ public class GridLiveRunner implements AutoCloseable, PrivateExecutionListener, 
             Set<String> remoteOpenClientOrderIds = remoteOpenOrders.stream()
                     .map(WorkingOrder::clientOrderId)
                     .collect(Collectors.toSet());
+            remoteOpenClientOrderIds.forEach(missingOpenOrderObservations::remove);
             remoteOpenOrders.forEach(workingOrderRegistry::trackRemote);
 
             Instant visibilityCutoff = Instant.now().minus(OPEN_ORDER_VISIBILITY_GRACE);
@@ -811,6 +814,7 @@ public class GridLiveRunner implements AutoCloseable, PrivateExecutionListener, 
                 recoveredExecution = handleExecution(fillEvent, "rest-reconcile-missing-open") || recoveredExecution;
             }
             if (!clientOrderIdsWithExecutions.isEmpty()) {
+                clientOrderIdsWithExecutions.forEach(missingOpenOrderObservations::remove);
                 eventLogger.warn("open-orders.missing.execution-found", Map.of(
                         "symbol", properties.strategyConfig().symbol(),
                         "executionCount", missingOrderExecutions.size(),
@@ -823,20 +827,47 @@ public class GridLiveRunner implements AutoCloseable, PrivateExecutionListener, 
             if (missingWithoutExecutions.isEmpty()) {
                 return new OpenOrderReconciliation(false, true);
             }
+            Set<String> missingClientOrderIds = missingWithoutExecutions.stream()
+                    .map(WorkingOrder::clientOrderId)
+                    .collect(Collectors.toSet());
+            List<WorkingOrder> terminalOrders = orderQueryGateway.fetchRecentOrders(
+                            properties.strategyConfig().symbol(),
+                            missingClientOrderIds
+                    ).stream()
+                    .filter(order -> order.status() == OrderStatus.CANCELED || order.status() == OrderStatus.EXPIRED)
+                    .toList();
+            List<WorkingOrder> awaitingConfirmation = missingWithoutExecutions.stream()
+                    .filter(order -> terminalOrders.stream().noneMatch(terminal -> terminal.clientOrderId().equals(order.clientOrderId())))
+                    .toList();
+            if (!awaitingConfirmation.isEmpty()) {
+                awaitingConfirmation.forEach(order -> missingOpenOrderObservations.merge(order.clientOrderId(), 1, Integer::sum));
+                eventLogger.warn("open-orders.missing.pending", Map.of(
+                        "symbol", properties.strategyConfig().symbol(),
+                        "remoteOpenCount", remoteOpenOrders.size(),
+                        "clientOrderIds", awaitingConfirmation.stream().map(WorkingOrder::clientOrderId).toList(),
+                        "reason", "terminal-order-status-not-confirmed"
+                ));
+            }
+            if (terminalOrders.isEmpty()) {
+                return OpenOrderReconciliation.none();
+            }
             Instant now = Instant.now();
-            missingWithoutExecutions.forEach(order -> workingOrderRegistry.markCanceled(order.clientOrderId(), now));
+            terminalOrders.forEach(order -> {
+                workingOrderRegistry.markCanceled(order.clientOrderId(), now);
+                missingOpenOrderObservations.remove(order.clientOrderId());
+            });
             eventLogger.warn("open-orders.reconciled", Map.of(
                     "symbol", properties.strategyConfig().symbol(),
                     "remoteOpenCount", remoteOpenOrders.size(),
-                    "locallyCanceledCount", missingWithoutExecutions.size(),
-                    "clientOrderIds", missingWithoutExecutions.stream()
+                    "locallyCanceledCount", terminalOrders.size(),
+                    "clientOrderIds", terminalOrders.stream()
                             .map(WorkingOrder::clientOrderId)
                             .toList()
             ));
             alertService.warning("OPEN_ORDERS_RECONCILED", "Local open orders were missing remotely and marked canceled", Map.of(
                     "symbol", properties.strategyConfig().symbol(),
                     "remoteOpenCount", remoteOpenOrders.size(),
-                    "locallyCanceledCount", missingWithoutExecutions.size()
+                    "locallyCanceledCount", terminalOrders.size()
             ));
             return new OpenOrderReconciliation(true, recoveredExecution);
         } catch (RuntimeException e) {
@@ -888,8 +919,10 @@ public class GridLiveRunner implements AutoCloseable, PrivateExecutionListener, 
             scheduleReconnect();
         }
         workingOrderRegistry.markFilled(fillEvent.clientOrderId(), fillEvent.fillTime() == null ? Instant.now() : fillEvent.fillTime());
-        commandExecutor.execute(strategyEngine.onFill(fillEvent, snapshot), strategyLedger.snapshot());
-        fillObserver.accept(fillEvent);
+        commandExecutor.execute(
+                strategyEngine.onFill(fillEvent, snapshot, () -> fillObserver.accept(fillEvent)),
+                strategyLedger.snapshot()
+        );
         persistState();
         runtimeStatusPublisher.publish();
         if (stopAfterCycle.get()
@@ -964,12 +997,21 @@ public class GridLiveRunner implements AutoCloseable, PrivateExecutionListener, 
     public void onSubscribed() {
         privateStreamConnected.set(true);
         privateStreamSubscribed.set(true);
+        cancelPendingReconnect();
         lastPrivateStreamMessageAt.set(Instant.now());
         synchronized (privateStreamConnectionMonitor) {
             privateStreamConnectionMonitor.notifyAll();
         }
         reconnectAttempts.set(0);
         eventLogger.info("private-stream.subscribed", Map.of("symbol", properties.strategyConfig().symbol()));
+    }
+
+    private void cancelPendingReconnect() {
+        ScheduledFuture<?> pending = reconnectFuture;
+        if (pending != null) {
+            pending.cancel(false);
+            reconnectFuture = null;
+        }
     }
 
     @Override
@@ -1012,16 +1054,23 @@ public class GridLiveRunner implements AutoCloseable, PrivateExecutionListener, 
             return;
         }
         int attempt = reconnectAttempts.incrementAndGet();
-        if (attempt > properties.runtimeSettings().reconnectMaxAttempts()) {
+        int maxFastAttempts = properties.runtimeSettings().reconnectMaxAttempts();
+        boolean slowRetry = attempt > maxFastAttempts;
+        if (attempt == maxFastAttempts + 1) {
             alertService.critical(
                     "PRIVATE_STREAM_RECONNECT_EXHAUSTED",
-                    "Private stream reconnect attempts exhausted",
+                    "Private stream fast reconnect attempts exhausted; continuing with slow retries",
                     Map.of("attempts", attempt)
             );
-            return;
         }
-        long delay = (long) properties.runtimeSettings().reconnectBaseDelaySeconds() * Math.min(attempt, 6);
-        eventLogger.warn("private-stream.reconnect.scheduled", Map.of("attempt", attempt, "delaySeconds", delay));
+        long delay = slowRetry
+                ? 300L
+                : (long) properties.runtimeSettings().reconnectBaseDelaySeconds() * Math.min(attempt, 6);
+        eventLogger.warn("private-stream.reconnect.scheduled", Map.of(
+                "attempt", attempt,
+                "delaySeconds", delay,
+                "mode", slowRetry ? "slow" : "fast"
+        ));
         reconnectFuture = scheduler.schedule(() -> {
             try {
                 privateStreamGateway.close();

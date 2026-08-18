@@ -1,22 +1,29 @@
 package com.btcgrid.app;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.btcgrid.common.model.OrderStatus;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpHandler;
 import com.sun.net.httpserver.HttpServer;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
+import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 import java.util.Base64;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.function.Supplier;
+import java.util.zip.GZIPOutputStream;
 
 public class HttpStatusServer implements AutoCloseable {
 
@@ -27,6 +34,9 @@ public class HttpStatusServer implements AutoCloseable {
     private final EventLogger eventLogger;
     private final String httpUsername;
     private final String httpPassword;
+    private final String httpRealm;
+    private final String ssoSecret;
+    private final String sessionToken = UUID.randomUUID().toString();
     private final String gridUiUrl;
     private final String rebalanceUiUrl;
     private final ObjectMapper objectMapper = new ObjectMapper().registerModule(new JavaTimeModule());
@@ -51,7 +61,8 @@ public class HttpStatusServer implements AutoCloseable {
                 System.getenv("GRID_HTTP_USERNAME"),
                 System.getenv("GRID_HTTP_PASSWORD"),
                 System.getenv("GRID_MANUAL_UI_URL"),
-                System.getenv("GRID_REBALANCE_UI_URL")
+                System.getenv("GRID_REBALANCE_UI_URL"),
+                System.getenv("QUANT_HOME_SSO_KEY_B64")
         );
     }
 
@@ -65,6 +76,32 @@ public class HttpStatusServer implements AutoCloseable {
             String httpPassword,
             String gridUiUrl,
             String rebalanceUiUrl
+    ) {
+        this(
+                host,
+                port,
+                runtimeStatusSupplier,
+                liveControlService,
+                eventLogger,
+                httpUsername,
+                httpPassword,
+                gridUiUrl,
+                rebalanceUiUrl,
+                ""
+        );
+    }
+
+    HttpStatusServer(
+            String host,
+            int port,
+            Supplier<RuntimeStatusSnapshot> runtimeStatusSupplier,
+            LiveControlService liveControlService,
+            EventLogger eventLogger,
+            String httpUsername,
+            String httpPassword,
+            String gridUiUrl,
+            String rebalanceUiUrl,
+            String ssoSecret
     ) {
         try {
             this.httpServer = HttpServer.create(new InetSocketAddress(host, port), 0);
@@ -82,6 +119,8 @@ public class HttpStatusServer implements AutoCloseable {
         this.eventLogger = eventLogger;
         this.httpUsername = normalized(httpUsername);
         this.httpPassword = normalized(httpPassword);
+        this.httpRealm = "BTC Grid " + httpServer.getAddress().getPort();
+        this.ssoSecret = normalized(ssoSecret);
         this.gridUiUrl = normalized(gridUiUrl);
         this.rebalanceUiUrl = normalized(rebalanceUiUrl);
         if (this.httpUsername.isBlank() != this.httpPassword.isBlank()) {
@@ -109,6 +148,7 @@ public class HttpStatusServer implements AutoCloseable {
     }
 
     private void registerContexts() {
+        httpServer.createContext("/login", this::handleLogin);
         createProtectedContext("/", this::writeIndex);
         createProtectedContext("/status", exchange -> writeJson(exchange, runtimeStatusSupplier.get()));
         createProtectedContext("/ledger", exchange -> writeJson(exchange, runtimeStatusSupplier.get().ledgerSnapshot()));
@@ -136,7 +176,13 @@ public class HttpStatusServer implements AutoCloseable {
                     queryInt(exchange, "offset", 0),
                     queryParam(exchange, "price")
             )));
-            createProtectedContext("/api/rebalance-funding-fees", exchange -> writeJson(exchange, liveControlService.rebalanceFundingFees()));
+            createProtectedContext("/api/rebalance-funding-fees", exchange -> writeJson(
+                    exchange,
+                    liveControlService.rebalanceFundingFeesPage(
+                            queryInt(exchange, "limit", 50),
+                            queryInt(exchange, "offset", 0)
+                    )
+            ));
             createProtectedContext("/api/rebalance-cycles", exchange -> writeJson(exchange, liveControlService.rebalanceCyclesPage(
                     queryInt(exchange, "limit", 50),
                     queryInt(exchange, "offset", 0)
@@ -156,6 +202,13 @@ public class HttpStatusServer implements AutoCloseable {
                     exchange,
                     tail(liveControlService.recentFills(), queryInt(exchange, "limit", 200))
             ));
+            createProtectedContext("/api/fills-page", exchange -> writeJson(exchange, liveControlService.fillsPage(
+                    queryInt(exchange, "limit", 50),
+                    queryInt(exchange, "offset", 0),
+                    queryParam(exchange, "minPrice"),
+                    queryParam(exchange, "maxPrice")
+            )));
+            createProtectedContext("/api/funding-fees", exchange -> writeJson(exchange, liveControlService.fundingFees()));
             createProtectedContext("/api/cycles", exchange -> writeJson(exchange, liveControlService.recentCycles()));
             createProtectedContext("/api/current-cycle", exchange -> writeJson(exchange, liveControlService.currentCycle()));
             createProtectedContext("/api/cycle-fills", exchange -> writeJson(exchange, liveControlService.cycleFillsPage(
@@ -231,6 +284,12 @@ public class HttpStatusServer implements AutoCloseable {
         if (httpUsername.isBlank()) {
             return true;
         }
+        if (handleSsoHandoff(exchange)) {
+            return false;
+        }
+        if (hasSessionCookie(exchange)) {
+            return true;
+        }
         String authorization = exchange.getRequestHeaders().getFirst("Authorization");
         if (authorization != null && authorization.regionMatches(true, 0, "Basic ", 0, 6)) {
             try {
@@ -248,14 +307,201 @@ public class HttpStatusServer implements AutoCloseable {
                 // Invalid Base64 is handled as an authentication failure.
             }
         }
+        if (isBrowserPage(exchange)) {
+            redirect(exchange, "/login?next=" + java.net.URLEncoder.encode(
+                    exchange.getRequestURI().getPath(),
+                    StandardCharsets.UTF_8
+            ));
+            return false;
+        }
         byte[] body = "Authentication required".getBytes(StandardCharsets.UTF_8);
-        exchange.getResponseHeaders().set("WWW-Authenticate", "Basic realm=\"BTC Grid\", charset=\"UTF-8\"");
+        exchange.getResponseHeaders().set("WWW-Authenticate", "Basic realm=\"" + httpRealm + "\", charset=\"UTF-8\"");
         exchange.getResponseHeaders().set("Cache-Control", "no-store");
         exchange.sendResponseHeaders(401, body.length);
         try (OutputStream outputStream = exchange.getResponseBody()) {
             outputStream.write(body);
         }
         return false;
+    }
+
+    private boolean handleSsoHandoff(HttpExchange exchange) throws IOException {
+        String path = exchange.getRequestURI().getPath();
+        String audience = switch (path) {
+            case "/grid" -> "grid-direct";
+            case "/rebalance" -> "rebalance-direct";
+            default -> "";
+        };
+        if (ssoSecret.isBlank()
+                || !"GET".equalsIgnoreCase(exchange.getRequestMethod())
+                || audience.isBlank()) {
+            return false;
+        }
+        String token = queryParam(exchange, "token");
+        if (!verifySsoHandoff(token, ssoSecret, System.currentTimeMillis() / 1000L, audience)) {
+            return false;
+        }
+        exchange.getResponseHeaders().add(
+                "Set-Cookie",
+                "btc_grid_session=" + sessionToken + "; Path=/; HttpOnly; SameSite=Lax"
+        );
+        exchange.getResponseHeaders().set("Cache-Control", "no-store");
+        redirect(exchange, path);
+        return true;
+    }
+
+    static boolean verifySsoHandoff(String token, String secretBase64, long nowEpochSeconds) {
+        return verifySsoHandoff(token, secretBase64, nowEpochSeconds, "grid-direct");
+    }
+
+    static boolean verifySsoHandoff(
+            String token,
+            String secretBase64,
+            long nowEpochSeconds,
+            String expectedAudience
+    ) {
+        if (token == null || token.isBlank() || secretBase64 == null || secretBase64.isBlank()) {
+            return false;
+        }
+        String[] parts = token.split("\\.", -1);
+        if (parts.length != 3) {
+            return false;
+        }
+        try {
+            byte[] secret = Base64.getDecoder().decode(secretBase64);
+            if (secret.length < 32) {
+                return false;
+            }
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(secret, "HmacSHA256"));
+            byte[] expected = mac.doFinal((parts[0] + "." + parts[1]).getBytes(StandardCharsets.US_ASCII));
+            byte[] supplied = Base64.getUrlDecoder().decode(parts[2]);
+            if (!MessageDigest.isEqual(expected, supplied)) {
+                return false;
+            }
+            ObjectMapper mapper = new ObjectMapper();
+            JsonNode header = mapper.readTree(Base64.getUrlDecoder().decode(parts[0]));
+            JsonNode claims = mapper.readTree(Base64.getUrlDecoder().decode(parts[1]));
+            long issuedAt = claims.path("iat").asLong(0L);
+            long expiresAt = claims.path("exp").asLong(0L);
+            return "HS256".equals(header.path("alg").asText())
+                    && "QH-HANDOFF".equals(header.path("typ").asText())
+                    && "quant-home".equals(claims.path("iss").asText())
+                    && expectedAudience.equals(claims.path("aud").asText())
+                    && !claims.path("sub").asText().isBlank()
+                    && issuedAt <= nowEpochSeconds + 30L
+                    && expiresAt >= nowEpochSeconds
+                    && expiresAt - issuedAt <= 60L;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
+    private boolean hasSessionCookie(HttpExchange exchange) {
+        String cookie = exchange.getRequestHeaders().getFirst("Cookie");
+        if (cookie == null || cookie.isBlank()) {
+            return false;
+        }
+        for (String part : cookie.split(";")) {
+            String[] pair = part.trim().split("=", 2);
+            if (pair.length == 2
+                    && "btc_grid_session".equals(pair[0])
+                    && constantTimeEquals(sessionToken, pair[1])) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isBrowserPage(HttpExchange exchange) {
+        String path = exchange.getRequestURI().getPath();
+        return "GET".equalsIgnoreCase(exchange.getRequestMethod())
+                && ("/".equals(path) || "/grid".equals(path) || "/rebalance".equals(path));
+    }
+
+    private void handleLogin(HttpExchange exchange) throws IOException {
+        if (httpUsername.isBlank()) {
+            redirect(exchange, safeLoginTarget(queryParam(exchange, "next")));
+            return;
+        }
+        String next = safeLoginTarget(queryParam(exchange, "next"));
+        boolean invalid = false;
+        if ("POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+            Map<String, String> form = parseForm(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            next = safeLoginTarget(form.get("next"));
+            if (constantTimeEquals(httpUsername, form.getOrDefault("username", ""))
+                    && constantTimeEquals(httpPassword, form.getOrDefault("password", ""))) {
+                exchange.getResponseHeaders().add(
+                        "Set-Cookie",
+                        "btc_grid_session=" + sessionToken + "; Path=/; HttpOnly; SameSite=Strict"
+                );
+                redirect(exchange, next);
+                return;
+            }
+            invalid = true;
+        } else if (!"GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+            exchange.sendResponseHeaders(405, -1);
+            exchange.close();
+            return;
+        }
+        String message = invalid ? "<p class=\"error\">用户名或密码错误</p>" : "";
+        String html = """
+                <!doctype html>
+                <html lang="zh-CN">
+                <head>
+                  <meta charset="utf-8">
+                  <meta name="viewport" content="width=device-width,initial-scale=1">
+                  <title>BTC Grid 登录</title>
+                  <style>
+                    body{font-family:system-ui,sans-serif;background:#f6f3ec;margin:0;display:grid;place-items:center;min-height:100vh;color:#222}
+                    form{width:min(380px,calc(100vw - 40px));background:#fffaf0;border:1px solid #dfd3bd;border-radius:12px;padding:28px;display:grid;gap:16px}
+                    label{display:grid;gap:6px} input{font:inherit;padding:10px;border:1px solid #cdbf9f;border-radius:6px}
+                    button{font:inherit;padding:11px;border:0;border-radius:6px;background:#176b4d;color:white;font-weight:700}
+                    .error{color:#b3261e;margin:0}
+                  </style>
+                </head>
+                <body>
+                  <form method="post" action="/login">
+                    <h1>BTC Grid 登录</h1>
+                    %s
+                    <input type="hidden" name="next" value="%s">
+                    <label>用户名<input name="username" autocomplete="username" required autofocus></label>
+                    <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
+                    <button type="submit">登录</button>
+                  </form>
+                </body>
+                </html>
+                """.formatted(message, escapeHtml(next));
+        byte[] bytes = html.getBytes(StandardCharsets.UTF_8);
+        if (invalid) {
+            exchange.getResponseHeaders().set("Content-Type", "text/html; charset=utf-8");
+            exchange.getResponseHeaders().set("Cache-Control", "no-store");
+            exchange.sendResponseHeaders(401, bytes.length);
+            try (OutputStream outputStream = exchange.getResponseBody()) {
+                outputStream.write(bytes);
+            }
+            return;
+        }
+        writeResponse(exchange, "text/html; charset=utf-8", bytes);
+    }
+
+    private Map<String, String> parseForm(String body) {
+        Map<String, String> values = new java.util.LinkedHashMap<>();
+        for (String part : body.split("&")) {
+            String[] pair = part.split("=", 2);
+            String key = URLDecoder.decode(pair[0], StandardCharsets.UTF_8);
+            String value = pair.length == 2 ? URLDecoder.decode(pair[1], StandardCharsets.UTF_8) : "";
+            values.put(key, value);
+        }
+        return values;
+    }
+
+    private String safeLoginTarget(String target) {
+        return "/rebalance".equals(target) ? "/rebalance" : "/grid";
+    }
+
+    private String escapeHtml(String value) {
+        return value.replace("&", "&amp;").replace("\"", "&quot;")
+                .replace("<", "&lt;").replace(">", "&gt;");
     }
 
     private boolean constantTimeEquals(String expected, String actual) {
@@ -291,12 +537,7 @@ public class HttpStatusServer implements AutoCloseable {
             return;
         }
         String html = "/grid".equals(path) || "/rebalance".equals(path) ? indexHtml() : landingHtml();
-        byte[] bytes = html.getBytes(StandardCharsets.UTF_8);
-        exchange.getResponseHeaders().add("Content-Type", "text/html; charset=utf-8");
-        exchange.sendResponseHeaders(200, bytes.length);
-        try (OutputStream outputStream = exchange.getResponseBody()) {
-            outputStream.write(bytes);
-        }
+        writeResponse(exchange, "text/html; charset=utf-8", html.getBytes(StandardCharsets.UTF_8));
     }
 
     private void redirect(HttpExchange exchange, String location) throws IOException {
@@ -375,11 +616,44 @@ public class HttpStatusServer implements AutoCloseable {
 
     private void writeJson(HttpExchange exchange, Object body) throws IOException {
         byte[] bytes = objectMapper.writeValueAsString(body).getBytes(StandardCharsets.UTF_8);
-        exchange.getResponseHeaders().add("Content-Type", "application/json; charset=utf-8");
-        exchange.sendResponseHeaders(200, bytes.length);
-        try (OutputStream outputStream = exchange.getResponseBody()) {
-            outputStream.write(bytes);
+        writeResponse(exchange, "application/json; charset=utf-8", bytes);
+    }
+
+    private void writeResponse(HttpExchange exchange, String contentType, byte[] bytes) throws IOException {
+        byte[] responseBytes = bytes;
+        exchange.getResponseHeaders().set("Content-Type", contentType);
+        exchange.getResponseHeaders().set("Vary", "Accept-Encoding");
+        if (acceptsGzip(exchange)) {
+            responseBytes = gzip(bytes);
+            exchange.getResponseHeaders().set("Content-Encoding", "gzip");
         }
+        exchange.sendResponseHeaders(200, responseBytes.length);
+        try (OutputStream outputStream = exchange.getResponseBody()) {
+            outputStream.write(responseBytes);
+        }
+    }
+
+    private boolean acceptsGzip(HttpExchange exchange) {
+        String acceptEncoding = exchange.getRequestHeaders().getFirst("Accept-Encoding");
+        if (acceptEncoding == null || acceptEncoding.isBlank()) {
+            return false;
+        }
+        for (String encoding : acceptEncoding.split(",")) {
+            String[] parts = encoding.trim().split(";", 2);
+            if (!"gzip".equalsIgnoreCase(parts[0].trim())) {
+                continue;
+            }
+            return parts.length < 2 || !parts[1].replace(" ", "").equalsIgnoreCase("q=0");
+        }
+        return false;
+    }
+
+    private byte[] gzip(byte[] bytes) throws IOException {
+        ByteArrayOutputStream compressed = new ByteArrayOutputStream();
+        try (GZIPOutputStream gzip = new GZIPOutputStream(compressed)) {
+            gzip.write(bytes);
+        }
+        return compressed.toByteArray();
     }
 
     private String indexHtml() {
@@ -399,6 +673,9 @@ public class HttpStatusServer implements AutoCloseable {
                     .metric { background: #ffffff; border: 1px solid #dfd3bd; border-radius: 8px; padding: 10px 12px; }
                     .metric span { display: block; color: #726650; font-size: 12px; }
                     .metric strong { display: block; margin-top: 4px; font-size: 18px; }
+                    .cycle-price-summary { display: grid; gap: 4px; }
+                    .cycle-price-summary > span { color: inherit; font-size: inherit; }
+                    .cycle-price-summary .price-label { display: inline; color: #726650; font-size: 12px; font-weight: 600; }
                     .badge { display: inline-flex; align-items: center; min-height: 28px; padding: 0 10px; border-radius: 999px; font-size: 13px; font-weight: 800; }
                     .badge-running { background: #d7f0e4; color: #0f5c3f; }
                     .badge-idle { background: #eee6d4; color: #6f5a30; }
@@ -518,39 +795,50 @@ public class HttpStatusServer implements AutoCloseable {
                       <div class="metric"><span>开单方向</span><strong id="rebalanceCycleDirection">-</strong></div>
                       <div class="metric"><span>启动比例</span><strong id="rebalanceCycleStartRatio">-</strong></div>
                       <div class="metric"><span>当前比例</span><strong id="rebalanceCycleCurrentRatio">-</strong></div>
-                      <div class="metric"><span>启动价格</span><strong id="rebalanceCycleStartPrice">-</strong></div>
-                      <div class="metric"><span>当前价格</span><strong id="rebalanceCycleMarketPrice">-</strong></div>
-                      <div class="metric"><span>当前价相对启动价</span><strong id="rebalanceCycleStartPriceChange">-</strong></div>
+                      <div class="metric"><span>启动 / 当前 / 成本价格</span><strong id="rebalanceCyclePriceSummary" class="cycle-price-summary">-</strong></div>
                       <div class="metric"><span>当前总资产（BTC）</span><strong id="rebalanceCycleTotalEquityBtc">-</strong></div>
-                      <div class="metric"><span>成本价格</span><strong id="rebalanceCycleCostPrice">-</strong></div>
-                      <div class="metric"><span>成本价相对当前价</span><strong id="rebalanceCycleCostPriceChange">-</strong></div>
-                      <div class="metric"><span>单边下跌至 100% BTC 比例（理论）</span><strong id="rebalanceCycleFullInventoryPrice">-</strong></div>
+                      <div class="metric"><span>单边下跌至 100% BTC 比例（情景推演）</span><strong id="rebalanceCycleFullInventoryPrice">-</strong></div>
                       <div class="metric"><span>买入 / 卖出次数</span><strong id="rebalanceCycleCounts">-</strong></div>
                       <div class="metric"><span>买入 / 卖出数量</span><strong id="rebalanceCycleQty">-</strong></div>
                       <div class="metric"><span>持续时长</span><strong id="rebalanceCycleDuration">-</strong></div>
                       <div class="metric"><span>累计净数量</span><strong id="rebalanceCycleCumQty">-</strong></div>
+                      <div class="metric"><span>固定 0.005 网格理论 / 实际净增</span><strong id="rebalanceCyclePlannedQty">-</strong></div>
+                      <div class="metric"><span>实际偏离理论</span><strong id="rebalanceCycleQtyDeviation">-</strong></div>
                       <div class="metric"><span>累计交易手续费</span><strong id="rebalanceCycleTradingFee">-</strong></div>
                       <div class="metric"><span>累计资金费</span><strong id="rebalanceCycleFundingFee">-</strong></div>
                       <div class="metric"><span>累计净费用</span><strong id="rebalanceCycleFee">-</strong></div>
+                      <div class="metric"><span>额外减仓</span><strong id="rebalanceCycleExtraReduce">-</strong></div>
+                      <div class="metric"><span>其中永久减仓（不加回）</span><strong id="rebalanceCyclePermanentReduce">-</strong></div>
+                      <div class="metric"><span>平均额外减仓价格</span><strong id="rebalanceCycleExtraReduceAvg">-</strong></div>
+                      <div class="metric"><span>额外加仓</span><strong id="rebalanceCycleExtraAdd">-</strong></div>
+                      <div class="metric"><span>平均额外加仓价格</span><strong id="rebalanceCycleExtraAddAvg">-</strong></div>
+                      <div class="metric"><span>待释放额外减仓</span><strong id="rebalanceCycleReleaseReserve">-</strong></div>
+                      <div class="metric"><span>净额外减仓 / 50%上限</span><strong id="rebalanceCycleReduceCap">-</strong></div>
+                      <div class="metric"><span>减仓待累计</span><strong id="rebalanceCycleReduceCarry">-</strong></div>
+                      <div class="metric"><span>加仓待累计</span><strong id="rebalanceCycleAddCarry">-</strong></div>
                     </div>
-                    <h3>再平衡资金费记录</h3>
-                    <div class="table-wrap">
-                      <table>
-                        <thead><tr><th>时间</th><th>标的</th><th>资金费</th><th>币种</th><th>价格</th><th>累计资金费</th><th>累计净费用</th><th>市场价盈亏</th><th>执行ID</th></tr></thead>
-                        <tbody id="rebalanceFundingFees"><tr><td colspan="9" class="muted">当前 Cycle 暂无资金费记录</td></tr></tbody>
-                      </table>
-                    </div>
+                    <details id="rebalanceFundingFeesDetails" ontoggle="toggleRebalanceFundingFees()">
+                      <summary><strong>再平衡资金费记录</strong>（点击显示）</summary>
+                      <div id="rebalanceFundingFeesPager" class="pager"></div>
+                      <div class="table-wrap">
+                        <table>
+                          <thead><tr><th>时间</th><th>标的</th><th>资金费</th><th>币种</th><th>价格</th><th>累计资金费</th><th>累计净费用</th><th>市场价盈亏</th><th>执行ID</th></tr></thead>
+                          <tbody id="rebalanceFundingFees"><tr><td colspan="9" class="muted">展开后读取资金费记录</td></tr></tbody>
+                        </table>
+                      </div>
+                    </details>
                     <h3>再平衡成交记录</h3>
+                    <small id="rebalancePnlFormula">盈亏 = 累计净数量 * 市场价 - 累计净价值 - 累计交易手续费 + 累计资金费。</small>
                     <div class="pager">
-                      <label>成交价格 <input id="rebalanceFillPrice" style="width:140px" inputmode="decimal" placeholder="输入一个价格" onkeydown="if(event.key==='Enter')applyRebalanceFillPriceFilter()"></label>
+                      <label>成交价格（按十位） <input id="rebalanceFillPrice" style="width:140px" inputmode="decimal" placeholder="如 63943 查 63940-63950" onkeydown="if(event.key==='Enter')applyRebalanceFillPriceFilter()"></label>
                       <button class="compact" onclick="applyRebalanceFillPriceFilter()">查询</button>
                       <button class="compact" onclick="clearRebalanceFillPriceFilter()">清空</button>
                     </div>
                     <div id="rebalanceFillsPager" class="pager"></div>
                     <div class="table-wrap">
                       <table>
-                        <thead><tr><th>时间</th><th>标的</th><th>方向</th><th>数量</th><th>价格</th><th>较上笔</th><th>成交额</th><th>手续费/资金费</th><th>市场价盈亏</th><th>累计净数量</th><th>累计成交额</th><th>累计净费用</th><th>成本价</th><th>订单ID</th></tr></thead>
-                        <tbody id="rebalanceFills"><tr><td colspan="14" class="muted">暂无再平衡成交</td></tr></tbody>
+                        <thead><tr><th>时间</th><th>标的</th><th>方向</th><th>数量</th><th>加减仓标记</th><th>价格</th><th>较上笔</th><th>成交额</th><th>手续费/资金费</th><th>市场价盈亏</th><th>累计净数量</th><th>累计成交额</th><th>累计净费用</th><th>成本价</th><th>订单ID</th></tr></thead>
+                        <tbody id="rebalanceFills"><tr><td colspan="15" class="muted">暂无再平衡成交</td></tr></tbody>
                       </table>
                     </div>
                     <h3>再平衡 Cycle 历史</h3>
@@ -564,8 +852,8 @@ public class HttpStatusServer implements AutoCloseable {
                     <h3>再平衡 Cycle 明细</h3>
                     <div class="table-wrap">
                       <table>
-                        <thead><tr><th>时间</th><th>标的</th><th>方向</th><th>数量</th><th>价格</th><th>较上笔</th><th>成交额</th><th>手续费/资金费</th><th>市场价盈亏</th><th>累计净数量</th><th>累计成交额</th><th>累计净费用</th><th>成本价</th><th>订单ID</th></tr></thead>
-                        <tbody id="rebalanceCycleDetail"><tr><td colspan="14" class="muted">请选择一个再平衡 Cycle</td></tr></tbody>
+                        <thead><tr><th>时间</th><th>标的</th><th>方向</th><th>数量</th><th>加减仓标记</th><th>价格</th><th>较上笔</th><th>成交额</th><th>手续费/资金费</th><th>市场价盈亏</th><th>累计净数量</th><th>累计成交额</th><th>累计净费用</th><th>成本价</th><th>订单ID</th></tr></thead>
+                        <tbody id="rebalanceCycleDetail"><tr><td colspan="15" class="muted">请选择一个再平衡 Cycle</td></tr></tbody>
                       </table>
                     </div>
                     </div>
@@ -582,8 +870,7 @@ public class HttpStatusServer implements AutoCloseable {
                     <div class="summary">
                       <div class="metric"><span>市场价盈亏</span><strong id="cycleMarkPricePnl">-</strong></div>
                       <div class="metric"><span>开单方向</span><strong id="cycleEntryDirection">-</strong></div>
-                      <div class="metric"><span>启动价格</span><strong id="cycleStartPrice">-</strong></div>
-                      <div class="metric"><span>当前价格</span><strong id="cycleMarketPrice">-</strong></div>
+                      <div class="metric"><span>启动 / 当前 / 成本价格</span><strong id="cyclePriceSummary" class="cycle-price-summary">-</strong></div>
                       <div class="metric"><span>买入 / 卖出次数</span><strong id="cycleCounts">-</strong></div>
                       <div class="metric"><span>买入 / 卖出数量</span><strong id="cycleQty">-</strong></div>
                       <div class="metric"><span>持续时长</span><strong id="cycleDuration">-</strong></div>
@@ -594,23 +881,29 @@ public class HttpStatusServer implements AutoCloseable {
                       <div class="metric"><span>累计净费用</span><strong id="cycleFee">-</strong></div>
                       <div class="metric"><span>盈利减仓</span><strong id="cPRQ">-</strong></div>
                       <div class="metric"><span>额外减仓</span><strong id="cPBE">-</strong></div>
+                      <div class="metric"><span>平均额外减仓价格</span><strong id="cPBEAvg">-</strong></div>
+                      <div class="metric"><span>额外加仓</span><strong id="cLABE">-</strong></div>
+                      <div class="metric"><span>平均额外加仓价格</span><strong id="cLABEAvg">-</strong></div>
+                      <div class="metric"><span>待释放额外减仓</span><strong id="cPRR">-</strong></div>
+                      <div class="metric"><span>净额外减仓 / 50%上限</span><strong id="cPRCap">-</strong></div>
+                      <div class="metric"><span>减仓待累计</span><strong id="cPRCarry">-</strong></div>
+                      <div class="metric"><span>加仓待累计</span><strong id="cLACarry">-</strong></div>
                     </div>
                     <h3>成交记录</h3>
                     <small id="pnlFormula">盈亏 = cumQty * 市场价 - cumValue - 净费用。</small>
                     <div class="pager">
-                      <label>最低价 <input id="fillPriceMin" style="width:100px" placeholder="如 69.8"></label>
-                      <label>最高价 <input id="fillPriceMax" style="width:100px" placeholder="如 70.2"></label>
+                      <label>成交价格（忽略小数点后第二位） <input id="fillPrice" style="width:160px" inputmode="decimal" placeholder="如 69.87 查 69.8-69.9" onkeydown="if(event.key==='Enter')applyFillPriceFilter()"></label>
                       <button class="compact" onclick="applyFillPriceFilter()">查询</button>
                       <button class="compact" onclick="clearFillPriceFilter()">清空</button>
                     </div>
                     <div class="pager">
-                      <button class="compact" onclick="previousFillsPage()">上一页</button>
+                      <button id="fillsPrev" class="compact" onclick="previousFillsPage()">上一页</button>
                       <span id="fillsPager">-</span>
-                      <button class="compact" onclick="nextFillsPage()">下一页</button>
+                      <button id="fillsNext" class="compact" onclick="nextFillsPage()">下一页</button>
                     </div>
                     <div class="table-wrap">
                       <table>
-                        <thead><tr><th>时间</th><th>标的</th><th>方向</th><th>数量</th><th>减仓标记</th><th>价格</th><th>较上笔</th><th>成交额</th><th>手续费/资金费</th><th>市场价盈亏</th><th>累计净数量</th><th>累计成交额</th><th>累计净费用</th><th>成本价</th><th>仓位均价</th><th>订单ID</th></tr></thead>
+                        <thead><tr><th>时间</th><th>标的</th><th>方向</th><th>数量</th><th>加减仓标记</th><th>价格</th><th>较上笔</th><th>成交额</th><th>手续费/资金费</th><th>市场价盈亏</th><th>累计净数量</th><th>累计成交额</th><th>累计净费用</th><th>成本价</th><th>仓位均价</th><th>订单ID</th></tr></thead>
                         <tbody id="fills"><tr><td colspan="16">暂无成交</td></tr></tbody>
                       </table>
                     </div>
@@ -626,7 +919,7 @@ public class HttpStatusServer implements AutoCloseable {
                     <div id="cycleDetailPager" class="pager"></div>
                     <div class="table-wrap">
                       <table>
-                        <thead><tr><th>时间</th><th>标的</th><th>方向</th><th>数量</th><th>减仓标记</th><th>价格</th><th>成交额</th><th>手续费/资金费</th><th>市场价盈亏</th><th>累计净数量</th><th>累计成交额</th><th>累计净费用</th><th>成本价</th><th>仓位均价</th><th>订单ID</th></tr></thead>
+                        <thead><tr><th>时间</th><th>标的</th><th>方向</th><th>数量</th><th>加减仓标记</th><th>价格</th><th>成交额</th><th>手续费/资金费</th><th>市场价盈亏</th><th>累计净数量</th><th>累计成交额</th><th>累计净费用</th><th>成本价</th><th>仓位均价</th><th>订单ID</th></tr></thead>
                         <tbody id="cycleDetail"><tr><td colspan="15">请选择一个历史 Cycle</td></tr></tbody>
                       </table>
                     </div>
@@ -710,18 +1003,26 @@ public class HttpStatusServer implements AutoCloseable {
                       confirmationSamples:'资产确认次数'
                     };
                     const fillsPageSize = 50;
-                    let fillsPage = 0;
+                    let fillsOffset = 0;
+                    let fillsPrice = '';
+                    let fillsRequestId = 0;
+                    let latestFillsPage = null;
+                    const gridFillsPageCache = new Map();
+                    const gridFillsCacheLimit = 10;
                     const rebalancePageSize = 50;
                     let rebalanceFillsOffset = 0;
                     let rebalanceFillPrice = '';
                     let rebalanceFillsRequestId = 0;
+                    const rebalanceFillsPageCache = new Map();
+                    const rebalanceFillsCacheLimit = 10;
+                    let rebalanceFundingFeesOffset = 0;
+                    let rebalanceFundingFeesRequestId = 0;
                     let rebalanceCyclesOffset = 0;
                     const cycleDetailPageSize = 50;
                     let cycleDetailOffset = 0;
                     let cycleDetailExecutionId = '';
                     let cycleDetailLabel = '';
                     let cycleDetailRequestId = 0;
-                    let latestFills = [];
                     let rebalanceDirty = false;
                     let savedRebalanceMode = 'price_target';
                     let latestRebalanceConfig = null;
@@ -914,6 +1215,15 @@ public class HttpStatusServer implements AutoCloseable {
                       refresh();
                     });
                     document.addEventListener('click', event => {
+                      const button = event.target.closest('[data-action="rebalance-funding-fees-page"]');
+                      if (!button) return;
+                      rebalanceFundingFeesOffset = Math.max(
+                        0,
+                        rebalanceFundingFeesOffset + Number(button.dataset.delta || 0) * rebalancePageSize
+                      );
+                      loadRebalanceFundingFeesPage();
+                    });
+                    document.addEventListener('click', event => {
                       const button = event.target.closest('[data-action="funding-detail"]');
                       if (!button) return;
                       renderFundingDetail();
@@ -970,15 +1280,15 @@ public class HttpStatusServer implements AutoCloseable {
                       }
                     }
                     async function refreshRebalance() {
-                      const rebalanceFillsPromise = loadRebalanceFillsPage();
-                      const [control, rebalanceConfig, rebalanceState, rebalanceOrders, rebalanceFundingFees, rebalanceCycles, rebalanceCurrentCycle] = await Promise.all([
+                      const rebalanceFillsPromise = loadRebalanceFillsPage(true);
+                      const [control, rebalanceConfig, rebalanceState, rebalanceOrders, rebalanceCycles, rebalanceCurrentCycle, rebalanceRecentFills] = await Promise.all([
                         fetch('/api/control').then(r=>r.json()),
                         fetch('/api/rebalance-config').then(r=>r.json()),
                         fetch('/api/rebalance-state').then(r=>r.json()),
                         fetch('/api/rebalance-orders').then(r=>r.json()),
-                        fetch('/api/rebalance-funding-fees').then(r=>r.json()),
                         fetch(`/api/rebalance-cycles?limit=${rebalancePageSize}&offset=${rebalanceCyclesOffset}`).then(r=>r.json()),
-                        fetch('/api/rebalance-current-cycle').then(r=>r.json())
+                        fetch('/api/rebalance-current-cycle').then(r=>r.json()),
+                        fetch('/api/rebalance-fills?limit=20&offset=0').then(r=>r.json())
                       ]);
                       const rebalanceCycleItems = rebalanceCycles && rebalanceCycles.items ? rebalanceCycles.items : [];
                       if (rebalanceConfig && rebalanceConfig.config) applyRebalanceConfig(rebalanceConfig.config);
@@ -988,27 +1298,123 @@ public class HttpStatusServer implements AutoCloseable {
                       renderRebalanceCurrentCycle(
                         rebalanceCurrentCycle,
                         rebalanceState && rebalanceState.state ? rebalanceState.state : null,
-                        activeRebalanceOrders
+                        activeRebalanceOrders,
+                        rebalanceRecentFills && rebalanceRecentFills.items ? rebalanceRecentFills.items : []
                       );
-                      renderRebalanceFundingFees(rebalanceFundingFees || []);
                       renderRebalanceCycles(rebalanceCycleItems);
                       renderRebalancePager('rebalanceCyclesPager', rebalanceCycles, rebalanceCyclesOffset, 'rebalance-cycles-page');
+                      const fundingDetails = document.getElementById('rebalanceFundingFeesDetails');
+                      if (fundingDetails && fundingDetails.open) loadRebalanceFundingFeesPage();
                       await rebalanceFillsPromise;
                     }
-                    async function loadRebalanceFillsPage() {
+                    function rebalanceFillsCacheKey(offset, price) {
+                      return `${price || '*'}|${offset}`;
+                    }
+                    function cacheRebalanceFillsPage(key, page) {
+                      const knownPage = rebalanceFillsPageCache.values().next().value;
+                      if (knownPage && Number(knownPage.total) !== Number(page && page.total)) {
+                        rebalanceFillsPageCache.clear();
+                      }
+                      rebalanceFillsPageCache.delete(key);
+                      rebalanceFillsPageCache.set(key, page);
+                      while (rebalanceFillsPageCache.size > rebalanceFillsCacheLimit) {
+                        rebalanceFillsPageCache.delete(rebalanceFillsPageCache.keys().next().value);
+                      }
+                    }
+                    async function fetchRebalanceFillsPage(offset, price) {
+                      return fetch(`/api/rebalance-fills?limit=${rebalancePageSize}&offset=${offset}${price ? '&price=' + encodeURIComponent(price) : ''}`)
+                        .then(r => r.json());
+                    }
+                    function renderRebalanceFillsPage(page, offset) {
+                      const fills = page && page.items ? page.items.map(item => item.fill || item) : [];
+                      renderSimpleFills('rebalanceFills', fills, true);
+                      renderRebalancePager('rebalanceFillsPager', page, offset, 'rebalance-fills-page');
+                    }
+                    function prefetchNextRebalanceFillsPage(page, offset, price) {
+                      if (!page || !page.hasMore) return;
+                      const nextOffset = offset + rebalancePageSize;
+                      const nextKey = rebalanceFillsCacheKey(nextOffset, price);
+                      if (rebalanceFillsPageCache.has(nextKey)) return;
+                      fetchRebalanceFillsPage(nextOffset, price)
+                        .then(nextPage => cacheRebalanceFillsPage(nextKey, nextPage))
+                        .catch(() => {});
+                    }
+                    async function loadRebalanceFillsPage(force = false) {
                       const requestId = ++rebalanceFillsRequestId;
                       const offset = rebalanceFillsOffset;
                       const price = rebalanceFillPrice;
-                      const page = await fetch(`/api/rebalance-fills?limit=${rebalancePageSize}&offset=${offset}${price ? '&price=' + encodeURIComponent(price) : ''}`).then(r=>r.json());
-                      if (requestId !== rebalanceFillsRequestId || offset !== rebalanceFillsOffset || price !== rebalanceFillPrice) return;
-                      renderSimpleFills('rebalanceFills', page && page.items ? page.items : [], true);
-                      renderRebalancePager('rebalanceFillsPager', page, offset, 'rebalance-fills-page');
+                      const key = rebalanceFillsCacheKey(offset, price);
+                      if (!force && rebalanceFillsPageCache.has(key)) {
+                        const cachedPage = rebalanceFillsPageCache.get(key);
+                        renderRebalanceFillsPage(cachedPage, offset);
+                        prefetchNextRebalanceFillsPage(cachedPage, offset, price);
+                        return cachedPage;
+                      }
+                      if (!rebalanceFillsPageCache.has(key)) {
+                        setText('rebalanceFillsPager', '读取成交记录...');
+                      }
+                      const page = await fetchRebalanceFillsPage(offset, price);
+                      cacheRebalanceFillsPage(key, page);
+                      if (requestId !== rebalanceFillsRequestId || offset !== rebalanceFillsOffset || price !== rebalanceFillPrice) return page;
+                      renderRebalanceFillsPage(page, offset);
+                      prefetchNextRebalanceFillsPage(page, offset, price);
+                      return page;
+                    }
+                    function gridFillsCacheKey(offset, price) {
+                      return `${price || '*'}|${offset}`;
+                    }
+                    function cacheGridFillsPage(key, page) {
+                      const knownPage = gridFillsPageCache.values().next().value;
+                      if (knownPage && Number(knownPage.total) !== Number(page && page.total)) {
+                        gridFillsPageCache.clear();
+                      }
+                      gridFillsPageCache.delete(key);
+                      gridFillsPageCache.set(key, page);
+                      while (gridFillsPageCache.size > gridFillsCacheLimit) {
+                        gridFillsPageCache.delete(gridFillsPageCache.keys().next().value);
+                      }
+                    }
+                    async function fetchGridFillsPage(offset, price) {
+                      const query = new URLSearchParams({limit: fillsPageSize, offset});
+                      if (price) {
+                        query.set('minPrice', price);
+                        query.set('maxPrice', (Number(price) + 0.09999999).toFixed(8));
+                      }
+                      return fetch(`/api/fills-page?${query}`).then(r => r.json());
+                    }
+                    function prefetchNextGridFillsPage(page, offset, price) {
+                      if (!page || !page.hasMore) return;
+                      const nextOffset = offset + fillsPageSize;
+                      const nextKey = gridFillsCacheKey(nextOffset, price);
+                      if (gridFillsPageCache.has(nextKey)) return;
+                      fetchGridFillsPage(nextOffset, price)
+                        .then(nextPage => cacheGridFillsPage(nextKey, nextPage))
+                        .catch(() => {});
+                    }
+                    async function loadGridFillsPage(force = false) {
+                      const requestId = ++fillsRequestId;
+                      const offset = fillsOffset;
+                      const price = fillsPrice;
+                      const key = gridFillsCacheKey(offset, price);
+                      if (!force && gridFillsPageCache.has(key)) {
+                        const cachedPage = gridFillsPageCache.get(key);
+                        renderFills(cachedPage);
+                        prefetchNextGridFillsPage(cachedPage, offset, price);
+                        return;
+                      }
+                      if (!gridFillsPageCache.has(key)) {
+                        setText('fillsPager', '读取成交记录...');
+                      }
+                      const page = await fetchGridFillsPage(offset, price);
+                      cacheGridFillsPage(key, page);
+                      if (requestId !== fillsRequestId || offset !== fillsOffset || price !== fillsPrice) return;
+                      renderFills(page);
+                      prefetchNextGridFillsPage(page, offset, price);
                     }
                     async function refreshGrid() {
-                      const [control, status, fills, cycles, currentCycle, solBollMonitor] = await Promise.all([
+                      const [control, status, cycles, currentCycle, solBollMonitor] = await Promise.all([
                         fetch('/api/control').then(r=>r.json()),
                         fetch('/api/active-status').then(r=>r.json()),
-                        fetch('/api/recent-fills?limit=200').then(r=>r.json()),
                         fetch('/api/cycles').then(r=>r.json()),
                         fetch('/api/current-cycle').then(r=>r.json()),
                         fetch('/api/sol-contract-boll-monitor').then(r=>r.json())
@@ -1018,8 +1424,8 @@ public class HttpStatusServer implements AutoCloseable {
                       renderSolBollMonitor(solBollMonitor);
                       renderOrders(activeOrders, status);
                       renderCurrentCycle(currentCycle);
-                      renderFills(fills);
                       renderCycles(cycles);
+                      await loadGridFillsPage(true);
                     }
                     function renderRebalanceState(state, control) {
                       if (!state) {
@@ -1067,18 +1473,15 @@ public class HttpStatusServer implements AutoCloseable {
                         </tr>
                       `).join('');
                     }
-                    function renderRebalanceCurrentCycle(cycle, state, activeOrders) {
+                """).concat("""
+                    function renderRebalanceCurrentCycle(cycle, state, activeOrders, recentFillItems) {
                       if (!cycle || !cycle.startedAt) {
                         setText('rebalanceCyclePnl', '-');
                         setText('rebalanceCycleDirection', '-');
                         setText('rebalanceCycleStartRatio', '-');
                         setText('rebalanceCycleCurrentRatio', '-');
-                        setText('rebalanceCycleStartPrice', '-');
-                        setText('rebalanceCycleMarketPrice', '-');
-                        setText('rebalanceCycleStartPriceChange', '-');
+                        setText('rebalanceCyclePriceSummary', '-');
                         setText('rebalanceCycleTotalEquityBtc', '-');
-                        setText('rebalanceCycleCostPrice', '-');
-                        setText('rebalanceCycleCostPriceChange', '-');
                         setText('rebalanceCycleFullInventoryPrice', '-');
                         setText('rebalanceCycleCounts', '-');
                         setText('rebalanceCycleQty', '-');
@@ -1087,57 +1490,99 @@ public class HttpStatusServer implements AutoCloseable {
                         setText('rebalanceCycleTradingFee', '-');
                         setText('rebalanceCycleFundingFee', '-');
                         setText('rebalanceCycleFee', '-');
+                        setText('rebalanceCycleExtraReduce', '-');
+                        setText('rebalanceCyclePermanentReduce', '-');
+                        setText('rebalanceCyclePlannedQty', '-');
+                        setText('rebalanceCycleQtyDeviation', '-');
+                        setText('rebalanceCycleExtraReduceAvg', '-');
+                        setText('rebalanceCycleExtraAdd', '-');
+                        setText('rebalanceCycleExtraAddAvg', '-');
+                        setText('rebalanceCycleReleaseReserve', '-');
+                        setText('rebalanceCycleReduceCap', '-');
+                        setText('rebalanceCycleReduceCarry', '-');
+                        setText('rebalanceCycleAddCarry', '-');
+                        setText('rebalancePnlFormula', '盈亏 = 累计净数量 * 市场价 - 累计净价值 - 累计交易手续费 + 累计资金费。');
                         return;
                       }
                       setHtml('rebalanceCyclePnl', formatPnl(cycle.markPricePnl));
                       setText('rebalanceCycleDirection', formatEntryDirection(cycle.entryDirection));
                       setText('rebalanceCycleStartRatio', formatPercent(cycle.startRatio));
                       setText('rebalanceCycleCurrentRatio', formatPercent(state && state.currentRatio));
-                      setText('rebalanceCycleStartPrice', formatNumber(cycle.startPrice));
-                      setText('rebalanceCycleMarketPrice', formatNumber(cycle.marketPrice));
+                      setHtml('rebalanceCyclePriceSummary', formatCyclePriceSummary(cycle));
                       const equityUsdt = Number(state && state.totalEquityUsdt);
                       const btcPrice = Number(cycle.marketPrice || (state && state.lastPrice));
-                      const startPrice = Number(cycle.startPrice);
-                      const cycleCostPrice = costPrice(cycle);
                       const netBtcQty = Number(state && state.netBaseQty);
-                      setText('rebalanceCycleStartPriceChange', Number.isFinite(btcPrice) && Number.isFinite(startPrice) && startPrice > 0
-                        ? formatPercent(btcPrice / startPrice - 1)
-                        : '-');
                       setText('rebalanceCycleTotalEquityBtc', Number.isFinite(equityUsdt) && Number.isFinite(btcPrice) && btcPrice > 0
                         ? formatNumber(equityUsdt / btcPrice)
                         : '-');
-                      setText('rebalanceCycleCostPrice', formatNumber(cycleCostPrice));
-                      setText('rebalanceCycleCostPriceChange', Number.isFinite(cycleCostPrice) && Number.isFinite(btcPrice) && btcPrice > 0
-                        ? formatPercent(cycleCostPrice / btcPrice - 1)
-                        : '-');
                       const fullInventoryEstimate = Number.isFinite(equityUsdt) && Number.isFinite(netBtcQty) && netBtcQty > 0
-                        ? estimateFullInventoryPrice(state, btcPrice, cycle, activeOrders)
+                        ? estimateFullInventoryPrice(state, btcPrice, cycle, activeOrders, recentFillItems)
                         : null;
                       setText('rebalanceCycleFullInventoryPrice', formatFullInventoryEstimate(fullInventoryEstimate));
                       setText('rebalanceCycleCounts', `${cycle.buyCount || 0} / ${cycle.sellCount || 0}，共 ${cycle.fillCount || 0}`);
                       setText('rebalanceCycleQty', `${formatNumber(cycle.buyQty)} / ${formatNumber(cycle.sellQty)}`);
                       setText('rebalanceCycleDuration', formatDuration(cycle.durationSeconds));
                       setText('rebalanceCycleCumQty', formatNumber(cycle.cumulativeQty));
+                      const plannedCycleQty = estimatePlannedCycleQty(cycle);
+                      const actualCycleQty = Number(cycle.cumulativeQty);
+                      const cycleQtyDeviation = Number.isFinite(plannedCycleQty) && Number.isFinite(actualCycleQty)
+                        ? actualCycleQty - plannedCycleQty
+                        : NaN;
+                      setText(
+                        'rebalanceCyclePlannedQty',
+                        Number.isFinite(plannedCycleQty)
+                          ? `${formatNumber(plannedCycleQty)} / ${formatNumber(actualCycleQty)} BTC`
+                          : '-'
+                      );
+                      setText(
+                        'rebalanceCycleQtyDeviation',
+                        Number.isFinite(cycleQtyDeviation)
+                          ? `${cycleQtyDeviation >= 0 ? '+' : ''}${formatNumber(cycleQtyDeviation)} BTC`
+                          : '-'
+                      );
                       setText('rebalanceCycleTradingFee', formatNumber(cycle.cumulativeTradingFee));
                       setText('rebalanceCycleFundingFee', formatNumber(cycle.cumulativeFundingFee));
                       setText('rebalanceCycleFee', formatNumber(cycle.cumulativeFee));
+                      setText('rebalanceCycleExtraReduce', formatNumber(cycle.profitReduceBoostExtraQty));
+                      setText('rebalanceCyclePermanentReduce', formatNumber(cycle.permanentProfitReduceQty));
+                      setText('rebalanceCycleExtraReduceAvg', formatNumber(cycle.profitReduceBoostAveragePrice));
+                      setText('rebalanceCycleExtraAdd', formatNumber(cycle.lossAddBoostExtraQty));
+                      setText('rebalanceCycleExtraAddAvg', formatNumber(cycle.lossAddBoostAveragePrice));
+                      setText('rebalanceCycleReleaseReserve', formatNumber(cycle.profitReleaseReserveQty));
+                      const extraReduceReserve = Number(cycle.profitReleaseReserveQty || 0);
+                      const extraReduceCap = Math.abs(Number(cycle.cumulativeQty || 0)) * 0.5;
+                      setText(
+                        'rebalanceCycleReduceCap',
+                        extraReduceCap > 0
+                          ? `${formatNumber(extraReduceReserve)} / ${formatNumber(extraReduceCap)} (${formatPercent(extraReduceReserve / extraReduceCap)})`
+                          : '-'
+                      );
+                      setText('rebalanceCycleReduceCarry', formatNumber(cycle.profitReduceCarryQty));
+                      setText('rebalanceCycleAddCarry', formatNumber(cycle.lossAddCarryQty));
+                      setText(
+                        'rebalancePnlFormula',
+                        `${cycle.symbol || '当前再平衡 Cycle'} 盈亏 = ${pnlFormulaText(cycle, cycle.marketPrice, cycle.markPricePnl)}`
+                      );
                     }
                     function renderSimpleFills(tbodyId, fills, newestFirst = false) {
                       const tbody = document.getElementById(tbodyId);
                       if (!tbody) return;
                       if (!fills || fills.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="14" class="muted">暂无记录</td></tr>';
+                        tbody.innerHTML = '<tr><td colspan="15" class="muted">暂无记录</td></tr>';
                         return;
                       }
                       const priceDiffs = priceDiffMap(fills);
                       const cumulativeTurnover = cumulativeTurnoverMap(fills);
                       const rows = newestFirst ? fills : [...fills].reverse();
-                      tbody.innerHTML = rows.slice(0, 200).map(f => `
-                        <tr>
+                      tbody.innerHTML = rows.slice(0, 200).map(f => {
+                        const boost = fillSizingBoost(f);
+                        return `
+                        <tr class="${boost ? 'boost-fill-row' : ''}">
                           <td>${formatTime(f.time)}</td>
                           <td>${esc(displaySymbol(f.symbol))}</td>
                           <td>${formatSide(f.side)}</td>
                           <td>${esc(formatNumber(f.qty))}</td>
+                          <td>${sizingBoostBadge(boost)}</td>
                           <td>${esc(formatNumber(f.price))}</td>
                           <td>${formatPriceDiff(priceDiffs.get(fillKey(f)))}</td>
                           <td>${esc(formatNumber(f.value))}</td>
@@ -1149,34 +1594,60 @@ public class HttpStatusServer implements AutoCloseable {
                           <td>${esc(formatNumber(costPrice(f)))}</td>
                           <td>${esc(f.clientOrderId)}</td>
                         </tr>
-                      `).join('');
+                      `;
+                      }).join('');
                     }
-                    function renderRebalanceFundingFees(rows) {
+                    function toggleRebalanceFundingFees() {
+                      const details = document.getElementById('rebalanceFundingFeesDetails');
+                      if (!details || !details.open) return;
+                      rebalanceFundingFeesOffset = 0;
+                      loadRebalanceFundingFeesPage();
+                    }
+                    async function loadRebalanceFundingFeesPage() {
+                      const details = document.getElementById('rebalanceFundingFeesDetails');
+                      if (!details || !details.open) return;
+                      const requestId = ++rebalanceFundingFeesRequestId;
+                      setText('rebalanceFundingFeesPager', '读取资金费记录...');
+                      try {
+                        const page = await fetch(
+                          `/api/rebalance-funding-fees?limit=${rebalancePageSize}&offset=${rebalanceFundingFeesOffset}`
+                        ).then(r => r.json());
+                        if (requestId !== rebalanceFundingFeesRequestId) return;
+                        renderRebalanceFundingFees(page && page.items ? page.items : []);
+                        renderRebalancePager(
+                          'rebalanceFundingFeesPager',
+                          page,
+                          rebalanceFundingFeesOffset,
+                          'rebalance-funding-fees-page'
+                        );
+                      } catch (error) {
+                        if (requestId !== rebalanceFundingFeesRequestId) return;
+                        setText('rebalanceFundingFeesPager', `读取失败：${error && error.message ? error.message : error}`);
+                      }
+                    }
+                    function renderRebalanceFundingFees(items) {
                       const tbody = document.getElementById('rebalanceFundingFees');
                       if (!tbody) return;
-                      if (!rows || rows.length === 0) {
+                      if (!items || items.length === 0) {
                         tbody.innerHTML = '<tr><td colspan="9" class="muted">当前 Cycle 暂无资金费记录</td></tr>';
                         return;
                       }
-                      const cumulativeFunding = new Map();
-                      let sum = 0;
-                      [...rows].reverse().forEach(row => {
-                        sum += Number(row.fee || 0);
-                        cumulativeFunding.set(fillKey(row), sum);
-                      });
-                      tbody.innerHTML = rows.map(row => `
+                      tbody.innerHTML = items.map(item => {
+                        const row = item && item.fill ? item.fill : item;
+                        return `
                         <tr>
                           <td>${formatTime(row.time)}</td>
                           <td>${esc(displaySymbol(row.symbol))}</td>
                           <td>${esc(formatNumber(row.fee))}</td>
                           <td>${esc(row.feeCurrency || '')}</td>
                           <td>${esc(formatNumber(row.price))}</td>
-                          <td>${esc(formatNumber(cumulativeFunding.get(fillKey(row))))}</td>
+                          <td>${esc(formatNumber(item && item.cumulativeFundingFee))}</td>
                           <td>${esc(formatNumber(row.cumulativeFee))}</td>
                           <td>${formatPnl(row.totalPnlAtFill)}</td>
                           <td>${esc(row.executionId || '')}</td>
                         </tr>
-                      `).join('');
+                      `;
+                      }).join('');
                     }
                     function renderRebalanceCycles(cycles) {
                       const tbody = document.getElementById('rebalanceCycles');
@@ -1214,10 +1685,15 @@ public class HttpStatusServer implements AutoCloseable {
                       const end = offset + count;
                       const hasPrev = offset > 0;
                       const hasNext = Boolean(page && page.hasMore);
-                      const filterText = action === 'rebalance-fills-page' && rebalanceFillPrice ? `，价格 ${esc(rebalanceFillPrice)}` : '';
+                      const total = Number(page && page.total);
+                      const totalText = Number.isFinite(total) ? ` / 共 ${total} 条` : '';
+                      const bucketStart = Number(rebalanceFillPrice);
+                      const filterText = action === 'rebalance-fills-page' && Number.isFinite(bucketStart)
+                        ? `，价格 ${esc(formatNumber(bucketStart))}–${esc(formatNumber(bucketStart + 10))}（不含上限）`
+                        : '';
                       el.innerHTML = `
                         <button class="compact" data-action="${action}" data-delta="-1" ${hasPrev ? '' : 'disabled'}>上一页</button>
-                        <span class="muted">第 ${Math.floor(offset / limit) + 1} 页，${start}-${end}${filterText}</span>
+                        <span class="muted">第 ${Math.floor(offset / limit) + 1} 页，${start}-${end}${totalText}${filterText}</span>
                         <button class="compact" data-action="${action}" data-delta="1" ${hasNext ? '' : 'disabled'}>下一页</button>
                       `;
                     }
@@ -1225,8 +1701,10 @@ public class HttpStatusServer implements AutoCloseable {
                       const input = document.getElementById('rebalanceFillPrice');
                       const value = input ? input.value.trim() : '';
                       if (value && !Number.isFinite(Number(value))) return;
-                      rebalanceFillPrice = value;
+                      rebalanceFillPrice = value ? String(Math.floor(Number(value) / 10) * 10) : '';
+                      if (input) input.value = rebalanceFillPrice;
                       rebalanceFillsOffset = 0;
+                      rebalanceFillsPageCache.clear();
                       loadRebalanceFillsPage();
                     }
                     function clearRebalanceFillPriceFilter() {
@@ -1234,6 +1712,7 @@ public class HttpStatusServer implements AutoCloseable {
                       if (input) input.value = '';
                       rebalanceFillPrice = '';
                       rebalanceFillsOffset = 0;
+                      rebalanceFillsPageCache.clear();
                       loadRebalanceFillsPage();
                     }
                     function renderSummary(control, status, activeOrders) {
@@ -1372,8 +1851,7 @@ public class HttpStatusServer implements AutoCloseable {
                       if (!cycle || !cycle.startedAt) {
                         setText('cycleMarkPricePnl', '-');
                         setText('cycleEntryDirection', '-');
-                        setText('cycleStartPrice', '-');
-                        setText('cycleMarketPrice', '-');
+                        setText('cyclePriceSummary', '-');
                         setText('cycleCounts', '-');
                         setText('cycleQty', '-');
                         setText('cycleDuration', '-');
@@ -1384,13 +1862,19 @@ public class HttpStatusServer implements AutoCloseable {
                         setText('cycleFundingFee', '-');
                         setText('cPRQ', '-');
                         setText('cPBE', '-');
+                        setText('cPBEAvg', '-');
+                        setText('cLABE', '-');
+                        setText('cLABEAvg', '-');
+                        setText('cPRR', '-');
+                        setText('cPRCap', '-');
+                        setText('cPRCarry', '-');
+                        setText('cLACarry', '-');
                         setText('pnlFormula', '盈亏 = cumQty * 市场价 - cumValue - 净费用。');
                         return;
                       }
                       setHtml('cycleMarkPricePnl', formatPnl(cycle.markPricePnl));
                       setText('cycleEntryDirection', formatEntryDirection(cycle.entryDirection));
-                      setText('cycleStartPrice', formatNumber(cycle.startPrice));
-                      setHtml('cycleMarketPrice', formatCycleMarketPrice(cycle));
+                      setHtml('cyclePriceSummary', formatCyclePriceSummary(cycle));
                       setText('cycleCounts', `${cycle.buyCount || 0} / ${cycle.sellCount || 0}，共 ${cycle.fillCount || 0}`);
                       setText('cycleQty', `${formatNumber(cycle.buyQty)} / ${formatNumber(cycle.sellQty)}`);
                       setText('cycleDuration', formatDuration(cycle.durationSeconds));
@@ -1401,42 +1885,69 @@ public class HttpStatusServer implements AutoCloseable {
                       setText('cycleFee', formatNumber(cycle.cumulativeFee));
                       setText('cPRQ', formatNumber(cycle.profitableReduceQty));
                       setText('cPBE', formatNumber(cycle.profitReduceBoostExtraQty));
+                      setText('cPBEAvg', formatNumber(cycle.profitReduceBoostAveragePrice));
+                      setText('cLABE', formatNumber(cycle.lossAddBoostExtraQty));
+                      setText('cLABEAvg', formatNumber(cycle.lossAddBoostAveragePrice));
+                      setText('cPRR', formatNumber(cycle.profitReleaseReserveQty));
+                      const extraReduceReserve = Number(cycle.profitReleaseReserveQty || 0);
+                      const extraReduceCap = Math.abs(Number(cycle.cumulativeQty || 0)) * 0.5;
+                      setText(
+                        'cPRCap',
+                        extraReduceCap > 0
+                          ? `${formatNumber(extraReduceReserve)} / ${formatNumber(extraReduceCap)} (${formatPercent(extraReduceReserve / extraReduceCap)})`
+                          : '-'
+                      );
+                      setText('cPRCarry', formatNumber(cycle.profitReduceCarryQty));
+                      setText('cLACarry', formatNumber(cycle.lossAddCarryQty));
                       setText('pnlFormula', `${cycle.symbol || '当前 Cycle'} 盈亏 = ${pnlFormulaText(cycle, cycle.marketPrice, cycle.markPricePnl)}`);
                     }
-                    function renderFills(fills) {
+                    function renderFills(page) {
                       const tbody = document.getElementById('fills');
-                      const tradingFills = (fills || []).filter(f => f.side !== 'CYCLE_END');
-                      latestFills = tradingFills;
-                      const filteredFills = filterFillsByPrice(tradingFills);
-                      if (filteredFills.length === 0) {
+                      latestFillsPage = page || {};
+                      const fills = (page && page.items ? page.items : []).map(item => {
+                        const fill = item.fill || item;
+                        return {
+                          ...fill,
+                          cumulativeTurnover: item.cumulativeTurnover,
+                          previousTradingPrice: item.previousTradingPrice
+                        };
+                      });
+                      const total = Number(page && page.total || 0);
+                      const tradingCount = Number(page && page.tradingCount || 0);
+                      const fundingCount = Number(page && page.fundingCount || 0);
+                      const totalPages = Math.max(1, Math.ceil(total / fillsPageSize));
+                      const currentPage = Math.floor(fillsOffset / fillsPageSize) + 1;
+                      setText(
+                        'fillsPager',
+                        `${currentPage} / ${totalPages}，成交 ${tradingCount} 笔`
+                          + (fundingCount ? `，资金费 ${fundingCount} 笔，共 ${total} 条` : '')
+                      );
+                      const prev = document.getElementById('fillsPrev');
+                      const next = document.getElementById('fillsNext');
+                      if (prev) prev.disabled = fillsOffset <= 0;
+                      if (next) next.disabled = !Boolean(page && page.hasMore);
+                      if (fills.length === 0) {
                         tbody.innerHTML = '<tr><td colspan="16">暂无成交</td></tr>';
-                        setText('fillsPager', `0 / 0，${fillsCountText(filteredFills, tradingFills)}`);
                         return;
                       }
-                      const cumulativeTurnover = cumulativeTurnoverMap(tradingFills);
-                      const priceDiffs = priceDiffMap(tradingFills);
-                      const newestFirst = [...filteredFills].reverse();
-                      const totalPages = Math.max(1, Math.ceil(newestFirst.length / fillsPageSize));
-                      fillsPage = Math.max(0, Math.min(fillsPage, totalPages - 1));
-                      const visibleFills = newestFirst.slice(fillsPage * fillsPageSize, (fillsPage + 1) * fillsPageSize);
-                      const filteredText = newestFirst.length === tradingFills.length ? '' : `，筛选自 ${fillsCountText(tradingFills, tradingFills)}`;
-                      setText('fillsPager', `${fillsPage + 1} / ${totalPages}，${fillsCountText(newestFirst, tradingFills)}${filteredText}`);
-                      tbody.innerHTML = visibleFills.map(f => {
-                        const boost = profitReduceBoost(f);
+                      tbody.innerHTML = fills.map(f => {
+                        const boost = fillSizingBoost(f);
+                        const previousPrice = Number(f.previousTradingPrice);
+                        const priceDiff = Number.isFinite(previousPrice) ? Number(f.price) - previousPrice : null;
                         return `
                         <tr class="${boost ? 'boost-fill-row' : ''}">
                           <td>${formatTime(f.time)}</td>
                           <td>${esc(f.symbol)}</td>
                           <td>${formatSide(f.side)}</td>
                           <td>${esc(f.qty)}</td>
-                          <td>${boost ? '<span class="boost-fill-badge">盈利加减仓 +' + esc(formatNumber(boost.extraQty)) + '</span>' : '-'}</td>
+                          <td>${sizingBoostBadge(boost)}</td>
                           <td>${esc(f.price)}</td>
-                          <td>${formatPriceDiff(priceDiffs.get(fillKey(f)))}</td>
+                          <td>${formatPriceDiff(priceDiff)}</td>
                           <td>${esc(formatNumber(f.value))}</td>
                           <td>${esc(formatNumber(f.fee))} ${esc(f.feeCurrency || '')}</td>
                           <td>${formatPnl(f.totalPnlAtFill)}</td>
                           <td>${esc(formatNumber(f.cumulativeQty))}</td>
-                          <td>${esc(formatNumber(cumulativeTurnover.get(fillKey(f))))}</td>
+                          <td>${esc(formatNumber(f.cumulativeTurnover))}</td>
                           <td>${esc(formatNumber(f.cumulativeFee))}</td>
                           <td>${esc(formatNumber(costPrice(f)))}</td>
                           <td>${esc(formatNumber(f.avgEntryPrice))}</td>
@@ -1446,46 +1957,31 @@ public class HttpStatusServer implements AutoCloseable {
                       }).join('');
                     }
                     function previousFillsPage() {
-                      fillsPage = Math.max(0, fillsPage - 1);
-                      renderFills(latestFills);
+                      fillsOffset = Math.max(0, fillsOffset - fillsPageSize);
+                      loadGridFillsPage();
                     }
                     function nextFillsPage() {
-                      const totalPages = Math.max(1, Math.ceil((latestFills || []).length / fillsPageSize));
-                      fillsPage = Math.min(totalPages - 1, fillsPage + 1);
-                      renderFills(latestFills);
+                      if (!latestFillsPage || !latestFillsPage.hasMore) return;
+                      fillsOffset += fillsPageSize;
+                      loadGridFillsPage();
                     }
                     function applyFillPriceFilter() {
-                      fillsPage = 0;
-                      renderFills(latestFills);
+                      const input = document.getElementById('fillPrice');
+                      const value = input ? input.value.trim() : '';
+                      if (value && !Number.isFinite(Number(value))) return;
+                      fillsPrice = value ? (Math.trunc(Number(value) * 10) / 10).toFixed(1) : '';
+                      if (input) input.value = fillsPrice;
+                      fillsOffset = 0;
+                      gridFillsPageCache.clear();
+                      loadGridFillsPage();
                     }
                     function clearFillPriceFilter() {
-                      const minInput = document.getElementById('fillPriceMin');
-                      const maxInput = document.getElementById('fillPriceMax');
-                      if (minInput) minInput.value = '';
-                      if (maxInput) maxInput.value = '';
-                      fillsPage = 0;
-                      renderFills(latestFills);
-                    }
-                    function filterFillsByPrice(fills) {
-                      const minInput = document.getElementById('fillPriceMin');
-                      const maxInput = document.getElementById('fillPriceMax');
-                      const min = minInput && minInput.value !== '' ? Number(minInput.value) : null;
-                      const max = maxInput && maxInput.value !== '' ? Number(maxInput.value) : null;
-                      if ((min === null || !Number.isFinite(min)) && (max === null || !Number.isFinite(max))) return fills;
-                      return fills.filter(fill => {
-                        const price = Number(fill.price);
-                        if (!Number.isFinite(price)) return false;
-                        if (min !== null && Number.isFinite(min) && price < min) return false;
-                        if (max !== null && Number.isFinite(max) && price > max) return false;
-                        return true;
-                      });
-                    }
-                    function fillsCountText(fills, originalFills) {
-                      const tradingCount = (fills || []).filter(fill => fill.side === 'BUY' || fill.side === 'SELL').length;
-                      const fundingCount = (fills || []).filter(fill => fill.side === 'FUNDING_FEE').length;
-                      const totalCount = (fills || []).length;
-                      if (fundingCount === 0) return `成交 ${tradingCount} 笔`;
-                      return `成交 ${tradingCount} 笔，资金费 ${fundingCount} 笔，共 ${totalCount} 条`;
+                      const input = document.getElementById('fillPrice');
+                      if (input) input.value = '';
+                      fillsPrice = '';
+                      fillsOffset = 0;
+                      gridFillsPageCache.clear();
+                      loadGridFillsPage();
                     }
                     function renderCycles(cycles) {
                       const tbody = document.getElementById('cycles');
@@ -1584,14 +2080,14 @@ public class HttpStatusServer implements AutoCloseable {
                       }
                       const cumulativeTurnover = cumulativeTurnoverMap(fills, turnoverBefore);
                       tbody.innerHTML = fills.map(f => {
-                        const boost = profitReduceBoost(f);
+                        const boost = fillSizingBoost(f);
                         return `
                         <tr class="${boost ? 'boost-fill-row' : ''}">
                           <td>${formatTime(f.time)}</td>
                           <td>${esc(f.symbol)}</td>
                           <td>${formatSide(f.side)}</td>
                           <td>${esc(f.qty)}</td>
-                          <td>${boost ? '<span class="boost-fill-badge">盈利加减仓 +' + esc(formatNumber(boost.extraQty)) + '</span>' : '-'}</td>
+                          <td>${sizingBoostBadge(boost)}</td>
                           <td>${esc(f.price)}</td>
                           <td>${esc(formatNumber(f.value))}</td>
                           <td>${esc(formatNumber(f.fee))} ${esc(f.feeCurrency || '')}</td>
@@ -1616,6 +2112,28 @@ public class HttpStatusServer implements AutoCloseable {
                       } catch (ignored) {
                         return null;
                       }
+                    }
+                    function lossAddBoost(fill) {
+                      if (!fill || !fill.configJson) return null;
+                      try {
+                        const metadata = typeof fill.configJson === 'string' ? JSON.parse(fill.configJson) : fill.configJson;
+                        const extraQty = Number(metadata && metadata.lossAddBoostExtraQty);
+                        if (!Number.isFinite(extraQty) || extraQty <= 0) return null;
+                        return {extraQty};
+                      } catch (ignored) {
+                        return null;
+                      }
+                    }
+                    function fillSizingBoost(fill) {
+                      const reduce = profitReduceBoost(fill);
+                      if (reduce) return {...reduce, type: 'reduce'};
+                      const add = lossAddBoost(fill);
+                      return add ? {...add, type: 'add'} : null;
+                    }
+                    function sizingBoostBadge(boost) {
+                      if (!boost) return '-';
+                      const label = boost.type === 'add' ? '亏损额外加仓' : '盈利额外减仓';
+                      return '<span class="boost-fill-badge">' + label + ' +' + esc(formatNumber(boost.extraQty)) + '</span>';
                     }
                     function fillKey(fill) {
                       return `${fill.executionId || fill.clientOrderId || ''}|${fill.time || ''}`;
@@ -1718,11 +2236,24 @@ public class HttpStatusServer implements AutoCloseable {
                       const sign = change > 0 ? '+' : '';
                       return `${formatNumber(price)} <span class="${cls}">(${sign}${formatNumber(change)}%)</span>`;
                     }
-                    function formatCycleMarketPrice(cycle) {
-                      const priceText = formatPriceWithStartChange(cycle.marketPrice, cycle.startPrice);
+                    function formatCyclePriceSummary(cycle) {
+                      const currentPriceText = formatPriceWithStartChange(cycle.marketPrice, cycle.startPrice);
                       const cost = costPrice(cycle);
-                      if (cost === null || cost === undefined) return priceText;
-                      return `${priceText} / 成本 ${formatNumber(cost)}`;
+                      const current = Number(cycle.marketPrice);
+                      const costNumber = Number(cost);
+                      let costText = formatNumber(cost);
+                      if (cost !== null && cost !== undefined
+                          && Number.isFinite(costNumber) && Number.isFinite(current) && current > 0) {
+                        const change = (costNumber / current - 1) * 100;
+                        const cls = change > 0 ? 'pnl-pos' : (change < 0 ? 'pnl-neg' : 'pnl-flat');
+                        const sign = change > 0 ? '+' : '';
+                        costText += ` <span class="${cls}">(${sign}${formatNumber(change)}%)</span>`;
+                      }
+                      return `
+                        <span><span class="price-label">启动</span> ${formatNumber(cycle.startPrice)}</span>
+                        <span><span class="price-label">当前</span> ${currentPriceText}</span>
+                        <span><span class="price-label">成本</span> ${costText}</span>
+                      `;
                     }
                     function cumulativePnlAtPrice(fill, price) {
                       const tradingFee = Number(fill.cumulativeTradingFee ?? fill.cumulativeFee ?? 0);
@@ -1738,8 +2269,8 @@ public class HttpStatusServer implements AutoCloseable {
                       const fundingFee = source.cumulativeFundingFee || 0;
                       return `${formatNumber(source.cumulativeQty)} * ${formatNumber(price)} - (${formatNumber(source.cumulativeValue)}) - ${formatNumber(tradingFee)} + ${formatNumber(fundingFee)} = ${formatNumber(pnl)}`;
                     }
-                    function renderFundingDetail() {
-                      const rows = (latestFills || []).filter(f => f.side === 'FUNDING_FEE');
+                    async function renderFundingDetail() {
+                      const rows = await fetch('/api/funding-fees').then(r => r.json());
                       const tbody = document.getElementById('cycleDetail');
                       const notice = document.getElementById('cycleDetailNotice');
                       const pager = document.getElementById('cycleDetailPager');
@@ -1782,16 +2313,27 @@ public class HttpStatusServer implements AutoCloseable {
                       const n = Number(value);
                       return Number.isFinite(n) ? n.toFixed(2) : '-';
                     }
-                    function estimateFullInventoryPrice(state, currentPrice, cycle, activeOrders) {
+                    function estimateFullInventoryPrice(state, currentPrice, cycle, activeOrders, recentFillItems) {
                       const equity = Number(state && state.totalEquityUsdt);
                       const netQty = Number(state && state.netBaseQty);
                       const spacing = Number(latestRebalanceConfig && latestRebalanceConfig.baseGridSpacing);
                       const baseBuyQty = Number(latestRebalanceConfig && (latestRebalanceConfig.autoBaseGridQty || latestRebalanceConfig.baseGridQty));
                       const maxInventoryQty = Number(latestRebalanceConfig && latestRebalanceConfig.maxInventoryQty);
-                      const cycleQty = Math.max(0, Number(cycle && cycle.cumulativeQty) || 0);
+                      const signedCycleQty = Number(cycle && cycle.cumulativeQty) || 0;
+                      const cycleQty = Math.max(0, signedCycleQty);
                       const activeBuy = (activeOrders || []).find(order =>
                         order && order.side === 'BUY' && Number.isFinite(Number(order.price)) && Number(order.price) > 0
                       );
+                      const cumulativeTurnover = Math.max(
+                        0,
+                        ...(recentFillItems || [])
+                          .map(item => Number(item && item.cumulativeTurnover))
+                          .filter(Number.isFinite)
+                      );
+                      const cumulativeTradingFee = Number(cycle && cycle.cumulativeTradingFee);
+                      const projectedFeeRate = Number.isFinite(cumulativeTradingFee) && cumulativeTradingFee >= 0 && cumulativeTurnover > 0
+                        ? Math.min(0.001, cumulativeTradingFee / cumulativeTurnover)
+                        : 0;
                       const latestFillPrice = Number(cycle && cycle.latestFillPrice);
                       let price = activeBuy
                         ? Number(activeBuy.price)
@@ -1804,35 +2346,140 @@ public class HttpStatusServer implements AutoCloseable {
                           || baseBuyQty <= 0 || price <= 0 || buyQty <= 0) return null;
                       let nonBtcValue = equity - netQty * currentPrice;
                       if (nonBtcValue <= 0) {
-                        return {price: currentPrice, requiredQty: 0, maxAdditionalQty: 0, reachable: true};
+                        return {
+                          nonBtcValue,
+                          current: {price: currentPrice, requiredQty: 0, maxAdditionalQty: 0, reachable: true},
+                          initial: null
+                        };
                       }
+
+                      const maxAdditionalQty = Number.isFinite(maxInventoryQty) && maxInventoryQty > 0
+                        ? Math.max(0, maxInventoryQty - cycleQty)
+                        : null;
+                      const current = simulateFixedFullInventoryPrice(
+                        nonBtcValue,
+                        price,
+                        buyQty,
+                        baseBuyQty,
+                        spacing,
+                        maxAdditionalQty,
+                        projectedFeeRate
+                      );
+                      const startRatio = Number(cycle && cycle.startRatio);
+                      const startPrice = Number(cycle && cycle.startPrice);
+                      const initialNetQty = netQty - signedCycleQty;
+                      const initialSteps = Number(latestRebalanceConfig && latestRebalanceConfig.autoInitialSteps);
+                      const initialOrderQty = latestRebalanceConfig && latestRebalanceConfig.mode === 'auto_cycle'
+                        && Number.isFinite(initialSteps) && initialSteps > 0
+                        ? baseBuyQty * initialSteps
+                        : baseBuyQty;
+                      const initialEquity = Number.isFinite(startRatio) && startRatio > 0
+                          && Number.isFinite(startPrice) && startPrice > 0
+                          && Number.isFinite(initialNetQty) && initialNetQty > 0
+                        ? initialNetQty * startPrice / startRatio
+                        : NaN;
+                      const initialNonBtcValue = initialEquity - initialNetQty * startPrice;
+                      const initial = Number.isFinite(initialNonBtcValue) && initialNonBtcValue > 0
+                          && Number.isFinite(initialOrderQty) && initialOrderQty > 0
+                        ? simulateInitialFullInventoryPrice(
+                            initialNonBtcValue,
+                            startPrice,
+                            initialOrderQty,
+                            baseBuyQty,
+                            spacing,
+                            Number.isFinite(maxInventoryQty) && maxInventoryQty > 0 ? maxInventoryQty : null,
+                            projectedFeeRate
+                          )
+                        : null;
+                      return {nonBtcValue, initialNonBtcValue, projectedFeeRate, current, initial};
+                    }
+                    function estimatePlannedCycleQty(cycle) {
+                      const startPrice = Number(cycle && cycle.startPrice);
+                      const marketPrice = Number(cycle && cycle.marketPrice);
+                      const spacing = Number(latestRebalanceConfig && latestRebalanceConfig.baseGridSpacing);
+                      const baseQty = Number(latestRebalanceConfig && (latestRebalanceConfig.autoBaseGridQty || latestRebalanceConfig.baseGridQty));
+                      const initialSteps = Number(latestRebalanceConfig && latestRebalanceConfig.autoInitialSteps);
+                      const initialQty = latestRebalanceConfig && latestRebalanceConfig.mode === 'auto_cycle'
+                        && Number.isFinite(initialSteps) && initialSteps > 0
+                        ? baseQty * initialSteps
+                        : baseQty;
+                      if (!Number.isFinite(startPrice) || !Number.isFinite(marketPrice)
+                          || !Number.isFinite(spacing) || !Number.isFinite(baseQty)
+                          || !Number.isFinite(initialQty) || startPrice <= 0 || marketPrice <= 0
+                          || spacing <= 0 || spacing >= 1 || baseQty <= 0 || initialQty <= 0) return NaN;
+                      const movedLevels = Math.floor(
+                        Math.log(marketPrice / startPrice) / Math.log(1 - spacing) + 1e-9
+                      );
+                      return Math.max(0, initialQty + movedLevels * baseQty);
+                    }
+                    function simulateInitialFullInventoryPrice(nonBtcValue, startPrice, initialOrderQty, baseBuyQty, spacing, maxAdditionalQty, projectedFeeRate) {
+                      const initialCost = initialOrderQty * startPrice * (1 + projectedFeeRate);
+                      if (initialCost >= nonBtcValue) {
+                        return {
+                          price: startPrice,
+                          requiredQty: initialOrderQty,
+                          maxAdditionalQty,
+                          reachable: maxAdditionalQty === null || initialOrderQty <= maxAdditionalQty + 1e-12,
+                          reason: maxAdditionalQty !== null && initialOrderQty > maxAdditionalQty + 1e-12 ? 'inventory-cap' : null
+                        };
+                      }
+                      const remainingCap = maxAdditionalQty === null
+                        ? null
+                        : Math.max(0, maxAdditionalQty - initialOrderQty);
+                      const continuation = simulateFixedFullInventoryPrice(
+                        nonBtcValue - initialCost,
+                        startPrice * (1 - spacing),
+                        baseBuyQty,
+                        baseBuyQty,
+                        spacing,
+                        remainingCap,
+                        projectedFeeRate
+                      );
+                      return {
+                        ...continuation,
+                        requiredQty: initialOrderQty + Number(continuation.requiredQty || 0),
+                        maxAdditionalQty
+                      };
+                    }
+                    function simulateFixedFullInventoryPrice(nonBtcValue, firstPrice, firstQty, baseBuyQty, spacing, maxAdditionalQty, projectedFeeRate) {
+                      let remainingValue = nonBtcValue;
+                      let price = firstPrice;
+                      let buyQty = firstQty;
                       let requiredQty = 0;
                       for (let step = 0; step < 100000 && price > 0; step += 1) {
-                        nonBtcValue -= buyQty * price;
-                        requiredQty += buyQty;
-                        if (nonBtcValue <= 0) {
-                          const maxAdditionalQty = Number.isFinite(maxInventoryQty) && maxInventoryQty > 0
-                            ? Math.max(0, maxInventoryQty - cycleQty)
-                            : null;
-                          return {
-                            price,
-                            requiredQty,
-                            maxAdditionalQty,
-                            reachable: maxAdditionalQty === null || requiredQty <= maxAdditionalQty + 1e-12
-                          };
+                        const availableQty = maxAdditionalQty === null
+                          ? buyQty
+                          : Math.min(buyQty, Math.max(0, maxAdditionalQty - requiredQty));
+                        if (availableQty <= 0) {
+                          return {price, requiredQty, maxAdditionalQty, reachable: false, reason: 'inventory-cap'};
+                        }
+                        remainingValue -= availableQty * price * (1 + projectedFeeRate);
+                        requiredQty += availableQty;
+                        if (remainingValue <= 0) {
+                          return {price, requiredQty, maxAdditionalQty, reachable: true};
+                        }
+                        if (availableQty + 1e-12 < buyQty) {
+                          return {price, requiredQty, maxAdditionalQty, reachable: false, reason: 'inventory-cap'};
                         }
                         price *= (1 - spacing);
                         buyQty = baseBuyQty;
                       }
-                      return null;
+                      return {price: null, requiredQty, maxAdditionalQty, reachable: false, reason: 'price-floor'};
                     }
                     function formatFullInventoryEstimate(estimate) {
-                      if (!estimate || !Number.isFinite(Number(estimate.price))) return '-';
-                      const price = formatPrice2(estimate.price);
-                      const required = formatNumber(estimate.requiredQty);
-                      if (estimate.reachable) return `${price}（预计再增加 ${required} BTC）`;
-                      const available = formatNumber(estimate.maxAdditionalQty);
-                      return `${price}（需增加 ${required} BTC；当前上限仅 ${available}，不可达）`;
+                      if (!estimate || !estimate.current) return '-';
+                      const scenarioText = (scenario, label) => {
+                        if (!scenario) return `${label} -`;
+                        const required = formatNumber(scenario.requiredQty);
+                        if (scenario.reachable && Number.isFinite(Number(scenario.price))) {
+                          return `${label} ${formatPrice2(scenario.price)}（再增加 ${required} BTC）`;
+                        }
+                        if (scenario.reason === 'inventory-cap') {
+                          return `${label} 不可达（库存上限内最多增加 ${required} BTC）`;
+                        }
+                        return `${label} 不可达（价格归零前约增加 ${required} BTC）`;
+                      };
+                      return `${scenarioText(estimate.initial, '周期初始口径：')}；${scenarioText(estimate.current, '当前状态口径：')}`;
                     }
                     function formatPercent(value) {
                       if (value === null || value === undefined || value === '') return '-';
