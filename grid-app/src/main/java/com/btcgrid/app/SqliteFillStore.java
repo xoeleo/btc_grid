@@ -322,7 +322,7 @@ public class SqliteFillStore implements FillStore {
 
     private CycleWindow cycleWindow(Connection connection, FillRecord cycleEnd) throws SQLException {
         String sql = """
-                select rowid, fill_time_millis, client_order_id
+                select rowid, fill_time_millis, client_order_id, config_json
                   from fills
                  where side in ('BUY', 'SELL', 'FUNDING_FEE')
                    and symbol = ?
@@ -341,7 +341,10 @@ public class SqliteFillStore implements FillStore {
                     if (initialClientOrderId != null && !initialClientOrderId.equals(clientOrderId)) {
                         break;
                     }
-                    if (initialClientOrderId == null && ClientOrderIds.isInitialPositionOrder(clientOrderId)) {
+                    if (initialClientOrderId == null && isCycleInitial(
+                            clientOrderId,
+                            rs.getString("config_json")
+                    )) {
                         initialClientOrderId = clientOrderId;
                     }
                     if (initialClientOrderId != null) {
@@ -457,7 +460,7 @@ public class SqliteFillStore implements FillStore {
                         break;
                     }
                     fills.add(record);
-                    if (initialClientOrderId == null && ClientOrderIds.isInitialPositionOrder(record.clientOrderId())) {
+                    if (initialClientOrderId == null && isCycleInitial(record)) {
                         initialClientOrderId = record.clientOrderId();
                     }
                 }
@@ -465,7 +468,7 @@ public class SqliteFillStore implements FillStore {
         } catch (SQLException e) {
             throw new IllegalStateException("Failed to read current cycle fills", e);
         }
-        if (fills.isEmpty() || !ClientOrderIds.isInitialPositionOrder(fills.get(fills.size() - 1).clientOrderId())) {
+        if (fills.isEmpty() || !isCycleInitial(fills.get(fills.size() - 1))) {
             return List.of();
         }
         Collections.reverse(fills);
@@ -745,7 +748,7 @@ public class SqliteFillStore implements FillStore {
 
     private CycleWindow currentCycleWindow(Connection connection, String symbol) throws SQLException {
         String sql = """
-                select rowid, fill_time_millis, client_order_id
+                select rowid, fill_time_millis, client_order_id, config_json
                   from fills
                  where side in ('BUY', 'SELL', 'FUNDING_FEE')
                    and symbol = ?
@@ -769,7 +772,10 @@ public class SqliteFillStore implements FillStore {
                     if (initialClientOrderId != null && !initialClientOrderId.equals(clientOrderId)) {
                         break;
                     }
-                    if (initialClientOrderId == null && ClientOrderIds.isInitialPositionOrder(clientOrderId)) {
+                    if (initialClientOrderId == null && isCycleInitial(
+                            clientOrderId,
+                            rs.getString("config_json")
+                    )) {
                         initialClientOrderId = clientOrderId;
                     }
                     if (initialClientOrderId != null) {
@@ -1161,6 +1167,25 @@ public class SqliteFillStore implements FillStore {
         }
     }
 
+    private boolean isCycleInitial(FillRecord fill) {
+        return fill != null && isCycleInitial(fill.clientOrderId(), fill.configJson());
+    }
+
+    private boolean isCycleInitial(String clientOrderId, String configJson) {
+        if (!ClientOrderIds.isInitialPositionOrder(clientOrderId)) {
+            return false;
+        }
+        if (configJson == null || configJson.isBlank()) {
+            return true;
+        }
+        try {
+            Object merged = OBJECT_MAPPER.readValue(configJson, MAP_TYPE).get("mergedIntoRecoveredCycle");
+            return !Boolean.parseBoolean(String.valueOf(merged));
+        } catch (Exception ignored) {
+            return true;
+        }
+    }
+
     private BigDecimal cumulativeProfit(
             BigDecimal cumulativeQty,
             BigDecimal cumulativeValue,
@@ -1249,7 +1274,7 @@ public class SqliteFillStore implements FillStore {
 
     private void backfillDerivedColumns(Connection connection, String targetSymbol) throws SQLException {
         String selectSql = """
-                select rowid, symbol, side, qty, price, fee, fee_currency, client_order_id
+                select rowid, symbol, side, qty, price, fee, fee_currency, client_order_id, config_json
                   from fills
                  %s
                  order by symbol asc, fill_time_millis asc, rowid asc
@@ -1282,7 +1307,7 @@ public class SqliteFillStore implements FillStore {
                 }
                 String side = rs.getString("side");
                 String clientOrderId = rs.getString("client_order_id");
-                if (ClientOrderIds.isInitialPositionOrder(clientOrderId)
+                if (isCycleInitial(clientOrderId, rs.getString("config_json"))
                         && !clientOrderId.equals(currentInitialClientOrderId)) {
                     cumulativeQty = BigDecimal.ZERO;
                     cumulativeValue = BigDecimal.ZERO;

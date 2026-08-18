@@ -159,6 +159,60 @@ class SqliteFillStoreTest {
     }
 
     @Test
+    void mergedRecoveryInitialOrderDoesNotSplitTheCurrentCycle() {
+        Path dbPath = tempDir.resolve("merged-recovery-cycle.sqlite");
+        SqliteFillStore store = new SqliteFillStore(dbPath);
+        store.save(fill(
+                Instant.ofEpochSecond(1000L),
+                "BUY",
+                new BigDecimal("0.025"),
+                new BigDecimal("100"),
+                BigDecimal.ZERO,
+                "RBAL_BTCUSDT_I_original",
+                "original-initial"
+        ));
+        store.save(fill(
+                Instant.ofEpochSecond(1100L),
+                "SELL",
+                new BigDecimal("0.005"),
+                new BigDecimal("101"),
+                BigDecimal.ZERO,
+                "RBAL_BTCUSDT_PS_follow",
+                "follow-fill"
+        ));
+        store.save(new FillRecord(
+                Instant.ofEpochSecond(1200L),
+                "BTCUSDT",
+                "BUY",
+                new BigDecimal("0.025"),
+                new BigDecimal("102"),
+                new BigDecimal("2.55"),
+                BigDecimal.ZERO,
+                "USDT",
+                new BigDecimal("0.045"),
+                new BigDecimal("4.545"),
+                BigDecimal.ZERO,
+                new BigDecimal("0.045"),
+                new BigDecimal("101"),
+                BigDecimal.ZERO,
+                BigDecimal.ZERO,
+                BigDecimal.ZERO,
+                "RBAL_BTCUSDT_I_recovered",
+                "recovered-initial",
+                "{\"targetRatio\":1,\"mergedIntoRecoveredCycle\":true}"
+        ));
+
+        List<FillRecord> fills = store.currentCycleFills("BTCUSDT");
+        CurrentCycleFillPage page = store.currentCycleFillsPage("BTCUSDT", 10, 0, null, null);
+
+        assertEquals(3, fills.size());
+        assertEquals("original-initial", fills.get(0).executionId());
+        assertEquals("recovered-initial", fills.get(2).executionId());
+        assertEquals(3, page.total());
+        assertEquals(3, page.items().size());
+    }
+
+    @Test
     void pagesCurrentCycleFillsInSqliteWithTotalsFiltersAndCrossPageMetrics() {
         Path dbPath = tempDir.resolve("current-cycle-pages.sqlite");
         SqliteFillStore store = new SqliteFillStore(dbPath);
