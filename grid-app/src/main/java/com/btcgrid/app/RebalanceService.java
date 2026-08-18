@@ -27,6 +27,8 @@ import com.btcgrid.strategy.service.ClientOrderIdFactory;
 import com.btcgrid.strategy.service.GridOrderPlanner;
 import com.btcgrid.strategy.service.GridStrategyEngine;
 import com.btcgrid.strategy.service.GridTriggerEvaluator;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Duration;
@@ -44,6 +46,7 @@ public class RebalanceService {
     public static final String CLIENT_ORDER_PREFIX = "RBAL_";
     private static final BigDecimal ABNORMAL_ASSET_CHANGE_THRESHOLD = new BigDecimal("0.20");
     private static final BigDecimal MIN_COMPARE_VALUE = new BigDecimal("0.00000001");
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     private final RebalanceSettings settings;
     private final BybitSdkMarketDataGateway marketDataGateway;
@@ -279,6 +282,7 @@ public class RebalanceService {
             rebalanceLedger.restore(snapshotFromFills(tradingFills, netQty));
             activeCycleStartedAt = tradingFills.get(0).time();
         }
+        BigDecimal restoredTargetRatio = restoredCycleTargetRatio(tradingFills);
         ActiveOrderPair pair = activePairFromOrders(activeOrders);
         rebalanceEngine.restore(
                 new StrategyRuntimeState(pair == null ? GridState.WAITING_TRIGGER : GridState.GRID_ACTIVE, pair, Instant.now()),
@@ -288,7 +292,7 @@ public class RebalanceService {
                 settings.enabled(),
                 settings.symbol(),
                 "GRID_ACTIVE",
-                state.targetRatio(),
+                restoredTargetRatio,
                 state.currentRatio(),
                 state.baseBalance(),
                 state.contractPositionQty(),
@@ -307,8 +311,29 @@ public class RebalanceService {
                 "symbol", settings.symbol(),
                 "fills", tradingFills.size(),
                 "openOrders", activeOrders.size(),
-                "netQty", netQty
+                "netQty", netQty,
+                "targetRatio", restoredTargetRatio
         ));
+    }
+
+    private BigDecimal restoredCycleTargetRatio(List<FillRecord> tradingFills) {
+        for (FillRecord fill : tradingFills) {
+            if (fill.configJson() == null || fill.configJson().isBlank()) {
+                continue;
+            }
+            try {
+                JsonNode target = OBJECT_MAPPER.readTree(fill.configJson()).path("targetRatio");
+                if (!target.isMissingNode() && !target.isNull()) {
+                    BigDecimal value = target.decimalValue();
+                    if (value.signum() > 0) {
+                        return value;
+                    }
+                }
+            } catch (RuntimeException | java.io.IOException ignored) {
+                // Older cycle metadata may not be JSON; fall back to the persisted state.
+            }
+        }
+        return state.targetRatio();
     }
 
     public synchronized boolean onExecution(FillEvent fillEvent, String source) {

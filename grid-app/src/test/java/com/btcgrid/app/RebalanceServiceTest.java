@@ -459,7 +459,7 @@ class RebalanceServiceTest {
     }
 
     @Test
-    void activeLongCycleDoesNotStopUntilTargetRatioIsActuallyReached() throws Exception {
+    void restoredCycleUsesImmutableFillTargetInsteadOfDriftedStateTarget() throws Exception {
         Path stateFile = Files.createTempFile("rebalance-state", ".json");
         new FileRebalanceStateStore(stateFile).save(new RebalanceState(
                 true,
@@ -513,9 +513,9 @@ class RebalanceServiceTest {
                         baseCoin,
                         quoteCoin,
                         new BigDecimal("1.10"),
-                        new BigDecimal("0.04615385"),
+                        new BigDecimal("0.06923077"),
                         BigDecimal.ZERO,
-                        new BigDecimal("1.14615385"),
+                        new BigDecimal("1.16923077"),
                         new BigDecimal("100000")
                 ),
                 tradeGateway,
@@ -544,7 +544,8 @@ class RebalanceServiceTest {
                         BigDecimal.ZERO,
                         BigDecimal.ZERO,
                         "RBAL_BTCUSDT_I_test",
-                        "initial-long"
+                        "initial-long",
+                        "{\"targetRatio\":1}"
                 )),
                 List.of()
         );
@@ -554,6 +555,7 @@ class RebalanceServiceTest {
         assertTrue(cycleEndReasons.isEmpty());
         RebalanceState saved = new FileRebalanceStateStore(stateFile).load().orElseThrow();
         assertEquals("GRID_ACTIVE", saved.status());
+        assertEquals(BigDecimal.ONE, saved.targetRatio());
         Files.deleteIfExists(stateFile);
     }
 
