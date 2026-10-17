@@ -2,6 +2,7 @@ package com.btcgrid.app;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.btcgrid.common.model.OrderStatus;
 import com.sun.net.httpserver.HttpExchange;
@@ -155,6 +156,7 @@ public class HttpStatusServer implements AutoCloseable {
         createProtectedContext("/runtime", exchange -> writeJson(exchange, runtimeStatusSupplier.get().runtimeState()));
         createProtectedContext("/orders", exchange -> writeJson(exchange, runtimeStatusSupplier.get().workingOrders()));
         httpServer.createContext("/health", exchange -> writeJson(exchange, Map.of("ok", true)));
+        createProtectedContext("/api/rebalance-price-range", this::handleRebalancePriceRange);
         if (liveControlService != null) {
             createProtectedContext("/api/control", exchange -> writeJson(exchange, liveControlService.controlState()));
             createProtectedContext("/api/active-status", exchange -> writeJson(exchange, activeStatusSnapshot()));
@@ -167,6 +169,16 @@ public class HttpStatusServer implements AutoCloseable {
                 requirePost(exchange);
                 LiveControlService.RebalanceConfigRequest request = objectMapper.readValue(exchange.getRequestBody(), LiveControlService.RebalanceConfigRequest.class);
                 writeJson(exchange, liveControlService.saveRebalanceConfig(request));
+            });
+            createProtectedContext("/api/rebalance-monitors", exchange -> {
+                if ("GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+                    writeJson(exchange, liveControlService.rebalanceMonitors());
+                    return;
+                }
+                requirePost(exchange);
+                java.util.List<RebalanceMonitorRule> rules = objectMapper.readValue(
+                        exchange.getRequestBody(), new TypeReference<java.util.List<RebalanceMonitorRule>>() {});
+                writeJson(exchange, liveControlService.saveRebalanceMonitors(rules));
             });
             createProtectedContext("/api/rebalance-state", exchange -> writeJson(exchange, liveControlService.rebalanceState()));
             createProtectedContext("/api/rebalance-orders", exchange -> writeJson(exchange, liveControlService.rebalanceOrders()));
@@ -196,6 +208,14 @@ public class HttpStatusServer implements AutoCloseable {
             createProtectedContext("/api/rebalance-stop", exchange -> {
                 requirePost(exchange);
                 writeJson(exchange, liveControlService.stopRebalance());
+            });
+            createProtectedContext("/api/rebalance-close-cycle", exchange -> {
+                requirePost(exchange);
+                writeJson(exchange, liveControlService.closeRebalanceCycle());
+            });
+            createProtectedContext("/api/rebalance-reduce-cycle", exchange -> {
+                requirePost(exchange);
+                writeJson(exchange, liveControlService.reduceRebalanceCycle());
             });
             createProtectedContext("/api/fills", exchange -> writeJson(exchange, liveControlService.recentFills()));
             createProtectedContext("/api/recent-fills", exchange -> writeJson(
@@ -247,6 +267,53 @@ public class HttpStatusServer implements AutoCloseable {
                 LiveControlService.CancelOrderRequest request = objectMapper.readValue(exchange.getRequestBody(), LiveControlService.CancelOrderRequest.class);
                 writeJson(exchange, liveControlService.cancelOrder(request));
             });
+        }
+    }
+
+    private synchronized RebalancePriceRangeStore priceRangeStore() {
+        String configured = System.getProperty("btcgrid.priceRangeConfigFile", "");
+        if (configured.isBlank() && liveControlService != null) {
+            String mainPath = objectMapper.valueToTree(liveControlService.rebalanceConfig())
+                    .path("config").path("configFilePath").asText("");
+            if (!mainPath.isBlank()) configured = java.nio.file.Path.of(mainPath).toAbsolutePath()
+                    .getParent().resolve("rebalance-price-range.properties").toString();
+        }
+        if (configured.isBlank()) configured = "runtime/mainnet/rebalance-price-range.properties";
+        return new RebalancePriceRangeStore(java.nio.file.Path.of(configured));
+    }
+
+    private void handleRebalancePriceRange(HttpExchange exchange) throws IOException {
+        try {
+            RebalancePriceRangeStore store = priceRangeStore();
+            RebalancePriceRangeStore.Range range;
+            if ("GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+                range = store.load();
+            } else if ("POST".equalsIgnoreCase(exchange.getRequestMethod())) {
+                JsonNode body = objectMapper.readTree(exchange.getRequestBody());
+                if (body == null) throw new IllegalArgumentException("请输入最低价和最高价");
+                range = store.save(new RebalancePriceRangeStore.Range(
+                        new java.math.BigDecimal(body.path("lowPrice").asText("")),
+                        new java.math.BigDecimal(body.path("highPrice").asText(""))));
+            } else {
+                exchange.getResponseHeaders().set("Allow", "GET, POST");
+                exchange.sendResponseHeaders(405, -1); exchange.close(); return;
+            }
+            java.math.BigDecimal price = null;
+            if (liveControlService != null) {
+                JsonNode node = objectMapper.valueToTree(liveControlService.rebalanceState()).path("state").path("lastPrice");
+                if (!node.isMissingNode() && !node.isNull()) price = new java.math.BigDecimal(node.asText());
+            }
+            Map<String, Object> result = new java.util.LinkedHashMap<>();
+            result.put("ok", true); result.put("config", range); result.put("lastPrice", price);
+            result.put("theoreticalRatio", range.targetRatio(price));
+            writeJson(exchange, result);
+        } catch (IllegalArgumentException | IOException e) {
+            int code = e instanceof IllegalArgumentException ? 400 : 500;
+            byte[] bytes = objectMapper.writeValueAsBytes(Map.of("ok", false, "message", e.getMessage() == null ? "价格配置保存失败" : e.getMessage()));
+            exchange.getResponseHeaders().set("Content-Type", "application/json; charset=utf-8");
+            exchange.getResponseHeaders().set("Cache-Control", "no-store");
+            exchange.sendResponseHeaders(code, bytes.length);
+            try (OutputStream out = exchange.getResponseBody()) { out.write(bytes); }
         }
     }
 
@@ -673,8 +740,24 @@ public class HttpStatusServer implements AutoCloseable {
                     .metric { background: #ffffff; border: 1px solid #dfd3bd; border-radius: 8px; padding: 10px 12px; }
                     .metric span { display: block; color: #726650; font-size: 12px; }
                     .metric strong { display: block; margin-top: 4px; font-size: 18px; }
+                    .metric-combined { grid-column: span 2; }
+                    .metric-combined .metric-lines { display: grid; gap: 5px; margin-top: 7px; }
+                    .metric-combined .metric-line { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+                    .metric-combined .metric-line strong { margin: 0; font-size: 15px; text-align: right; }
+                    @media (max-width: 600px) { .metric-combined { grid-column: auto; } }
+                    .cycle-price-scenario-row { grid-column: span 5; min-width: 0; display: grid; grid-template-columns: minmax(220px, 1fr) minmax(0, 2fr); gap: 10px; }
+                    @media (max-width: 1000px) { .cycle-price-scenario-row { grid-column: 1 / -1; } }
+                    @media (max-width: 680px) { .cycle-price-scenario-row { grid-template-columns: minmax(0, 1fr); } }
+                    .metric-scenario { min-width: 0; }
+                    .metric-scenario > span { white-space: nowrap; }
+                    .metric-scenario > strong { overflow-x: auto; font-size: clamp(14px, 1.6vw, 18px); }
+                    .metric-scenario > strong > span { display: block; white-space: nowrap; color: inherit; font-size: inherit; }
+                    .metric-price-summary { grid-column: span 2; min-width: 0; }
+                    .cycle-price-summary > span { white-space: nowrap; overflow-x: auto; }
+                    @media (max-width: 400px) { .metric-price-summary { grid-column: 1 / -1; } }
                     .cycle-price-summary { display: grid; gap: 4px; }
                     .cycle-price-summary > span { color: inherit; font-size: inherit; }
+                    .cycle-price-summary > span > span { display: inline; }
                     .cycle-price-summary .price-label { display: inline; color: #726650; font-size: 12px; font-weight: 600; }
                     .badge { display: inline-flex; align-items: center; min-height: 28px; padding: 0 10px; border-radius: 999px; font-size: 13px; font-weight: 800; }
                     .badge-running { background: #d7f0e4; color: #0f5c3f; }
@@ -718,6 +801,14 @@ public class HttpStatusServer implements AutoCloseable {
                     .section-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 22px; }
                     .toggle-row { display: flex; align-items: center; gap: 8px; min-height: 38px; }
                     .toggle-row input { width: 18px; height: 18px; }
+                    .monitor-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 10px 0; }
+                    .monitor-actions button { margin-right: 0; }
+                    .monitor-rule input[type="number"] { width: 110px; }
+                    .monitor-rule input[type="text"] { width: 140px; }
+                    .monitor-rule select { min-width: 84px; }
+                    .monitor-rule input[type="checkbox"] { width: 18px; height: 18px; }
+                    .monitor-rule.current-cycle { background: #edf8f1; }
+                    .monitor-current-badge { margin-left: 6px; color: #0f5c3f; font-weight: 800; white-space: nowrap; }
                     .pnl-pos { color: #0f6b45; font-weight: 700; }
                     .pnl-neg { color: #a33125; font-weight: 700; }
                     .pnl-flat { color: #6f5a30; }
@@ -769,19 +860,41 @@ public class HttpStatusServer implements AutoCloseable {
                       <div class="metric"><span>再平衡状态</span><strong id="rebalanceStatus">-</strong></div>
                       <div class="metric"><span>Cycle 锁</span><strong id="rebalanceCycleLock">-</strong></div>
                       <div class="metric"><span>当前价格</span><strong id="rebalanceCurrentPrice">-</strong></div>
-                      <div class="metric"><span>当前 / 目标 BTC 占比</span><strong id="rebalanceRatio">-</strong></div>
+                      <div class="metric"><span>波段最低价—最高价（USDT）</span><strong id="rebalancePriceRange">-</strong></div>
+                      <div class="metric"><span>当前理论 BTC 占比</span><strong id="rebalanceTheoryRatio">-</strong></div>
+                      <div class="metric"><span>当前 / 执行目标 BTC 占比</span><strong id="rebalanceRatio">-</strong></div>
                       <div class="metric"><span>现货 BTC</span><strong id="rebalanceSpotQty">-</strong></div>
                       <div class="metric"><span>合约 BTC 仓位</span><strong id="rebalanceContractQty">-</strong></div>
                       <div class="metric"><span>净 BTC 敞口</span><strong id="rebalanceNetQty">-</strong></div>
                       <div class="metric"><span>总权益 USDT</span><strong id="rebalanceEquity">-</strong></div>
+                      <div class="metric"><span>当前总资产（BTC）</span><strong id="rebalanceCycleTotalEquityBtc">-</strong></div>
                     </div>
+                    <h3>波段高低价</h3>
+                    <div class="grid" id="rebalancePriceRangeForm">
+                      <label>波段最低价（USDT）<input id="rebalanceRangeLow" type="number" min="0.01" step="0.1" value="60000"><small>对应100% BTC</small></label>
+                      <label>波段最高价（USDT）<input id="rebalanceRangeHigh" type="number" min="0.01" step="0.1" value="200000"><small>对应0% BTC</small></label>
+                    </div>
+                    <p><button id="saveRebalancePriceRangeButton" class="start" onclick="saveRebalancePriceRange()">保存波段高低价</button> <span id="rebalancePriceRangeNotice" class="muted">-</span></p>
+                    <p class="muted">理论占比按当前价格在高低点之间线性计算。当前 Cycle 的执行目标单独显示。</p>
                     <p>
                       <button id="saveRebalanceButton" class="start" onclick="saveRebalanceConfig()">保存再平衡配置</button>
                       <button id="startRebalanceButton" class="start" onclick="postRebalance('/api/rebalance-start')">启动再平衡</button>
                       <button id="stopRebalanceButton" class="stop" onclick="postRebalance('/api/rebalance-stop')">停止再平衡</button>
+                      <button id="closeRebalanceCycleButton" class="danger" onclick="closeRebalanceCycle()" disabled>平仓并停止当前 Cycle</button>
+                      <button id="reduceRebalanceCycleButton" onclick="reduceRebalanceCycle()" disabled>手动减仓 10%</button>
                     </p>
                     <div id="rebalanceActionBanner" class="action-banner"></div>
                     <div id="rebalanceNotice" class="notice"></div>
+                    <div class="section-title"><h3>价格监控配置</h3><small>按列表顺序匹配；一次只运行一个 Cycle</small></div>
+                    <div class="monitor-actions">
+                      <button class="start" onclick="addRebalanceMonitor()">添加监控</button>
+                      <button class="start" onclick="saveRebalanceMonitors()">保存监控配置</button>
+                      <span id="rebalanceMonitorStatus" class="muted">-</span>
+                    </div>
+                    <div class="table-wrap"><table>
+                      <thead><tr><th>启用</th><th>名称</th><th>方向</th><th>价格条件</th><th>触发价 USDT</th><th>起始倍数</th><th>单格 BTC</th><th>结束 BTC 比例 %</th><th>操作</th></tr></thead>
+                      <tbody id="rebalanceMonitorRules"><tr><td colspan="9" class="muted">暂无监控配置</td></tr></tbody>
+                    </table></div>
                     <h3>再平衡挂单</h3>
                     <div class="table-wrap">
                       <table>
@@ -791,31 +904,55 @@ public class HttpStatusServer implements AutoCloseable {
                     </div>
                     <h3>当前再平衡 Cycle</h3>
                     <div class="summary">
-                      <div class="metric"><span>市场价盈亏</span><strong id="rebalanceCyclePnl">-</strong></div>
-                      <div class="metric"><span>开单方向</span><strong id="rebalanceCycleDirection">-</strong></div>
-                      <div class="metric"><span>启动比例</span><strong id="rebalanceCycleStartRatio">-</strong></div>
-                      <div class="metric"><span>当前比例</span><strong id="rebalanceCycleCurrentRatio">-</strong></div>
-                      <div class="metric"><span>启动 / 当前 / 成本价格</span><strong id="rebalanceCyclePriceSummary" class="cycle-price-summary">-</strong></div>
-                      <div class="metric"><span>当前总资产（BTC）</span><strong id="rebalanceCycleTotalEquityBtc">-</strong></div>
-                      <div class="metric"><span>单边下跌至 100% BTC 比例（情景推演）</span><strong id="rebalanceCycleFullInventoryPrice">-</strong></div>
-                      <div class="metric"><span>买入 / 卖出次数</span><strong id="rebalanceCycleCounts">-</strong></div>
-                      <div class="metric"><span>买入 / 卖出数量</span><strong id="rebalanceCycleQty">-</strong></div>
-                      <div class="metric"><span>持续时长</span><strong id="rebalanceCycleDuration">-</strong></div>
-                      <div class="metric"><span>累计净数量</span><strong id="rebalanceCycleCumQty">-</strong></div>
-                      <div class="metric"><span>固定 0.005 网格理论 / 实际净增</span><strong id="rebalanceCyclePlannedQty">-</strong></div>
-                      <div class="metric"><span>实际偏离理论</span><strong id="rebalanceCycleQtyDeviation">-</strong></div>
-                      <div class="metric"><span>累计交易手续费</span><strong id="rebalanceCycleTradingFee">-</strong></div>
-                      <div class="metric"><span>累计资金费</span><strong id="rebalanceCycleFundingFee">-</strong></div>
-                      <div class="metric"><span>累计净费用</span><strong id="rebalanceCycleFee">-</strong></div>
-                      <div class="metric"><span>额外减仓</span><strong id="rebalanceCycleExtraReduce">-</strong></div>
+                      <div class="metric metric-combined"><span>本 Cycle 监控配置</span><strong id="rebalanceCycleMonitorRule">-</strong></div>
+                      <div class="metric metric-combined"><span>Cycle 盈亏与仓位</span><div class="metric-lines">
+                        <div class="metric-line"><span>市场价盈亏</span><strong id="rebalanceCyclePnl">-</strong></div>
+                        <div class="metric-line"><span>开单方向</span><strong id="rebalanceCycleDirection">-</strong></div>
+                        <div class="metric-line"><span>累计净数量</span><strong id="rebalanceCycleCumQty">-</strong></div>
+                        <div class="metric-line"><span>持续时长</span><strong id="rebalanceCycleDuration">-</strong></div>
+                      </div></div>
+                      <div class="metric metric-combined"><span>BTC 占比</span><div class="metric-lines">
+                        <div class="metric-line"><span>启动比例</span><strong id="rebalanceCycleStartRatio">-</strong></div>
+                        <div class="metric-line"><span>当前比例</span><strong id="rebalanceCycleCurrentRatio">-</strong></div>
+                      </div></div>
+                      <div class="metric metric-combined"><span>动态水位止盈</span><div class="metric-lines">
+                        <div class="metric-line"><span>水位</span><strong id="rebalanceCycleWaterPrice">-</strong></div>
+                        <div class="metric-line"><span>当前价格</span><strong id="rebalanceCycleWaterCurrentPrice">-</strong></div>
+                        <div class="metric-line"><span>1% 减半</span><strong id="rebalanceCycleHalfPrice">-</strong></div>
+                        <div class="metric-line"><span>2% 清仓</span><strong id="rebalanceCycleExitPrice">-</strong></div>
+                      </div></div>
+                      <div class="cycle-price-scenario-row">
+                        <div class="metric"><span>启动 / 当前 / 成本价格</span><strong id="rebalanceCyclePriceSummary" class="cycle-price-summary">-</strong></div>
+                        <div class="metric metric-scenario"><span id="rebalanceCycleScenarioLabel"></span><strong id="rebalanceCycleFullInventoryPrice">-</strong></div>
+                      </div>
+                      <div class="metric metric-combined"><span>买入 / 卖出</span><div class="metric-lines">
+                        <div class="metric-line"><span>数量</span><strong id="rebalanceCycleQty">-</strong></div>
+                        <div class="metric-line"><span>次数</span><strong id="rebalanceCycleCounts">-</strong></div>
+                      </div></div>
+                      <div class="metric metric-combined"><span>固定单格网格理论 / 实际净增</span><div class="metric-lines">
+                        <div class="metric-line"><span>数量</span><strong id="rebalanceCyclePlannedQty">-</strong></div>
+                        <div class="metric-line"><span>实际偏离理论</span><strong id="rebalanceCycleQtyDeviation">-</strong></div>
+                      </div></div>
+                      <div class="metric metric-combined"><span>累计费用</span><div class="metric-lines">
+                        <div class="metric-line"><span>交易手续费</span><strong id="rebalanceCycleTradingFee">-</strong></div>
+                        <div class="metric-line"><span>资金费</span><strong id="rebalanceCycleFundingFee">-</strong></div>
+                        <div class="metric-line"><span>净费用</span><strong id="rebalanceCycleFee">-</strong></div>
+                      </div></div>
+                      <div class="metric metric-combined"><span>历史额外仓位（旧算法）</span><div class="metric-lines">
+                        <div class="metric-line"><span>额外减仓</span><strong id="rebalanceCycleExtraReduce">-</strong></div>
+                        <div class="metric-line"><span>历史未释放减仓</span><strong id="rebalanceCycleReleaseReserve">-</strong></div>
+                        <div class="metric-line"><span>额外加仓</span><strong id="rebalanceCycleExtraAdd">-</strong></div>
+                      </div></div>
+                      <div class="metric metric-combined"><span>平均额外成交价</span><div class="metric-lines">
+                        <div class="metric-line"><span>减仓</span><strong id="rebalanceCycleExtraReduceAvg">-</strong></div>
+                        <div class="metric-line"><span>加仓</span><strong id="rebalanceCycleExtraAddAvg">-</strong></div>
+                      </div></div>
                       <div class="metric"><span>其中永久减仓（不加回）</span><strong id="rebalanceCyclePermanentReduce">-</strong></div>
-                      <div class="metric"><span>平均额外减仓价格</span><strong id="rebalanceCycleExtraReduceAvg">-</strong></div>
-                      <div class="metric"><span>额外加仓</span><strong id="rebalanceCycleExtraAdd">-</strong></div>
-                      <div class="metric"><span>平均额外加仓价格</span><strong id="rebalanceCycleExtraAddAvg">-</strong></div>
-                      <div class="metric"><span>待释放额外减仓</span><strong id="rebalanceCycleReleaseReserve">-</strong></div>
                       <div class="metric"><span>净额外减仓 / 50%上限</span><strong id="rebalanceCycleReduceCap">-</strong></div>
-                      <div class="metric"><span>减仓待累计</span><strong id="rebalanceCycleReduceCarry">-</strong></div>
-                      <div class="metric"><span>加仓待累计</span><strong id="rebalanceCycleAddCarry">-</strong></div>
+                      <div class="metric metric-combined"><span>待累计数量</span><div class="metric-lines">
+                        <div class="metric-line"><span>减仓待累计</span><strong id="rebalanceCycleReduceCarry">-</strong></div>
+                        <div class="metric-line"><span>加仓待累计</span><strong id="rebalanceCycleAddCarry">-</strong></div>
+                      </div></div>
                     </div>
                     <details id="rebalanceFundingFeesDetails" ontoggle="toggleRebalanceFundingFees()">
                       <summary><strong>再平衡资金费记录</strong>（点击显示）</summary>
@@ -870,7 +1007,7 @@ public class HttpStatusServer implements AutoCloseable {
                     <div class="summary">
                       <div class="metric"><span>市场价盈亏</span><strong id="cycleMarkPricePnl">-</strong></div>
                       <div class="metric"><span>开单方向</span><strong id="cycleEntryDirection">-</strong></div>
-                      <div class="metric"><span>启动 / 当前 / 成本价格</span><strong id="cyclePriceSummary" class="cycle-price-summary">-</strong></div>
+                      <div class="metric metric-price-summary"><span>启动 / 当前 / 成本价格</span><strong id="cyclePriceSummary" class="cycle-price-summary">-</strong></div>
                       <div class="metric"><span>买入 / 卖出次数</span><strong id="cycleCounts">-</strong></div>
                       <div class="metric"><span>买入 / 卖出数量</span><strong id="cycleQty">-</strong></div>
                       <div class="metric"><span>持续时长</span><strong id="cycleDuration">-</strong></div>
@@ -971,7 +1108,7 @@ public class HttpStatusServer implements AutoCloseable {
                       spot:'现货'
                     };
                     const rebalanceFields = {
-                      enabled:false, mode:'price_target', autoMinTotalBtc:'7', autoBaseGridQty:'0.005', autoInitialSteps:'5',
+                      enabled:false, mode:'price_target', autoMinTotalBtc:'6', autoBaseGridQty:'0.003', autoInitialSteps:'5',
                       category:'linear', symbol:'BTCUSDT', accountType:'UNIFIED', baseCoin:'BTC', quoteCoin:'USDT',
                       priceTargets:'0:0.80,60000:0.75,65000:0.70,100000:0.50', ratioThreshold:'0.02',
                       baseGridSpacing:'0.0016', gridRequoteShrinkFactor:'0.85', baseGridQty:'0.001', maxInitialSteps:'5',
@@ -1018,14 +1155,83 @@ public class HttpStatusServer implements AutoCloseable {
                     let rebalanceFundingFeesOffset = 0;
                     let rebalanceFundingFeesRequestId = 0;
                     let rebalanceCyclesOffset = 0;
+                    let rebalanceCyclesRequestId = 0;
                     const cycleDetailPageSize = 50;
                     let cycleDetailOffset = 0;
                     let cycleDetailExecutionId = '';
                     let cycleDetailLabel = '';
                     let cycleDetailRequestId = 0;
+                    let priceRangeConfig = null;
+                    let priceRangeState = null;
+                    let priceRangeDirty = false;
+                    let priceRangeRequest = 0;
+                    document.getElementById('rebalancePriceRangeForm').addEventListener('input', () => {
+                      priceRangeDirty = true; renderPriceRange();
+                    });
+                    function theoreticalRatio(price, low, high) {
+                      if (![price, low, high].every(Number.isFinite) || price <= 0 || low <= 0 || high <= low) return null;
+                      return Math.max(0, Math.min(1, (high - price) / (high - low)));
+                    }
+                    function renderPriceRange() {
+                      const price = Number(priceRangeState && priceRangeState.lastPrice);
+                      const config = priceRangeConfig;
+                      setText('rebalancePriceRange', config ? `${formatNumber(config.lowPrice)} — ${formatNumber(config.highPrice)}` : '-');
+                      const ratio = config ? theoreticalRatio(price, Number(config.lowPrice), Number(config.highPrice)) : null;
+                      setText('rebalanceTheoryRatio', ratio == null ? '-' : formatPercent(ratio));
+                      if (priceRangeDirty) {
+                        const low = Number(document.getElementById('rebalanceRangeLow').value);
+                        const high = Number(document.getElementById('rebalanceRangeHigh').value);
+                        const preview = theoreticalRatio(price, low, high);
+                        setText('rebalancePriceRangeNotice', low > 0 && high > low
+                          ? `未保存${preview == null ? '' : '；修改后理论占比 ' + formatPercent(preview)}` : '最高价必须大于最低价，且最低价大于0');
+                      }
+                    }
+                    function applyPriceRange(config) {
+                      priceRangeConfig = config;
+                      if (!priceRangeDirty && !document.getElementById('rebalancePriceRangeForm').contains(document.activeElement)) {
+                        document.getElementById('rebalanceRangeLow').value = config.lowPrice;
+                        document.getElementById('rebalanceRangeHigh').value = config.highPrice;
+                      }
+                      renderPriceRange();
+                    }
+                    async function refreshRebalancePriceRange() {
+                      const request = ++priceRangeRequest;
+                      try {
+                        const response = await fetch('/api/rebalance-price-range');
+                        const result = await response.json();
+                        if (request !== priceRangeRequest) return;
+                        if (!response.ok || !result.ok) throw new Error(result.message || '价格配置读取失败');
+                        applyPriceRange(result.config);
+                      } catch (error) {
+                        if (request !== priceRangeRequest) return;
+                        priceRangeConfig = null; renderPriceRange();
+                        setText('rebalancePriceRangeNotice', error.message || '价格配置读取失败');
+                      }
+                    }
+                    async function saveRebalancePriceRange() {
+                      const low = document.getElementById('rebalanceRangeLow').value.trim();
+                      const high = document.getElementById('rebalanceRangeHigh').value.trim();
+                      if (!Number.isFinite(Number(low)) || !Number.isFinite(Number(high)) || Number(low) <= 0 || Number(high) <= Number(low)) {
+                        setText('rebalancePriceRangeNotice', '最高价必须大于最低价，且最低价大于0'); return;
+                      }
+                      const request = ++priceRangeRequest;
+                      const controls = ['rebalanceRangeLow', 'rebalanceRangeHigh', 'saveRebalancePriceRangeButton'].map(id => document.getElementById(id));
+                      controls.forEach(input => input.disabled = true);
+                      try {
+                        const response = await fetch('/api/rebalance-price-range', {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({lowPrice:low, highPrice:high})});
+                        const result = await response.json();
+                        if (!response.ok || !result.ok) throw new Error(result.message || '价格配置保存失败');
+                        priceRangeRequest++; priceRangeDirty = false; applyPriceRange(result.config);
+                        document.getElementById('rebalanceRangeLow').value = result.config.lowPrice;
+                        document.getElementById('rebalanceRangeHigh').value = result.config.highPrice;
+                        setText('rebalancePriceRangeNotice', '已保存');
+                      } catch (error) { setText('rebalancePriceRangeNotice', error.message || '价格配置保存失败'); }
+                      finally { controls.forEach(input => input.disabled = false); }
+                    }
                     let rebalanceDirty = false;
                     let savedRebalanceMode = 'price_target';
                     let latestRebalanceConfig = null;
+                    let rebalanceMonitorsDirty = false;
                     const form = document.getElementById('form');
                     Object.entries(fields).forEach(([k,v]) => {
                       const control = k === 'entryDirection'
@@ -1040,16 +1246,16 @@ public class HttpStatusServer implements AutoCloseable {
                       const control = k === 'enabled'
                         ? `<div class="toggle-row"><input id="rebalance_${k}" type="checkbox"><span>开启</span></div>`
                         : k === 'mode'
-                          ? `<select id="rebalance_${k}"><option value="price_target">价格目标再平衡</option><option value="auto_cycle">自动循环网格</option></select>`
+                          ? `<select id="rebalance_${k}"><option value="price_target">价格目标再平衡</option><option value="auto_cycle">自动做多 Cycle</option><option value="auto_short_cycle">高位做空 / 低位做多 Cycle</option><option value="auto_long_below">低于阈值做多 Cycle</option></select>`
                         : k === 'category'
                           ? `<select id="rebalance_${k}">${Object.entries(categoryOptions).map(([value,text]) => `<option value="${value}" ${value === v ? 'selected' : ''}>${text}</option>`).join('')}</select>`
                           : `<input id="rebalance_${k}" value="${v}">`;
                       const help = k === 'priceTargets'
-                        ? '格式：价格下限:目标BTC占比，例如 0:0.70,80000:0.60,100000:0.50'
+                        ? '价格目标模式填价格下限:目标占比；低于阈值做多模式填触发价:1，例如 100000:1（严格低于触发）'
                         : k === 'autoMinTotalBtc'
                           ? '仅空闲且总资产折合 BTC 严格大于此值时启动'
                         : k === 'autoBaseGridQty'
-                          ? '自动模式后续网格也沿用此单格数量'
+                          ? '自动做多及低于阈值做多模式的单格数量；首笔数量还会乘以初始格数'
                         : k === 'autoInitialSteps'
                           ? '首笔买入量 = 单格数量 × 初始格数'
                         : `rebalance.${k}`;
@@ -1059,14 +1265,18 @@ public class HttpStatusServer implements AutoCloseable {
                     rebalanceForm.addEventListener('change', () => { rebalanceDirty = true; });
                     document.getElementById('rebalance_mode').addEventListener('change', updateRebalanceModeUi);
                     function updateRebalanceModeUi() {
-                      const auto = document.getElementById('rebalance_mode').value === 'auto_cycle';
-                      ['autoMinTotalBtc', 'autoBaseGridQty', 'autoInitialSteps'].forEach(k => {
-                        document.getElementById(`rebalance_${k}`).disabled = !auto;
+                      const mode = document.getElementById('rebalance_mode').value;
+                      const autoLong = mode === 'auto_cycle';
+                      const autoShort = mode === 'auto_short_cycle';
+                      const longBelow = mode === 'auto_long_below';
+                      document.getElementById('rebalance_autoMinTotalBtc').disabled = !autoLong;
+                      document.getElementById('rebalance_autoBaseGridQty').disabled = !(autoLong || autoShort || longBelow);
+                      document.getElementById('rebalance_autoInitialSteps').disabled = !(autoLong || autoShort || longBelow);
+                      ['ratioThreshold', 'bandHysteresisRatio'].forEach(k => {
+                        document.getElementById(`rebalance_${k}`).disabled = autoLong || autoShort || longBelow;
                       });
-                      ['priceTargets', 'ratioThreshold', 'bandHysteresisRatio'].forEach(k => {
-                        document.getElementById(`rebalance_${k}`).disabled = auto;
-                      });
-                      setText('rebalanceMode', auto ? '自动循环网格' : '价格目标再平衡');
+                      document.getElementById('rebalance_priceTargets').disabled = autoLong;
+                      setText('rebalanceMode', autoLong ? '自动做多 Cycle' : (autoShort ? '高位做空 / 低位做多 Cycle' : (longBelow ? '低于阈值做多 Cycle' : '价格目标再平衡')));
                     }
                     function payload() {
                       const out = {};
@@ -1101,6 +1311,99 @@ public class HttpStatusServer implements AutoCloseable {
                       const path = document.getElementById('rebalanceConfigPath');
                       if (path) path.textContent = config && config.configFilePath ? `保存到 ${config.configFilePath}` : '-';
                     }
+                    function monitorRow(rule) {
+                      const row = document.createElement('tr');
+                      row.className = 'monitor-rule';
+                      row.dataset.id = rule.id || '';
+                      row.innerHTML = `<td><input data-field="enabled" type="checkbox"></td>
+                        <td><input data-field="name" type="text" placeholder="监控名称"></td>
+                        <td><select data-field="side"><option value="BUY">做多</option><option value="SELL">做空</option></select></td>
+                        <td><select data-field="trigger"><option value="BELOW">小于</option><option value="ABOVE">大于</option></select></td>
+                        <td><input data-field="triggerPrice" type="number" min="0.01" step="any"></td>
+                        <td><input data-field="initialSteps" type="number" min="0.001" step="any"></td>
+                        <td><input data-field="gridQty" type="number" min="0.000001" step="any"></td>
+                        <td><input data-field="targetPercent" type="number" min="0" max="100" step="any"></td>
+                        <td><button type="button" data-action="up" title="上移">↑</button><button type="button" data-action="down" title="下移">↓</button><button class="danger" type="button" data-action="delete">删除</button></td>`;
+                      for (const field of ['name', 'side', 'trigger', 'triggerPrice', 'initialSteps', 'gridQty']) {
+                        row.querySelector(`[data-field="${field}"]`).value = rule[field] ?? '';
+                      }
+                      row.querySelector('[data-field="enabled"]').checked = Boolean(rule.enabled);
+                      row.querySelector('[data-field="targetPercent"]').value = Number(rule.targetRatio ?? 1) * 100;
+                      row.querySelector('[data-action="up"]').onclick = () => {
+                        if (row.previousElementSibling && row.previousElementSibling.classList.contains('monitor-rule')) {
+                          row.parentNode.insertBefore(row, row.previousElementSibling);
+                          rebalanceMonitorsDirty = true;
+                        }
+                      };
+                      row.querySelector('[data-action="down"]').onclick = () => {
+                        if (row.nextElementSibling && row.nextElementSibling.classList.contains('monitor-rule')) {
+                          row.parentNode.insertBefore(row.nextElementSibling, row);
+                          rebalanceMonitorsDirty = true;
+                        }
+                      };
+                      row.querySelector('[data-action="delete"]').onclick = () => { row.remove(); rebalanceMonitorsDirty = true; };
+                      return row;
+                    }
+                    function renderRebalanceMonitors(data, state) {
+                      const cycleRunning = state && (state.status === 'GRID_ACTIVE' || state.status === 'GRID_OPENING');
+                      const active = cycleRunning && data && data.active && data.active.id ? data.active : null;
+                      const startRule = active && data.activeSnapshot && data.activeSnapshot.id === active.id
+                        ? data.activeSnapshot : active;
+                      const activeText = active
+                        ? `${active.name || active.id}｜${startRule.side === 'BUY' ? '做多' : '做空'}｜启动条件：价格${startRule.trigger === 'BELOW' ? '小于' : '大于'}${formatNumber(startRule.triggerPrice)}｜起始 ${formatNumber(startRule.initialSteps)} × ${formatNumber(startRule.gridQty)} BTC｜当前结束比例 ${formatPercent(active.targetRatio)}`
+                        : cycleRunning ? '原配置启动（无关联监控规则）' : '-';
+                      setText('rebalanceCycleMonitorRule', activeText);
+                      setText('rebalanceMonitorStatus', active
+                        ? `当前 Cycle：${active.name || active.id}（${active.side === 'BUY' ? '做多' : '做空'}）`
+                        : cycleRunning ? '当前 Cycle 由原配置启动' : data && data.configured ? '监控待命' : '未配置');
+                      if (rebalanceMonitorsDirty) return;
+                      const body = document.getElementById('rebalanceMonitorRules');
+                      body.replaceChildren();
+                      for (const rule of (data && data.rules) || []) {
+                        const row = monitorRow(rule);
+                        if (active && active.id === rule.id) {
+                          row.classList.add('current-cycle');
+                          row.querySelector('[data-action="delete"]').disabled = true;
+                          const badge = document.createElement('span');
+                          badge.className = 'monitor-current-badge';
+                          badge.textContent = '当前 Cycle（结束比例修改后生效）';
+                          row.children[1].appendChild(badge);
+                        }
+                        body.appendChild(row);
+                      }
+                      if (!body.children.length) body.innerHTML = '<tr><td colspan="9" class="muted">暂无监控配置</td></tr>';
+                    }
+                    function addRebalanceMonitor() {
+                      const body = document.getElementById('rebalanceMonitorRules');
+                      if (body.querySelector('.muted')) body.replaceChildren();
+                      body.appendChild(monitorRow({enabled:false, name:'', side:'BUY', trigger:'BELOW',
+                        triggerPrice:'10000', initialSteps:'5', gridQty:'0.006', targetRatio:1}));
+                      rebalanceMonitorsDirty = true;
+                    }
+                    document.getElementById('rebalanceMonitorRules').addEventListener('input', () => { rebalanceMonitorsDirty = true; });
+                    document.getElementById('rebalanceMonitorRules').addEventListener('change', () => { rebalanceMonitorsDirty = true; });
+                    function rebalanceMonitorPayload() {
+                      return [...document.querySelectorAll('#rebalanceMonitorRules .monitor-rule')].map(row => {
+                        const field = key => row.querySelector(`[data-field="${key}"]`);
+                        return {id:row.dataset.id || null, name:field('name').value,
+                          enabled:field('enabled').checked, side:field('side').value,
+                          trigger:field('trigger').value, triggerPrice:field('triggerPrice').value,
+                          initialSteps:field('initialSteps').value, gridQty:field('gridQty').value,
+                          targetRatio:String(Number(field('targetPercent').value) / 100)};
+                      });
+                    }
+                    async function saveRebalanceMonitors() {
+                      try {
+                        const response = await fetch('/api/rebalance-monitors', {method:'POST',
+                          headers:{'content-type':'application/json'}, body:JSON.stringify(rebalanceMonitorPayload())});
+                        const result = await response.json();
+                        if (!result.ok) throw new Error(result.message || '保存失败');
+                        rebalanceMonitorsDirty = false;
+                        renderRebalanceMonitors({configured:true, rules:result.rules});
+                        showRebalanceResult('ok', result.message || '监控配置已保存');
+                        await refresh();
+                      } catch (error) { showRebalanceResult('error', error.message || '保存失败'); }
+                    }
                     async function saveRebalanceConfig() {
                       const nextMode = document.getElementById('rebalance_mode').value;
                       if (nextMode !== savedRebalanceMode) {
@@ -1131,8 +1434,8 @@ public class HttpStatusServer implements AutoCloseable {
                       }
                     }
                     async function postRebalance(url) {
-                      const action = url.includes('stop') ? 'stop' : 'start';
-                      const actionText = action === 'stop' ? '停止再平衡' : '启动再平衡';
+                      const action = url.includes('reduce-cycle') ? 'reduce' : url.includes('close-cycle') ? 'close' : (url.includes('stop') ? 'stop' : 'start');
+                      const actionText = action === 'reduce' ? '手动减仓 10%' : action === 'close' ? '平仓并停止当前 Cycle' : (action === 'stop' ? '停止再平衡' : '启动再平衡');
                       setBusy(true, action);
                       showRebalanceResult('info', `${actionText}请求处理中...`);
                       showRebalanceBanner('info', `正在${actionText}...`);
@@ -1150,6 +1453,14 @@ public class HttpStatusServer implements AutoCloseable {
                         setBusy(false);
                         setTimeout(refresh, 500);
                       }
+                    }
+                    function closeRebalanceCycle() {
+                      if (!confirm('确认撤销当前 Cycle 挂单，并按盘口最近价限价平掉累计净数量？成交后 Cycle 结束。')) return;
+                      postRebalance('/api/rebalance-close-cycle');
+                    }
+                    function reduceRebalanceCycle() {
+                      if (!confirm('确认按当前 Cycle 累计净数量减仓 10%（按数量步长向下取整）？将先撤单，再按盘口限价减仓；成交后继续当前 Cycle。')) return;
+                      postRebalance('/api/rebalance-reduce-cycle');
                     }
                     async function post(url, body) {
                       setBusy(true);
@@ -1212,7 +1523,7 @@ public class HttpStatusServer implements AutoCloseable {
                       const button = event.target.closest('[data-action="rebalance-cycles-page"]');
                       if (!button) return;
                       rebalanceCyclesOffset = Math.max(0, rebalanceCyclesOffset + Number(button.dataset.delta || 0) * rebalancePageSize);
-                      refresh();
+                      loadRebalanceCyclesPage();
                     });
                     document.addEventListener('click', event => {
                       const button = event.target.closest('[data-action="rebalance-funding-fees-page"]');
@@ -1229,10 +1540,10 @@ public class HttpStatusServer implements AutoCloseable {
                       renderFundingDetail();
                     });
                     function setBusy(busy, action) {
-                      ['startButton', 'resumeButton', 'stopButton', 'flattenButton', 'saveRebalanceButton', 'startRebalanceButton', 'stopRebalanceButton'].forEach(id => {
+                      ['startButton', 'resumeButton', 'stopButton', 'flattenButton', 'saveRebalanceButton', 'startRebalanceButton', 'stopRebalanceButton', 'closeRebalanceCycleButton', 'reduceRebalanceCycleButton'].forEach(id => {
                         const button = document.getElementById(id);
                         if (button) button.dataset.busy = busy ? 'true' : 'false';
-                        if (button && (id === 'saveRebalanceButton' || id === 'startRebalanceButton' || id === 'stopRebalanceButton')) button.disabled = busy;
+                        if (button && (id === 'saveRebalanceButton' || id === 'startRebalanceButton' || id === 'stopRebalanceButton' || id === 'closeRebalanceCycleButton' || id === 'reduceRebalanceCycleButton')) button.disabled = busy;
                       });
                       setRebalanceButtonText(busy ? action : null);
                       document.querySelectorAll('[data-action="cancel-order"]').forEach(button => button.disabled = busy);
@@ -1242,7 +1553,9 @@ public class HttpStatusServer implements AutoCloseable {
                       const labels = {
                         saveRebalanceButton: action === 'save' ? '保存中...' : '保存再平衡配置',
                         startRebalanceButton: action === 'start' ? '启动中...' : '启动再平衡',
-                        stopRebalanceButton: action === 'stop' ? '停止中...' : '停止再平衡'
+                        stopRebalanceButton: action === 'stop' ? '停止中...' : '停止再平衡',
+                        closeRebalanceCycleButton: action === 'close' ? '平仓请求中...' : '平仓并停止当前 Cycle',
+                        reduceRebalanceCycleButton: action === 'reduce' ? '减仓请求中...' : '手动减仓 10%'
                       };
                       Object.entries(labels).forEach(([id, text]) => {
                         const button = document.getElementById(id);
@@ -1280,18 +1593,22 @@ public class HttpStatusServer implements AutoCloseable {
                       }
                     }
                     async function refreshRebalance() {
+                      const priceRangePromise = refreshRebalancePriceRange();
                       const rebalanceFillsPromise = loadRebalanceFillsPage(true);
-                      const [control, rebalanceConfig, rebalanceState, rebalanceOrders, rebalanceCycles, rebalanceCurrentCycle, rebalanceRecentFills] = await Promise.all([
+                      const [control, rebalanceConfig, rebalanceState, rebalanceOrders, rebalanceCycles, rebalanceCurrentCycle, rebalanceRecentFills, rebalanceMonitors] = await Promise.all([
                         fetch('/api/control').then(r=>r.json()),
                         fetch('/api/rebalance-config').then(r=>r.json()),
                         fetch('/api/rebalance-state').then(r=>r.json()),
                         fetch('/api/rebalance-orders').then(r=>r.json()),
                         fetch(`/api/rebalance-cycles?limit=${rebalancePageSize}&offset=${rebalanceCyclesOffset}`).then(r=>r.json()),
                         fetch('/api/rebalance-current-cycle').then(r=>r.json()),
-                        fetch('/api/rebalance-fills?limit=20&offset=0').then(r=>r.json())
+                        fetch('/api/rebalance-fills?limit=20&offset=0').then(r=>r.json()),
+                        fetch('/api/rebalance-monitors').then(r=>r.json())
                       ]);
                       const rebalanceCycleItems = rebalanceCycles && rebalanceCycles.items ? rebalanceCycles.items : [];
                       if (rebalanceConfig && rebalanceConfig.config) applyRebalanceConfig(rebalanceConfig.config);
+                      renderRebalanceMonitors(rebalanceMonitors,
+                        rebalanceState && rebalanceState.state ? rebalanceState.state : null);
                       renderRebalanceState(rebalanceState && rebalanceState.state ? rebalanceState.state : null, control);
                       const activeRebalanceOrders = (rebalanceOrders || []).filter(isActiveOrder);
                       renderRebalanceOrders(activeRebalanceOrders, rebalanceCurrentCycle);
@@ -1301,11 +1618,12 @@ public class HttpStatusServer implements AutoCloseable {
                         activeRebalanceOrders,
                         rebalanceRecentFills && rebalanceRecentFills.items ? rebalanceRecentFills.items : []
                       );
-                      renderRebalanceCycles(rebalanceCycleItems);
+                      renderRebalanceCycles(rebalanceCycleItems, rebalanceCycles && rebalanceCycles.summary);
                       renderRebalancePager('rebalanceCyclesPager', rebalanceCycles, rebalanceCyclesOffset, 'rebalance-cycles-page');
                       const fundingDetails = document.getElementById('rebalanceFundingFeesDetails');
                       if (fundingDetails && fundingDetails.open) loadRebalanceFundingFeesPage();
                       await rebalanceFillsPromise;
+                      await priceRangePromise;
                     }
                     function rebalanceFillsCacheKey(offset, price) {
                       return `${price || '*'}|${offset}`;
@@ -1428,7 +1746,15 @@ public class HttpStatusServer implements AutoCloseable {
                       await loadGridFillsPage(true);
                     }
                     function renderRebalanceState(state, control) {
+                      priceRangeState = state; renderPriceRange();
+                      const equityUsdt = Number(state && state.totalEquityUsdt);
+                      const btcPrice = Number(state && state.lastPrice);
+                      setText('rebalanceCycleTotalEquityBtc', Number.isFinite(equityUsdt) && Number.isFinite(btcPrice) && btcPrice > 0
+                        ? formatNumber(equityUsdt / btcPrice)
+                        : '-');
                       if (!state) {
+                        document.getElementById('closeRebalanceCycleButton').disabled = true;
+                        document.getElementById('reduceRebalanceCycleButton').disabled = true;
                         setText('rebalanceStatus', '-');
                         setText('rebalanceCycleLock', '-');
                         setText('rebalanceCurrentPrice', '-');
@@ -1441,6 +1767,12 @@ public class HttpStatusServer implements AutoCloseable {
                       }
                       const monitor = control && control.rebalanceRunning ? '监控运行中' : '监控未运行';
                       setText('rebalanceStatus', `${monitor} / ${state.status || '-'}${state.message ? ' / ' + state.message : ''}`);
+                      const closeButton = document.getElementById('closeRebalanceCycleButton');
+                      if (closeButton) closeButton.disabled = document.body.dataset.busy === 'true'
+                        || !Boolean(control && control.rebalanceRunning) || state.status !== 'GRID_ACTIVE';
+                      const reduceButton = document.getElementById('reduceRebalanceCycleButton');
+                      if (reduceButton) reduceButton.disabled = document.body.dataset.busy === 'true'
+                        || !Boolean(control && control.rebalanceRunning) || state.status !== 'GRID_ACTIVE';
                       setText('rebalanceCycleLock', state.status === 'GRID_ACTIVE' ? '已锁定，禁止重复开单' : '未锁定');
                       setText('rebalanceCurrentPrice', formatNumber(state.lastPrice));
                       setText('rebalanceRatio', `${formatPercent(state.currentRatio)} / ${formatPercent(state.targetRatio)}`);
@@ -1476,12 +1808,16 @@ public class HttpStatusServer implements AutoCloseable {
                 """).concat("""
                     function renderRebalanceCurrentCycle(cycle, state, activeOrders, recentFillItems) {
                       if (!cycle || !cycle.startedAt) {
+                        setText('rebalanceCycleScenarioLabel', rebalanceScenarioLabel(null, state));
                         setText('rebalanceCyclePnl', '-');
                         setText('rebalanceCycleDirection', '-');
                         setText('rebalanceCycleStartRatio', '-');
                         setText('rebalanceCycleCurrentRatio', '-');
                         setText('rebalanceCyclePriceSummary', '-');
-                        setText('rebalanceCycleTotalEquityBtc', '-');
+                        setText('rebalanceCycleWaterPrice', '-');
+                        setText('rebalanceCycleWaterCurrentPrice', '-');
+                        setText('rebalanceCycleHalfPrice', '-');
+                        setText('rebalanceCycleExitPrice', '-');
                         setText('rebalanceCycleFullInventoryPrice', '-');
                         setText('rebalanceCycleCounts', '-');
                         setText('rebalanceCycleQty', '-');
@@ -1512,13 +1848,24 @@ public class HttpStatusServer implements AutoCloseable {
                       const equityUsdt = Number(state && state.totalEquityUsdt);
                       const btcPrice = Number(cycle.marketPrice || (state && state.lastPrice));
                       const netBtcQty = Number(state && state.netBaseQty);
-                      setText('rebalanceCycleTotalEquityBtc', Number.isFinite(equityUsdt) && Number.isFinite(btcPrice) && btcPrice > 0
-                        ? formatNumber(equityUsdt / btcPrice)
-                        : '-');
-                      const fullInventoryEstimate = Number.isFinite(equityUsdt) && Number.isFinite(netBtcQty) && netBtcQty > 0
-                        ? estimateFullInventoryPrice(state, btcPrice, cycle, activeOrders, recentFillItems)
-                        : null;
-                      setText('rebalanceCycleFullInventoryPrice', formatFullInventoryEstimate(fullInventoryEstimate));
+                      const shortCycle = isShortRebalanceCycle(cycle, state);
+                      const waterPrice = costPrice(cycle);
+                      setText('rebalanceCycleWaterPrice', formatPrice2(waterPrice));
+                      setText('rebalanceCycleWaterCurrentPrice', formatPrice2(btcPrice));
+                      setText('rebalanceCycleHalfPrice', formatPrice2(waterPrice == null ? null : waterPrice * (shortCycle ? 0.99 : 1.01)));
+                      setText('rebalanceCycleExitPrice', formatPrice2(waterPrice == null ? null : waterPrice * (shortCycle ? 0.98 : 1.02)));
+                      setText('rebalanceCycleScenarioLabel', rebalanceScenarioLabel(cycle, state));
+                      if (shortCycle) {
+                        const targetRatioEstimate = Number.isFinite(equityUsdt) && Number.isFinite(netBtcQty) && netBtcQty > 0
+                          ? estimateTargetRatioPrice(state, btcPrice, cycle, activeOrders, recentFillItems)
+                          : null;
+                        setText('rebalanceCycleFullInventoryPrice', formatTargetRatioEstimate(targetRatioEstimate));
+                      } else {
+                        const fullInventoryEstimate = Number.isFinite(equityUsdt) && Number.isFinite(netBtcQty) && netBtcQty > 0
+                          ? estimateFullInventoryPrice(state, btcPrice, cycle, activeOrders, recentFillItems)
+                          : null;
+                        setHtml('rebalanceCycleFullInventoryPrice', formatFullInventoryEstimate(fullInventoryEstimate));
+                      }
                       setText('rebalanceCycleCounts', `${cycle.buyCount || 0} / ${cycle.sellCount || 0}，共 ${cycle.fillCount || 0}`);
                       setText('rebalanceCycleQty', `${formatNumber(cycle.buyQty)} / ${formatNumber(cycle.sellQty)}`);
                       setText('rebalanceCycleDuration', formatDuration(cycle.durationSeconds));
@@ -1625,6 +1972,27 @@ public class HttpStatusServer implements AutoCloseable {
                         setText('rebalanceFundingFeesPager', `读取失败：${error && error.message ? error.message : error}`);
                       }
                     }
+                    async function loadRebalanceCyclesPage() {
+                      const requestId = ++rebalanceCyclesRequestId;
+                      const offset = rebalanceCyclesOffset;
+                      setText('rebalanceCyclesPager', '读取 Cycle 历史...');
+                      try {
+                        const page = await fetch(
+                          `/api/rebalance-cycles?limit=${rebalancePageSize}&offset=${offset}`
+                        ).then(r => r.json());
+                        if (requestId !== rebalanceCyclesRequestId || offset !== rebalanceCyclesOffset) return;
+                        renderRebalanceCycles(page && page.items ? page.items : [], page && page.summary);
+                        renderRebalancePager(
+                          'rebalanceCyclesPager',
+                          page,
+                          offset,
+                          'rebalance-cycles-page'
+                        );
+                      } catch (error) {
+                        if (requestId !== rebalanceCyclesRequestId || offset !== rebalanceCyclesOffset) return;
+                        setText('rebalanceCyclesPager', `读取失败：${error && error.message ? error.message : error}`);
+                      }
+                    }
                     function renderRebalanceFundingFees(items) {
                       const tbody = document.getElementById('rebalanceFundingFees');
                       if (!tbody) return;
@@ -1649,14 +2017,33 @@ public class HttpStatusServer implements AutoCloseable {
                       `;
                       }).join('');
                     }
-                    function renderRebalanceCycles(cycles) {
+                    function renderRebalanceCycles(cycles, summary) {
                       const tbody = document.getElementById('rebalanceCycles');
                       if (!tbody) return;
-                      if (!cycles || cycles.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="15" class="muted">暂无再平衡 Cycle</td></tr>';
-                        return;
-                      }
-                      tbody.innerHTML = cycles.slice(0, 100).map(c => `
+                      const cycleCount = Number(summary && summary.cycleCount) || 0;
+                      const summaryRow = `
+                        <tr class="summary-row">
+                          <td><strong>累计</strong></td>
+                          <td>${esc(displaySymbol(summary && summary.symbol))}</td>
+                          <td>全部</td>
+                          <td>-</td>
+                          <td>-</td>
+                          <td>-</td>
+                          <td>-</td>
+                          <td>-</td>
+                          <td><strong>${formatCycleCounts(summary)}（${cycleCount} 个 Cycle）</strong></td>
+                          <td><strong>${formatDuration(summary && summary.durationSeconds)}</strong></td>
+                          <td>-</td>
+                          <td><strong>${formatPnl(summary && summary.totalPnl)}</strong></td>
+                          <td>-</td>
+                          <td>-</td>
+                          <td>-</td>
+                        </tr>
+                      `;
+                      const emptyRow = !cycles || cycles.length === 0
+                        ? '<tr><td colspan="15" class="muted">暂无再平衡 Cycle</td></tr>'
+                        : '';
+                      const cycleRows = (cycles || []).slice(0, 100).map(c => `
                         <tr>
                           <td>${formatTime(c.time)}</td>
                           <td>${esc(displaySymbol(c.symbol))}</td>
@@ -1675,6 +2062,7 @@ public class HttpStatusServer implements AutoCloseable {
                           <td><button class="compact" data-action="rebalance-cycle-detail" data-execution-id="${esc(c.executionId)}">明细</button></td>
                         </tr>
                       `).join('');
+                      tbody.innerHTML = summaryRow + emptyRow + cycleRows;
                     }
                     function renderRebalancePager(elementId, page, offset, action) {
                       const el = document.getElementById(elementId);
@@ -2313,6 +2701,27 @@ public class HttpStatusServer implements AutoCloseable {
                       const n = Number(value);
                       return Number.isFinite(n) ? n.toFixed(2) : '-';
                     }
+                    function isShortRebalanceCycle(cycle, state) {
+                      return String(cycle && cycle.entryDirection || '').toUpperCase() === 'SHORT'
+                        || String(state && state.activeSide || '').toUpperCase() === 'SELL';
+                    }
+                    function rebalanceScenarioLabel(cycle, state) {
+                      return isShortRebalanceCycle(cycle, state)
+                        ? '达到目标比例时预计 BTC 价格'
+                        : '单边下跌至 100% BTC 比例（情景推演）';
+                    }
+                    function estimateProjectedFeeRate(cycle, recentFillItems) {
+                      const cumulativeTurnover = Math.max(
+                        0,
+                        ...(recentFillItems || [])
+                          .map(item => Number(item && item.cumulativeTurnover))
+                          .filter(Number.isFinite)
+                      );
+                      const cumulativeTradingFee = Number(cycle && cycle.cumulativeTradingFee);
+                      return Number.isFinite(cumulativeTradingFee) && cumulativeTradingFee >= 0 && cumulativeTurnover > 0
+                        ? Math.min(0.001, cumulativeTradingFee / cumulativeTurnover)
+                        : 0;
+                    }
                     function estimateFullInventoryPrice(state, currentPrice, cycle, activeOrders, recentFillItems) {
                       const equity = Number(state && state.totalEquityUsdt);
                       const netQty = Number(state && state.netBaseQty);
@@ -2324,16 +2733,7 @@ public class HttpStatusServer implements AutoCloseable {
                       const activeBuy = (activeOrders || []).find(order =>
                         order && order.side === 'BUY' && Number.isFinite(Number(order.price)) && Number(order.price) > 0
                       );
-                      const cumulativeTurnover = Math.max(
-                        0,
-                        ...(recentFillItems || [])
-                          .map(item => Number(item && item.cumulativeTurnover))
-                          .filter(Number.isFinite)
-                      );
-                      const cumulativeTradingFee = Number(cycle && cycle.cumulativeTradingFee);
-                      const projectedFeeRate = Number.isFinite(cumulativeTradingFee) && cumulativeTradingFee >= 0 && cumulativeTurnover > 0
-                        ? Math.min(0.001, cumulativeTradingFee / cumulativeTurnover)
-                        : 0;
+                      const projectedFeeRate = estimateProjectedFeeRate(cycle, recentFillItems);
                       const latestFillPrice = Number(cycle && cycle.latestFillPrice);
                       let price = activeBuy
                         ? Number(activeBuy.price)
@@ -2392,6 +2792,63 @@ public class HttpStatusServer implements AutoCloseable {
                           )
                         : null;
                       return {nonBtcValue, initialNonBtcValue, projectedFeeRate, current, initial};
+                    }
+                    function estimateTargetRatioPrice(state, currentPrice, cycle, activeOrders, recentFillItems) {
+                      const equity = Number(state && state.totalEquityUsdt);
+                      const netQty = Number(state && state.netBaseQty);
+                      const targetRatio = Number(state && state.targetRatio);
+                      const spacing = Number(latestRebalanceConfig && latestRebalanceConfig.baseGridSpacing);
+                      const baseSellQty = Number(latestRebalanceConfig && latestRebalanceConfig.baseGridQty);
+                      const maxInventoryQty = Number(latestRebalanceConfig && latestRebalanceConfig.maxInventoryQty);
+                      const activeSell = (activeOrders || []).find(order =>
+                        order && order.side === 'SELL' && Number.isFinite(Number(order.price)) && Number(order.price) > 0
+                      );
+                      const latestFillPrice = Number(cycle && cycle.latestFillPrice);
+                      let price = activeSell
+                        ? Number(activeSell.price)
+                        : (Number.isFinite(latestFillPrice) && latestFillPrice > 0 ? latestFillPrice * (1 + spacing) : NaN);
+                      let sellQty = activeSell ? Number(activeSell.qty) : baseSellQty;
+                      if (!Number.isFinite(equity) || !Number.isFinite(netQty) || !Number.isFinite(currentPrice)
+                          || !Number.isFinite(targetRatio) || !Number.isFinite(spacing) || !Number.isFinite(baseSellQty)
+                          || !Number.isFinite(price) || !Number.isFinite(sellQty)
+                          || equity <= 0 || netQty <= 0 || currentPrice <= 0 || targetRatio <= 0 || targetRatio >= 1
+                          || spacing <= 0 || baseSellQty <= 0 || price <= 0 || sellQty <= 0) return null;
+                      const currentRatio = netQty * currentPrice / equity;
+                      if (currentRatio <= targetRatio) {
+                        return {price: currentPrice, requiredQty: 0, targetRatio, reachable: true};
+                      }
+                      const projectedFeeRate = estimateProjectedFeeRate(cycle, recentFillItems);
+                      const signedCycleQty = Number(cycle && cycle.cumulativeQty) || 0;
+                      const maxAdditionalQty = Number.isFinite(maxInventoryQty) && maxInventoryQty > 0
+                        ? Math.max(0, maxInventoryQty - Math.abs(signedCycleQty))
+                        : null;
+                      let nonBtcValue = equity - netQty * currentPrice;
+                      let projectedNetQty = netQty;
+                      let requiredQty = 0;
+                      for (let step = 0; step < 100000 && price > 0; step += 1) {
+                        const availableQty = maxAdditionalQty === null
+                          ? sellQty
+                          : Math.min(sellQty, Math.max(0, maxAdditionalQty - requiredQty));
+                        if (availableQty <= 0) {
+                          return {price, requiredQty, targetRatio, reachable: false, reason: 'inventory-cap'};
+                        }
+                        const equityBeforeFill = nonBtcValue + projectedNetQty * price;
+                        const tradingFee = availableQty * price * projectedFeeRate;
+                        projectedNetQty -= availableQty;
+                        nonBtcValue += availableQty * price - tradingFee;
+                        requiredQty += availableQty;
+                        const equityAfterFill = equityBeforeFill - tradingFee;
+                        const projectedRatio = equityAfterFill > 0 ? projectedNetQty * price / equityAfterFill : NaN;
+                        if (Number.isFinite(projectedRatio) && projectedRatio <= targetRatio) {
+                          return {price, requiredQty, targetRatio, reachable: true};
+                        }
+                        if (availableQty + 1e-12 < sellQty || projectedNetQty <= 0) {
+                          return {price, requiredQty, targetRatio, reachable: false, reason: 'inventory-cap'};
+                        }
+                        price *= (1 + spacing);
+                        sellQty = baseSellQty;
+                      }
+                      return {price: null, requiredQty, targetRatio, reachable: false, reason: 'price-ceiling'};
                     }
                     function estimatePlannedCycleQty(cycle) {
                       const startPrice = Number(cycle && cycle.startPrice);
@@ -2479,7 +2936,16 @@ public class HttpStatusServer implements AutoCloseable {
                         }
                         return `${label} 不可达（价格归零前约增加 ${required} BTC）`;
                       };
-                      return `${scenarioText(estimate.initial, '周期初始口径：')}；${scenarioText(estimate.current, '当前状态口径：')}`;
+                      return `<span>${esc(scenarioText(estimate.initial, '周期初始口径：'))}</span>`
+                        + `<span>${esc(scenarioText(estimate.current, '当前状态口径：'))}</span>`;
+                    }
+                    function formatTargetRatioEstimate(estimate) {
+                      if (!estimate) return '-';
+                      if (estimate.reachable && Number.isFinite(Number(estimate.price))) {
+                        return `${formatPrice2(estimate.price)} USDT`;
+                      }
+                      if (estimate.reason === 'inventory-cap') return '库存上限内不可达';
+                      return '不可达';
                     }
                     function formatPercent(value) {
                       if (value === null || value === undefined || value === '') return '-';

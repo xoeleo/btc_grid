@@ -16,6 +16,7 @@ import com.btcgrid.common.model.TradeSide;
 import com.btcgrid.ledger.model.StrategyLedgerSnapshot;
 import com.btcgrid.strategy.model.OrderPairPlan;
 import com.btcgrid.strategy.model.ProfitSizingState;
+import com.btcgrid.strategy.model.QuantityRoundingState;
 import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
@@ -23,6 +24,130 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 
 class GridOrderPlannerTest {
+
+    @Test
+    void carriesFractionalGridQuantityIntoNextFilledOrder() {
+        AtomicReference<QuantityRoundingState> roundingState = new AtomicReference<>(QuantityRoundingState.empty());
+        GridOrderPlanner planner = new GridOrderPlanner(
+                new ClientOrderIdFactory(),
+                BigDecimal.ONE,
+                null,
+                null,
+                symbol -> ProfitSizingState.empty(),
+                symbol -> roundingState.get()
+        );
+        GridStrategyConfig config = new GridStrategyConfig(
+                ProductCategory.LINEAR,
+                "BTCUSDT",
+                EntryDirection.BOTH,
+                new BigDecimal("0.01"),
+                new BigDecimal("0.85"),
+                new BigDecimal("0.003"),
+                new BigDecimal("5"),
+                new BigDecimal("0.1"),
+                new BigDecimal("1"),
+                new BigDecimal("1"),
+                4,
+                20,
+                20,
+                new BigDecimal("2.0"),
+                new BigDecimal("0.01"),
+                new BigDecimal("10"),
+                new BigDecimal("0.30"),
+                true,
+                Duration.ofMinutes(15),
+                Duration.ZERO
+        );
+        InstrumentSpec instrument = new InstrumentSpec(
+                "BTCUSDT",
+                new BigDecimal("0.001"),
+                new BigDecimal("0.001"),
+                new BigDecimal("0.1"),
+                new BigDecimal("0.1")
+        );
+        Instant now = Instant.parse("2026-08-23T07:13:49Z");
+        MarketSnapshot market = new MarketSnapshot(
+                "BTCUSDT",
+                now,
+                new BigDecimal("100"),
+                new IndicatorSnapshot(now, new BigDecimal("100"), new BigDecimal("110"),
+                        new BigDecimal("100"), new BigDecimal("90"))
+        );
+        StrategyLedgerSnapshot ledger = new StrategyLedgerSnapshot(
+                "BTCUSDT",
+                new BigDecimal("0.05"),
+                new BigDecimal("100"),
+                BigDecimal.ZERO,
+                BigDecimal.ZERO,
+                new BigDecimal("99"),
+                new BigDecimal("100"),
+                TradeSide.SELL,
+                market.indicators().zoneOf(new BigDecimal("100")),
+                0,
+                2,
+                InventoryMode.NORMAL,
+                now
+        );
+
+        OrderPairPlan first = planner.planPairedOrders(
+                config, instrument, market, ledger, new BigDecimal("100"),
+                new BigDecimal("1.5"), false, "follow-fill"
+        );
+
+        assertEquals(new BigDecimal("0.004"), first.sellOrder().qty());
+        assertTrue(first.sellOrder().reason().contains(
+                "qty-rounding:raw=0.0045,carry=0,rounded=0.004,order=0.004"));
+
+        roundingState.set(new QuantityRoundingState(BigDecimal.ZERO, new BigDecimal("0.0005")));
+        OrderPairPlan second = planner.planPairedOrders(
+                config, instrument, market, ledger, new BigDecimal("100"),
+                new BigDecimal("1.5"), false, "follow-fill"
+        );
+
+        assertEquals(new BigDecimal("0.005"), second.sellOrder().qty());
+        assertTrue(second.sellOrder().reason().contains(
+                "qty-rounding:raw=0.0045,carry=0.0005,rounded=0.005,order=0.005"));
+    }
+
+    @Test
+    void roundingCarryChangesOnlyInProportionToActualFill() {
+        QuantityRoundingState empty = QuantityRoundingState.empty();
+
+        QuantityRoundingState firstFill = empty.afterFill(
+                TradeSide.SELL,
+                new BigDecimal("0.0045"),
+                new BigDecimal("0.004"),
+                new BigDecimal("0.004"),
+                new BigDecimal("0.004")
+        );
+        assertEquals(new BigDecimal("0.0005"), firstFill.sellCarryQty());
+
+        QuantityRoundingState consumed = firstFill.afterFill(
+                TradeSide.SELL,
+                new BigDecimal("0.0045"),
+                new BigDecimal("0.005"),
+                new BigDecimal("0.005"),
+                new BigDecimal("0.005")
+        );
+        assertEquals(0, consumed.sellCarryQty().compareTo(BigDecimal.ZERO));
+
+        QuantityRoundingState partial = empty.afterFill(
+                TradeSide.SELL,
+                new BigDecimal("0.0045"),
+                new BigDecimal("0.004"),
+                new BigDecimal("0.004"),
+                new BigDecimal("0.002")
+        );
+        assertEquals(new BigDecimal("0.00025"), partial.sellCarryQty());
+
+        assertEquals(empty, empty.afterFill(
+                TradeSide.SELL,
+                new BigDecimal("0.0045"),
+                new BigDecimal("0.004"),
+                new BigDecimal("0.004"),
+                BigDecimal.ZERO
+        ));
+    }
 
     @Test
     void anomalouslyCloseConsecutiveFillsCannotShrinkPlacementBelowBaseSpacing() {

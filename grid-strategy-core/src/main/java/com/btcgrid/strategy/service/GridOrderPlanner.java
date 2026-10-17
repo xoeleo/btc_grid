@@ -10,6 +10,7 @@ import com.btcgrid.common.model.TradeSide;
 import com.btcgrid.ledger.model.StrategyLedgerSnapshot;
 import com.btcgrid.strategy.model.OrderPairPlan;
 import com.btcgrid.strategy.model.ProfitSizingState;
+import com.btcgrid.strategy.model.QuantityRoundingState;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.util.function.BiPredicate;
@@ -23,6 +24,8 @@ public class GridOrderPlanner {
     private final ProfitStateEvaluator profitableStateEvaluator;
     private final ProfitStateEvaluator lossStateEvaluator;
     private final ProfitSizingStateProvider profitSizingStateProvider;
+    private final QuantityRoundingStateProvider quantityRoundingStateProvider;
+    private final boolean quantityRoundingCarryEnabled;
 
     @FunctionalInterface
     public interface ProfitStateEvaluator {
@@ -37,6 +40,11 @@ public class GridOrderPlanner {
     @FunctionalInterface
     public interface ProfitSizingStateProvider {
         ProfitSizingState state(String symbol);
+    }
+
+    @FunctionalInterface
+    public interface QuantityRoundingStateProvider {
+        QuantityRoundingState state(String symbol);
     }
 
     public GridOrderPlanner(ClientOrderIdFactory clientOrderIdFactory) {
@@ -76,7 +84,8 @@ public class GridOrderPlanner {
                 profitableReduceSideMultiplier,
                 profitableStateEvaluator,
                 (marketSnapshot, ledgerSnapshot, orderPrice, orderQty) -> false,
-                symbol -> ProfitSizingState.empty()
+                symbol -> ProfitSizingState.empty(),
+                null
         );
     }
 
@@ -86,6 +95,24 @@ public class GridOrderPlanner {
             ProfitStateEvaluator profitableStateEvaluator,
             ProfitStateEvaluator lossStateEvaluator,
             ProfitSizingStateProvider profitSizingStateProvider
+    ) {
+        this(
+                clientOrderIdFactory,
+                profitableReduceSideMultiplier,
+                profitableStateEvaluator,
+                lossStateEvaluator,
+                profitSizingStateProvider,
+                null
+        );
+    }
+
+    public GridOrderPlanner(
+            ClientOrderIdFactory clientOrderIdFactory,
+            BigDecimal profitableReduceSideMultiplier,
+            ProfitStateEvaluator profitableStateEvaluator,
+            ProfitStateEvaluator lossStateEvaluator,
+            ProfitSizingStateProvider profitSizingStateProvider,
+            QuantityRoundingStateProvider quantityRoundingStateProvider
     ) {
         this.clientOrderIdFactory = clientOrderIdFactory;
         this.profitableReduceSideMultiplier = profitableReduceSideMultiplier == null || profitableReduceSideMultiplier.compareTo(BigDecimal.ONE) < 0
@@ -100,6 +127,10 @@ public class GridOrderPlanner {
         this.profitSizingStateProvider = profitSizingStateProvider == null
                 ? symbol -> ProfitSizingState.empty()
                 : profitSizingStateProvider;
+        this.quantityRoundingCarryEnabled = quantityRoundingStateProvider != null;
+        this.quantityRoundingStateProvider = quantityRoundingStateProvider == null
+                ? symbol -> QuantityRoundingState.empty()
+                : quantityRoundingStateProvider;
     }
 
     public OrderIntent planInitialOrder(
@@ -217,15 +248,26 @@ public class GridOrderPlanner {
         );
         BigDecimal buyPrice = buyPlacement.price();
         BigDecimal sellPrice = sellPlacement.price();
-        BigDecimal buyNormalQty = clampTradableQty(
+        QuantityRoundingState roundingState = quantityRoundingStateProvider.state(marketSnapshot.symbol());
+        QuantityRoundingAdjustment buyRounding = quantityRoundingAdjustment(
                 instrumentSpec,
                 qtyFromPlacementDistance(buyPlacement.distance(), baseSpacing, config.baseGridQty()),
+                roundingState == null ? BigDecimal.ZERO : roundingState.carryQty(TradeSide.BUY)
+        );
+        QuantityRoundingAdjustment sellRounding = quantityRoundingAdjustment(
+                instrumentSpec,
+                qtyFromPlacementDistance(sellPlacement.distance(), baseSpacing, config.baseGridQty()),
+                roundingState == null ? BigDecimal.ZERO : roundingState.carryQty(TradeSide.SELL)
+        );
+        BigDecimal buyNormalQty = clampTradableQty(
+                instrumentSpec,
+                buyRounding.qty(),
                 config.maxOrderQty(),
                 buyPrice
         );
         BigDecimal sellNormalQty = clampTradableQty(
                 instrumentSpec,
-                qtyFromPlacementDistance(sellPlacement.distance(), baseSpacing, config.baseGridQty()),
+                sellRounding.qty(),
                 config.maxOrderQty(),
                 sellPrice
         );
@@ -250,6 +292,7 @@ public class GridOrderPlanner {
                     config, instrumentSpec, marketSnapshot, ledgerSnapshot, buyQty, buyPrice, sizingState
             );
             buyQty = buyRelease.qty();
+            buyQtyBeforeProfitBoost = buyQty;
             buySizingReason = buyRelease.reason();
             sellQty = clampTradableQty(instrumentSpec, sellNormalQty.min(ledgerSnapshot.netQty().max(BigDecimal.ZERO)), config.maxOrderQty(), sellPrice);
             sellQtyBeforeProfitBoost = sellQty;
@@ -265,6 +308,7 @@ public class GridOrderPlanner {
                     config, instrumentSpec, marketSnapshot, ledgerSnapshot, buyQty, buyPrice, sizingState
             );
             buyQty = buyRelease.qty();
+            buyQtyBeforeProfitBoost = buyQty;
             buySizingReason = buyRelease.reason();
             BigDecimal reducedSellQty = config.classicReduceSizing()
                     ? BigDecimal.ZERO
@@ -291,6 +335,7 @@ public class GridOrderPlanner {
                     config, instrumentSpec, marketSnapshot, ledgerSnapshot, sellQty, sellPrice, sizingState
             );
             sellQty = sellRelease.qty();
+            sellQtyBeforeProfitBoost = sellQty;
             sellSizingReason = sellRelease.reason();
             BigDecimal reducedBuyQty = config.classicReduceSizing()
                     ? BigDecimal.ZERO
@@ -316,6 +361,15 @@ public class GridOrderPlanner {
             return null;
         }
 
+        String buyRoundingReason = buyNormalQty.compareTo(buyRounding.qty()) == 0
+                && buyQtyBeforeProfitBoost.compareTo(buyNormalQty) == 0
+                ? buyRounding.reason()
+                : null;
+        String sellRoundingReason = sellNormalQty.compareTo(sellRounding.qty()) == 0
+                && sellQtyBeforeProfitBoost.compareTo(sellNormalQty) == 0
+                ? sellRounding.reason()
+                : null;
+
         OrderIntent buy = buyQty.signum() == 0 ? null : new OrderIntent(
                 marketSnapshot.symbol(),
                 clientOrderIdFactory.next(marketSnapshot.symbol(), "PAIR_BUY"),
@@ -324,7 +378,8 @@ public class GridOrderPlanner {
                 buyQty,
                 buyPrice,
                 false,
-                pairSideReason(pairReason, "buy", buyReduceQtyApplied, buyProfitBoostApplied, buyQtyBeforeProfitBoost, buyQty, buySizingReason)
+                pairSideReason(pairReason, "buy", buyReduceQtyApplied, buyProfitBoostApplied,
+                        buyQtyBeforeProfitBoost, buyQty, buyRoundingReason, buySizingReason)
         );
         OrderIntent sell = sellQty.signum() == 0 ? null : new OrderIntent(
                 marketSnapshot.symbol(),
@@ -334,7 +389,8 @@ public class GridOrderPlanner {
                 sellQty,
                 sellPrice,
                 false,
-                pairSideReason(pairReason, "sell", sellReduceQtyApplied, sellProfitBoostApplied, sellQtyBeforeProfitBoost, sellQty, sellSizingReason)
+                pairSideReason(pairReason, "sell", sellReduceQtyApplied, sellProfitBoostApplied,
+                        sellQtyBeforeProfitBoost, sellQty, sellRoundingReason, sellSizingReason)
         );
         return new OrderPairPlan(buy, sell);
     }
@@ -375,12 +431,16 @@ public class GridOrderPlanner {
             boolean profitBoostApplied,
             BigDecimal baseQty,
             BigDecimal boostedQty,
+            String roundingReason,
             String sizingReason
     ) {
         String baseReason = pairReason == null
                 ? ("buy".equals(sideTag) ? "grid-buy" : "grid-sell")
                 : pairReason + "|" + sideTag;
         String reason = reduceQtyApplied ? baseReason + "|reduce-qty" : baseReason;
+        if (roundingReason != null && !roundingReason.isBlank()) {
+            reason += "|" + roundingReason + ",order=" + plain(boostedQty);
+        }
         if (sizingReason != null && !sizingReason.isBlank()) {
             reason += "|" + sizingReason;
         } else if (profitBoostApplied) {
@@ -709,6 +769,28 @@ public class GridOrderPlanner {
         return steps.multiply(baseGridQty);
     }
 
+    private QuantityRoundingAdjustment quantityRoundingAdjustment(
+            InstrumentSpec instrumentSpec,
+            BigDecimal rawQty,
+            BigDecimal carryQty
+    ) {
+        BigDecimal raw = rawQty == null ? BigDecimal.ZERO : rawQty.max(BigDecimal.ZERO);
+        if (!quantityRoundingCarryEnabled) {
+            return new QuantityRoundingAdjustment(raw, null);
+        }
+        BigDecimal carry = carryQty == null ? BigDecimal.ZERO : carryQty.max(BigDecimal.ZERO);
+        BigDecimal rounded = instrumentSpec.roundQtyDown(raw.add(carry));
+        if (carry.signum() == 0 && rounded.compareTo(raw) == 0) {
+            return new QuantityRoundingAdjustment(rounded, null);
+        }
+        return new QuantityRoundingAdjustment(
+                rounded,
+                "qty-rounding:raw=" + plain(raw)
+                        + ",carry=" + plain(carry)
+                        + ",rounded=" + plain(rounded)
+        );
+    }
+
     private BigDecimal clampQty(BigDecimal qty, BigDecimal maxOrderQty) {
         return qty.min(maxOrderQty);
     }
@@ -794,5 +876,8 @@ public class GridOrderPlanner {
     }
 
     private record Placement(BigDecimal price, BigDecimal distance) {
+    }
+
+    private record QuantityRoundingAdjustment(BigDecimal qty, String reason) {
     }
 }

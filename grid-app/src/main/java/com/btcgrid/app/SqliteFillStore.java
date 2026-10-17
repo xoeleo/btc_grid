@@ -4,6 +4,7 @@ import com.btcgrid.common.model.ClientOrderIds;
 import com.btcgrid.common.model.FillEvent;
 import com.btcgrid.common.model.TradeSide;
 import com.btcgrid.strategy.model.ProfitSizingState;
+import com.btcgrid.strategy.model.QuantityRoundingState;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.math.MathContext;
@@ -57,6 +58,10 @@ public class SqliteFillStore implements FillStore {
                   net_qty, avg_entry_price, realized_pnl, floating_pnl_at_fill,
                   total_pnl_at_fill, client_order_id, config_json
                 ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                on conflict(execution_id) do update set
+                  fee = excluded.fee,
+                  fee_currency = excluded.fee_currency
+                where abs(cast(excluded.fee as real)) > abs(cast(fills.fee as real))
                 """;
         try (Connection connection = connect();
              PreparedStatement statement = connection.prepareStatement(sql)) {
@@ -885,6 +890,24 @@ public class SqliteFillStore implements FillStore {
                 cumulativePermanentReduce,
                 BigDecimal.ZERO
         );
+    }
+
+    @Override
+    public synchronized QuantityRoundingState quantityRoundingState(String symbol) {
+        List<FillRecord> fills = currentCycleFills(symbol);
+        BigDecimal buyCarry = BigDecimal.ZERO;
+        BigDecimal sellCarry = BigDecimal.ZERO;
+        for (FillRecord fill : fills) {
+            BigDecimal savedBuyCarry = metadataDecimal(fill, "buyGridRoundingCarryQty");
+            if (savedBuyCarry != null) {
+                buyCarry = savedBuyCarry;
+            }
+            BigDecimal savedSellCarry = metadataDecimal(fill, "sellGridRoundingCarryQty");
+            if (savedSellCarry != null) {
+                sellCarry = savedSellCarry;
+            }
+        }
+        return new QuantityRoundingState(buyCarry, sellCarry);
     }
 
     private BigDecimal valueOrZero(BigDecimal value) {

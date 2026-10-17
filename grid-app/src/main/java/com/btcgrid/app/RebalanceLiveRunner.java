@@ -222,6 +222,18 @@ public class RebalanceLiveRunner implements AutoCloseable, PrivateExecutionListe
         }
     }
 
+    public void requestManualCycleExit() {
+        rebalanceService.requestManualCycleExit();
+    }
+
+    public java.math.BigDecimal requestManualReduction() {
+        return rebalanceService.requestManualReduction();
+    }
+
+    public boolean resumeAfterManualCycleExit() {
+        return rebalanceService.resumeAfterManualCycleExit();
+    }
+
     private boolean handleExecution(FillEvent fillEvent, String source) {
         if (fillEvent == null || !RebalanceService.isRebalanceClientOrder(fillEvent.clientOrderId())) {
             return false;

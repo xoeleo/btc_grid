@@ -40,7 +40,7 @@ class BybitSdkPrivateStreamGatewayTest {
         Map<String, Object> second = BybitSdkPrivateStreamGateway.subscribeMessage();
 
         assertEquals("subscribe", first.get("op"));
-        assertEquals(List.of("execution", "execution.fast", "order"), first.get("args"));
+        assertEquals(List.of("execution", "order"), first.get("args"));
         assertNotEquals(first.get("req_id"), second.get("req_id"));
     }
 
