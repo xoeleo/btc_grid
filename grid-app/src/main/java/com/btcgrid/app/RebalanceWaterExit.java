@@ -105,6 +105,13 @@ public final class RebalanceWaterExit {
         return cycle.cumulativeQty().multiply(price).subtract(cycle.cumulativeValue())
                 .subtract(cycle.cumulativeFee()).signum() > 0;
     }
+    private boolean beyondEntryPrice(CurrentCycleSummary cycle, BigDecimal price) {
+        BigDecimal entry = cycle.startPrice();
+        if (entry == null || entry.signum() <= 0) return false;
+        int change = price.compareTo(entry);
+        return ("LONG".equals(cycle.entryDirection()) && change > 0)
+                || ("SHORT".equals(cycle.entryDirection()) && change < 0);
+    }
 
     /** Called before applying a grid execution, so a newly profitable fill cannot generate another grid pair. */
     public void beforeFill(FillEvent fill, MarketSnapshot market) {
@@ -217,9 +224,12 @@ public final class RebalanceWaterExit {
             }
         }
         BigDecimal qty = cycle.cumulativeQty().abs();
-        if (currentRate.compareTo(FULL_RATE) >= 0 && !Set.of("EXITING", "MANUAL").contains(control.phase)) {
+        boolean entryPriceSatisfied = beyondEntryPrice(cycle, price);
+        if (entryPriceSatisfied && currentRate.compareTo(FULL_RATE) >= 0
+                && !Set.of("EXITING", "MANUAL").contains(control.phase)) {
             control.phase = "EXITING"; control.targetAbsQty = BigDecimal.ZERO; persist();
-        } else if ("PAUSED".equals(control.phase) && !control.halfDone && currentRate.compareTo(HALF_RATE) >= 0) {
+        } else if (entryPriceSatisfied && "PAUSED".equals(control.phase) && !control.halfDone
+                && currentRate.compareTo(HALF_RATE) >= 0) {
             BigDecimal half = spec.roundQtyDown(qty.divide(new BigDecimal("2")));
             if (half.compareTo(spec.minOrderQty()) < 0) { message = "动态水位达到 1%，半仓小于最小下单量，继续暂停网格"; return true; }
             control.phase = "HALF"; control.targetAbsQty = qty.subtract(half); persist();
@@ -230,7 +240,8 @@ public final class RebalanceWaterExit {
         }
         if (!Set.of("HALF", "EXITING", "MANUAL").contains(control.phase)) {
             message = "Cycle 已盈利，网格暂停；动态水位 " + water(cycle).stripTrailingZeros().toPlainString()
-                    + (control.halfDone ? "；本次盈利波段已减半，等待 2% 清仓或回到亏损侧恢复" : "；等待 1% 减半、2% 清仓");
+                    + (control.halfDone ? "；本次盈利波段已减半，等待 2% 清仓或回到亏损侧恢复" : "；等待 1% 减半、2% 清仓")
+                    + (entryPriceSatisfied ? "" : "；自动触发还需多单现价高于开单价、空单现价低于开单价");
             return true;
         }
         BigDecimal remaining = spec.roundQtyDown(qty.subtract(control.targetAbsQty).max(BigDecimal.ZERO));

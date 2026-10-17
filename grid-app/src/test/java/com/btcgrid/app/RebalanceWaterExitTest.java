@@ -48,6 +48,9 @@ class RebalanceWaterExitTest {
         f.recreate(); f.poll(); assertEquals(1, f.submitted.size()); // halfDone survives restart
         f.price = d("98900"); assertFalse(f.poll()); assertEquals("GRID", f.exit.phase());
         f.price = d("99990"); assertTrue(f.poll());
+        assertEquals(1, f.submitted.size()); assertEquals("PAUSED", f.exit.phase());
+        f.price = d("100000"); f.poll(); assertEquals(1, f.submitted.size());
+        f.price = d("100000.1"); f.poll();
         assertEquals(2, f.submitted.size()); assertEquals(0, d("0.025").compareTo(f.submitted.get(1).qty()));
     }
     @Test void twoPercentJumpsDirectlyToFullCloseAndEndsOnlyAfterConfirmedExecution() throws Exception {
@@ -63,6 +66,7 @@ class RebalanceWaterExitTest {
     }
     @Test void shortUsesMirroredThresholdsAndBuysBackHalfThenAll() throws Exception {
         Fixture f = new Fixture(); f.qty = d("-0.1"); f.value = d("-10000");
+        f.entryDirection = "SHORT";
         f.price = d("101000"); assertFalse(f.poll());
         f.price = d("99999"); assertTrue(f.poll()); assertTrue(f.submitted.isEmpty());
         f.price = d("99000"); f.poll(); OrderIntent half = f.submitted.get(0);
@@ -78,6 +82,63 @@ class RebalanceWaterExitTest {
         f.fees = d("200"); assertFalse(f.poll()); assertEquals("GRID", f.exit.phase());
         assertEquals(0, d("102000").compareTo(RebalanceWaterExit.water(f.cycle())));
         f.price = d("103020"); f.poll(); assertEquals(1, f.submitted.size());
+    }
+    @Test void longHalfAndFullWaitUntilPriceIsStrictlyAboveCycleEntry() throws Exception {
+        for (String trigger : List.of("101000", "102000")) {
+            Fixture f = new Fixture(); f.startPrice = d("103000"); f.price = d(trigger);
+            assertTrue(f.poll()); assertEquals("PAUSED", f.exit.phase());
+            assertTrue(f.submitted.isEmpty());
+            assertTrue(f.exit.message().contains("高于开单价"));
+            f.recreate(); f.poll(); assertTrue(f.submitted.isEmpty());
+            f.price = f.startPrice; f.poll(); assertTrue(f.submitted.isEmpty());
+            f.price = d("103000.1"); f.poll();
+            assertEquals("EXITING", f.exit.phase()); assertEquals(1, f.submitted.size());
+            assertEquals(TradeSide.SELL, f.submitted.get(0).side());
+            assertEquals(0, f.qty.compareTo(f.submitted.get(0).qty()));
+        }
+    }
+    @Test void shortHalfAndFullWaitUntilPriceIsStrictlyBelowCycleEntry() throws Exception {
+        for (String trigger : List.of("99000", "98000")) {
+            Fixture f = new Fixture(); f.qty = d("-0.1"); f.value = d("-10000");
+            f.entryDirection = "SHORT"; f.startPrice = d("97000"); f.price = d(trigger);
+            assertTrue(f.poll()); assertEquals("PAUSED", f.exit.phase());
+            assertTrue(f.submitted.isEmpty());
+            f.recreate(); f.poll(); assertTrue(f.submitted.isEmpty());
+            f.price = f.startPrice; f.poll(); assertTrue(f.submitted.isEmpty());
+            f.price = d("96999.9"); f.poll();
+            assertEquals("EXITING", f.exit.phase()); assertEquals(1, f.submitted.size());
+            assertEquals(TradeSide.BUY, f.submitted.get(0).side());
+            assertEquals(0, f.qty.abs().compareTo(f.submitted.get(0).qty()));
+        }
+    }
+    @Test void favorableEntryPriceDoesNotReplaceWaterProfitThresholds() throws Exception {
+        for (String direction : List.of("LONG", "SHORT")) {
+            Fixture f = new Fixture(); f.entryDirection = direction;
+            if ("SHORT".equals(direction)) { f.qty = f.qty.negate(); f.value = f.value.negate(); }
+            f.price = d("LONG".equals(direction) ? "100999.9" : "99000.1");
+            assertTrue(f.poll()); assertEquals("PAUSED", f.exit.phase());
+            assertTrue(f.submitted.isEmpty());
+            f.price = d("LONG".equals(direction) ? "101000" : "99000"); f.poll();
+            assertEquals("HALF", f.exit.phase()); assertEquals(1, f.submitted.size());
+            assertEquals(0, d("0.05").compareTo(f.submitted.get(0).qty()));
+        }
+    }
+    @Test void missingOrInvalidEntryDetailsBlockAutomaticThresholdExits() throws Exception {
+        for (BigDecimal entry : Arrays.asList(null, BigDecimal.ZERO, d("-1"))) {
+            Fixture f = new Fixture(); f.startPrice = entry; f.price = d("102000");
+            assertTrue(f.poll()); assertEquals("PAUSED", f.exit.phase()); assertTrue(f.submitted.isEmpty());
+        }
+        for (String direction : Arrays.asList(null, "UNKNOWN")) {
+            Fixture f = new Fixture(); f.entryDirection = direction; f.price = d("102000");
+            assertTrue(f.poll()); assertEquals("PAUSED", f.exit.phase()); assertTrue(f.submitted.isEmpty());
+        }
+    }
+    @Test void nonpositiveDynamicWaterStillRequiresFavorableEntryPrice() throws Exception {
+        Fixture f = new Fixture(); f.value = d("-100"); f.price = d("99999");
+        assertTrue(f.poll()); assertEquals("PAUSED", f.exit.phase()); assertTrue(f.submitted.isEmpty());
+        f.price = d("100000"); f.poll(); assertTrue(f.submitted.isEmpty());
+        f.price = d("100000.1"); f.poll();
+        assertEquals("EXITING", f.exit.phase()); assertEquals(1, f.submitted.size());
     }
     @Test void partialFillWaitsAndRequoteWaitsForTerminalEvidenceBeforeReplacement() throws Exception {
         Fixture f = new Fixture(); f.price = d("101000"); f.poll(); OrderIntent half = f.submitted.get(0);
@@ -139,7 +200,8 @@ class RebalanceWaterExitTest {
         f.poll(); assertEquals(0, d("0.009").compareTo(f.submitted.get(1).qty()));
     }
     @Test void manualShortReductionBuysBackAndKeepsProfitableCyclePaused() throws Exception {
-        Fixture f = new Fixture(); f.qty = d("-0.1"); f.value = d("-10000"); f.price = d("99500"); f.poll();
+        Fixture f = new Fixture(); f.qty = d("-0.1"); f.value = d("-10000"); f.entryDirection = "SHORT";
+        f.price = d("99500"); f.poll();
         f.exit.requestManualReduction(f.market()); f.poll(); OrderIntent order = f.submitted.get(0);
         assertEquals(TradeSide.BUY, order.side()); assertEquals(0, d("0.01").compareTo(order.qty()));
         f.finish(order); assertTrue(f.poll()); assertEquals("PAUSED", f.exit.phase());
@@ -179,6 +241,8 @@ class RebalanceWaterExitTest {
         final Path path;
         Instant start = START;
         BigDecimal qty = d("0.1"), value = d("10000"), fees = BigDecimal.ZERO, price = d("100000");
+        BigDecimal startPrice = d("100000");
+        String entryDirection = "LONG";
         boolean failSubmit;
         final List<OrderIntent> submitted = new ArrayList<>();
         final List<String> canceled = new ArrayList<>();
@@ -213,6 +277,7 @@ class RebalanceWaterExitTest {
         CurrentCycleSummary cycle() {
             Map<String,Object> data = new HashMap<>(); data.put("symbol", "RBAL:BTCUSDT"); data.put("startedAt", start.toString());
             data.put("cumulativeQty", qty); data.put("cumulativeValue", value); data.put("cumulativeFee", fees);
+            data.put("startPrice", startPrice); data.put("entryDirection", entryDirection);
             return JSON.convertValue(data, CurrentCycleSummary.class);
         }
         MarketSnapshot market() { return new MarketSnapshot("BTCUSDT", Instant.now(), price, price, null); }

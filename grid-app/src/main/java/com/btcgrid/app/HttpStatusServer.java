@@ -920,7 +920,7 @@ public class HttpStatusServer implements AutoCloseable {
                         <div class="metric-line"><span>当前价格</span><strong id="rebalanceCycleWaterCurrentPrice">-</strong></div>
                         <div class="metric-line"><span>1% 减半</span><strong id="rebalanceCycleHalfPrice">-</strong></div>
                         <div class="metric-line"><span>2% 清仓</span><strong id="rebalanceCycleExitPrice">-</strong></div>
-                      </div></div>
+                      </div><small class="muted">自动触发同时要求：做多现价高于本 Cycle 开单价，做空现价低于开单价；相等不触发。</small></div>
                       <div class="cycle-price-scenario-row">
                         <div class="metric"><span>启动 / 当前 / 成本价格</span><strong id="rebalanceCyclePriceSummary" class="cycle-price-summary">-</strong></div>
                         <div class="metric metric-scenario"><span id="rebalanceCycleScenarioLabel"></span><strong id="rebalanceCycleFullInventoryPrice">-</strong></div>
