@@ -635,10 +635,10 @@ public class RebalanceService {
         if (persistenceObserver != null) {
             persistenceObserver.run();
         }
-        fillNotifier.accept(fill, baseQty, false, () -> cycleMarketPnl(marketSnapshot), settings.quoteCoin());
+        fillNotifier.accept(fill, baseQty, false, () -> notificationCycleSummary(marketSnapshot), settings.quoteCoin());
     }
 
-    private BigDecimal cycleMarketPnl(MarketSnapshot marketSnapshot) {
+    private CurrentCycleSummary notificationCycleSummary(MarketSnapshot marketSnapshot) {
         if (cycleSummary == null) {
             return null;
         }
@@ -648,8 +648,7 @@ public class RebalanceService {
             if (market == null || market.markPrice() == null || market.markPrice().signum() <= 0) {
                 return null;
             }
-            CurrentCycleSummary cycle = cycleSummary.apply(market.markPrice());
-            return cycle == null ? null : cycle.markPricePnl();
+            return cycleSummary.apply(market.markPrice());
         } catch (RuntimeException e) {
             eventLogger.warn("rebalance.feishu.cycle-pnl.unavailable", Map.of("reason", e.getClass().getSimpleName()));
             return null;

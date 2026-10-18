@@ -4,6 +4,8 @@
 
 通知不显示订单号。成交时间以北京时间（`Asia/Shanghai`，UTC+8）显示，保留毫秒，不修改原始成交时间。通知中的“当前 Cycle 市场价盈亏”在本笔成交入账后、Cycle 结束前读取，使用与页面相同的 `markPricePnl`（累计净数量 × 市价 − 累计净成交金额 − 累计手续费，含已入账资金费），按报价币保留两位小数。行情或 Cycle 汇总不可用时显示“暂不可用”，不将缺失数据当作零盈亏。
 
+“当前 Cycle 成交次数”与盈亏共用同一次入账后汇总，显示“买入 X 次，卖出 Y 次”，沿用页面的 `buyCount` / `sellCount`。按去重后的逐笔成交记录计数，同一订单拆分成交分别计数，资金费不计入；汇总不可用时显示“暂不可用”。
+
 沿用 predict 的环境变量 `FEISHU_WEBHOOK_URL` 和可选 `FEISHU_WEBHOOK_SECRET`，支持同样的 HmacSHA256 时间戳签名。也可以用 `REBALANCE_FEISHU_WEBHOOK_URL` 和 `REBALANCE_FEISHU_WEBHOOK_SECRET` 配置独立机器人；独立 URL 存在时只使用独立 secret，不混用两组配置。如设置关键词，可使用“再平衡”。未配置时仅记录 `rebalance.feishu.disabled`。
 
 两个启动脚本会在启动 Java 前加载 `${HOME}/.config/btc-grid/rebalance-feishu.env`，可通过 `REBALANCE_FEISHU_ENV_FILE` 指定其他文件路径。文件使用 shell 环境变量赋值语法，权限设为 600；不要提交到 Git 或放入发布包。systemd 也可以通过 `EnvironmentFile=` 直接加载这两个变量。已有运行进程需要发布新代码并重启目标服务才能生效。
@@ -40,3 +42,15 @@
 - 8787 PID `1024`、JAR 及交易配置均保持不变。新格式已通过候选包验证，发布后尚未观察到真实大额成交触发。
 
 本次回滚仅恢复该备份目录的 `original.jar` 并重启 8789；保留现有飞书配置及持续更新的交易账本、运行状态。
+
+## 2026-10-18 买卖成交次数实盘发布
+
+8789 通知新增“当前 Cycle 成交次数：买入 X 次，卖出 Y 次”，与市场价盈亏共用同一份入账后汇总。
+
+- 仅替换 `RebalanceService.class` 与 `RebalanceFillNotifier.class`，原线上依赖 SHA256 均已核对；本地相关测试 37 项、线上依赖下候选包测试 92 项通过。
+- 发布 JAR SHA256：`90905ee118b9b95ac7b7f46988f501a5269b669b1c8a4a5ecedfd825ac02720a`。
+- 备份目录：`/opt/btc_grid_rebalance/backups/feishu-counts-20261018T145110Z`；线上及备份 SQLite 完整性均为 `ok`。
+- 北京时间 2026-10-18 22:51 独立复查：8789 PID `232019`，`NRestarts=0`，`GRID_ACTIVE`，私有流已订阅；原 Cycle 的 2522 笔成交（买入 1285 次、卖出 1237 次）、`0.420 BTC` 净数量均已恢复，两张挂单与交易所一致。
+- 8787 PID `1024`、JAR 和交易配置未变。发布后尚未观察到真实大额成交通知触发。
+
+回滚仅恢复本次备份的 `original.jar` 并重启 8789，保留持续更新的交易账本和运行状态。

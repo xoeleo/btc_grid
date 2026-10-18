@@ -1351,6 +1351,8 @@ class RebalanceServiceTest {
         assertEquals(1, observed.size(), "Notification must query the cycle after this fill is persisted");
         CurrentCycleSummary cycle = observed.get(0);
         assertEquals(1, cycle.fillCount());
+        assertEquals(0, cycle.buyCount());
+        assertEquals(1, cycle.sellCount());
         assertEquals(new BigDecimal("100"), cycle.marketPrice());
         assertEquals(0, execution.fillQty().subtract(execution.fee()).compareTo(cycle.markPricePnl()));
         assertEquals(time, store.currentCycleFills("RBAL:BTCUSDT").get(0).time());

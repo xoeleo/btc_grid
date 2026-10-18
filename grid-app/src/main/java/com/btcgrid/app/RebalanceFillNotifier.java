@@ -31,7 +31,7 @@ final class RebalanceFillNotifier {
     }
 
     synchronized void accept(FillEvent fill, BigDecimal baseQty, boolean historical,
-            Supplier<BigDecimal> cycleMarketPnl, String quoteCoin) {
+            Supplier<CurrentCycleSummary> cycleSummary, String quoteCoin) {
         if (fill == null || !RebalanceService.isRebalanceClientOrder(fill.clientOrderId())
                 || fill.fillQty() == null || fill.fillQty().signum() <= 0
                 || baseQty == null || baseQty.signum() <= 0) {
@@ -46,16 +46,20 @@ final class RebalanceFillNotifier {
         BigDecimal threshold = thresholds.computeIfAbsent(order, ignored -> baseQty.multiply(new BigDecimal("3")));
         BigDecimal total = quantities.merge(order, fill.fillQty(), BigDecimal::add);
         if (total.compareTo(threshold) >= 0 && notified.add(order) && !historical) {
-            BigDecimal pnl = cycleMarketPnl.get();
+            CurrentCycleSummary cycle = cycleSummary.get();
+            BigDecimal pnl = cycle == null ? null : cycle.markPricePnl();
             String pnlText = pnl == null ? "暂不可用"
                     : (pnl.signum() > 0 ? "+" : "") + pnl.setScale(2, RoundingMode.HALF_UP).toPlainString()
                             + " " + quoteCoin;
+            String countText = cycle == null ? "暂不可用"
+                    : "买入 " + cycle.buyCount() + " 次，卖出 " + cycle.sellCount() + " 次";
             sender.accept("再平衡大额成交\n交易对：" + fill.symbol()
                     + "\n方向：" + fill.side()
                     + "\n订单累计成交：" + total.toPlainString() + " " + FillEvent.baseCoin(fill.symbol())
                     + "\n通知阈值（单格 × 3）：" + threshold.toPlainString()
                     + "\n本笔成交价：" + fill.fillPrice()
                     + "\n当前 Cycle 市场价盈亏：" + pnlText
+                    + "\n当前 Cycle 成交次数：" + countText
                     + "\n成交时间（北京时间）：" + (fill.fillTime() == null ? "未知" : LOCAL_TIME.format(fill.fillTime())));
         }
     }
