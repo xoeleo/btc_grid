@@ -40,6 +40,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
 public class RebalanceService {
 
@@ -68,6 +69,7 @@ public class RebalanceService {
     private final Set<String> processedExecutionIds = ConcurrentHashMap.newKeySet();
     private Instant activeCycleStartedAt;
     private RebalanceProfitExit profitExit;
+    private Function<BigDecimal, CurrentCycleSummary> cycleSummary;
     private RebalanceWaterExit waterExit;
     private RebalanceMonitorStore monitorStore;
     private RebalanceMonitorRule activeMonitorRule;
@@ -158,6 +160,7 @@ public class RebalanceService {
             RebalanceProfitExit.Exchange exchange,
             java.util.function.Function<BigDecimal, CurrentCycleSummary> summary,
             Consumer<FillEvent> persistenceObserver) {
+        cycleSummary = summary;
         java.nio.file.Path controlPath = PathResolver.absolutePath(settings.stateFilePath() + ".profit-exit.json");
         profitExit = new RebalanceProfitExit(controlPath, settings, instrumentSpec, exchange,
                 tradeGateway, workingOrderRegistry, summary, fill -> {
@@ -555,10 +558,13 @@ public class RebalanceService {
         boolean cycleWasActive = rebalanceCycleActive();
         TradeSide cycleSide = cycleEntrySide();
         boolean fillObserved = false;
+        BigDecimal notificationBaseQty = cycleBaseGridQty(cycleSide == null ? fillEvent.side() : cycleSide);
+        MarketSnapshot fillMarketSnapshot = null;
         boolean waterAccountingOnly = waterExit != null && waterExit.frozen();
         if (waterExit != null && !waterAccountingOnly && !(profitExit != null && profitExit.frozen())) {
             try {
-                waterExit.beforeFill(fillEvent, marketDataGateway.latestSnapshot(settings.symbol()));
+                fillMarketSnapshot = marketDataGateway.latestSnapshot(settings.symbol());
+                waterExit.beforeFill(fillEvent, fillMarketSnapshot);
                 waterAccountingOnly = waterExit.frozen();
                 if (waterAccountingOnly) eventLogger.info("rebalance.water.fill-freeze", Map.of("executionId", fillEvent.executionId()));
             } catch (RuntimeException e) {
@@ -567,13 +573,10 @@ public class RebalanceService {
                 eventLogger.warn("rebalance.water.fill-check.failed", Map.of("message", String.valueOf(e.getMessage())));
             }
         }
-        fillNotifier.accept(fillEvent, cycleBaseGridQty(cycleSide == null ? fillEvent.side() : cycleSide), false);
         if ((isAccountingOnlyCorrectionOrder(fillEvent.clientOrderId())
                 || (profitExit != null && profitExit.frozen()) || waterAccountingOnly) && rebalanceLedger != null) {
             rebalanceLedger.applyFill(fillEvent);
-            if (afterLedgerApplied != null) {
-                afterLedgerApplied.run();
-            }
+            recordAndNotifyFill(fillEvent, notificationBaseQty, afterLedgerApplied, fillMarketSnapshot);
             fillObserved = true;
             eventLogger.info("rebalance.fill.correction-applied", Map.of(
                     "executionId", fillEvent.executionId(),
@@ -584,7 +587,8 @@ public class RebalanceService {
             ));
         } else if (rebalanceEngine != null && rebalanceLedger != null && rebalanceCommandExecutor != null) {
             MarketSnapshot marketSnapshot = marketDataGateway.latestSnapshot(settings.symbol());
-            List<StrategyCommand> commands = rebalanceEngine.onFill(fillEvent, marketSnapshot, afterLedgerApplied);
+            List<StrategyCommand> commands = rebalanceEngine.onFill(fillEvent, marketSnapshot,
+                    () -> recordAndNotifyFill(fillEvent, notificationBaseQty, afterLedgerApplied, marketSnapshot));
             fillObserved = true;
             List<String> failures = rebalanceCommandExecutor.execute(commands, rebalanceLedger.snapshot());
             if (!failures.isEmpty()) {
@@ -600,8 +604,8 @@ public class RebalanceService {
                 return true;
             }
         }
-        if (!fillObserved && afterLedgerApplied != null) {
-            afterLedgerApplied.run();
+        if (!fillObserved) {
+            recordAndNotifyFill(fillEvent, notificationBaseQty, afterLedgerApplied, fillMarketSnapshot);
         }
         boolean cycleStillActive = cycleWasActive || rebalanceCycleActive();
         save(new RebalanceState(
@@ -624,6 +628,32 @@ public class RebalanceService {
                 cycleStillActive ? "rebalance grid fill processed" : "rebalance order filled"
         ));
         return true;
+    }
+
+    private void recordAndNotifyFill(FillEvent fill, BigDecimal baseQty,
+            Runnable persistenceObserver, MarketSnapshot marketSnapshot) {
+        if (persistenceObserver != null) {
+            persistenceObserver.run();
+        }
+        fillNotifier.accept(fill, baseQty, false, () -> cycleMarketPnl(marketSnapshot), settings.quoteCoin());
+    }
+
+    private BigDecimal cycleMarketPnl(MarketSnapshot marketSnapshot) {
+        if (cycleSummary == null) {
+            return null;
+        }
+        try {
+            MarketSnapshot market = marketSnapshot == null
+                    ? marketDataGateway.latestSnapshot(settings.symbol()) : marketSnapshot;
+            if (market == null || market.markPrice() == null || market.markPrice().signum() <= 0) {
+                return null;
+            }
+            CurrentCycleSummary cycle = cycleSummary.apply(market.markPrice());
+            return cycle == null ? null : cycle.markPricePnl();
+        } catch (RuntimeException e) {
+            eventLogger.warn("rebalance.feishu.cycle-pnl.unavailable", Map.of("reason", e.getClass().getSimpleName()));
+            return null;
+        }
     }
 
     public synchronized boolean onOrderUpdate(String symbol, String clientOrderId, OrderStatus status, Instant updatedAt) {

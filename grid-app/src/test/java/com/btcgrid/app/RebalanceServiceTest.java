@@ -1318,6 +1318,47 @@ class RebalanceServiceTest {
     }
 
     @Test
+    void largeFillNotificationReadsCycleAfterPersistenceAtMarketPrice() throws Exception {
+        Path directory = Files.createTempDirectory("rebalance-notification");
+        SqliteFillStore store = new SqliteFillStore(directory.resolve("fills.sqlite"));
+        RecordingTradeGateway gateway = new RecordingTradeGateway();
+        RebalanceService service = autoShortCycleService(directory.resolve("state.json"), gateway,
+                new BigDecimal("100"));
+        List<CurrentCycleSummary> observed = new ArrayList<>();
+        service.configureProfitExit(new RebalanceProfitExit.Exchange() {
+            public List<WorkingOrder> openOrders() { throw new AssertionError("No exit expected"); }
+            public RebalanceProfitExit.Evidence evidence(String id) { throw new AssertionError(); }
+            public BigDecimal bestOppositePrice(TradeSide side) { throw new AssertionError(); }
+        }, price -> {
+            CurrentCycleSummary cycle = store.currentCycle("RBAL:BTCUSDT", Instant.now(), price);
+            if (cycle != null) observed.add(cycle);
+            return cycle;
+        }, ignored -> { throw new AssertionError("No exit fill expected"); });
+        service.onPoll();
+        OrderIntent initial = gateway.submitted.get(0);
+        Instant time = Instant.parse("2026-10-17T21:29:59.623Z");
+        FillEvent execution = new FillEvent("notification-fill", "BTCUSDT", initial.clientOrderId(),
+                TradeSide.SELL, initial.qty(), new BigDecimal("101"), time,
+                initial.qty().multiply(new BigDecimal("101")), new BigDecimal("0.01"), "USDT");
+        Runnable persist = () -> store.save(new FillRecord(time, "RBAL:BTCUSDT", "SELL", execution.fillQty(),
+                execution.fillPrice(), execution.fillValue(), execution.fee(), "USDT",
+                execution.fillQty().negate(), execution.fillValue().negate(), execution.fee(),
+                execution.fillQty().negate(), execution.fillPrice(), BigDecimal.ZERO,
+                BigDecimal.ZERO, BigDecimal.ZERO, execution.clientOrderId(), execution.executionId()));
+
+        service.onExecution(execution, "test", persist);
+
+        assertEquals(1, observed.size(), "Notification must query the cycle after this fill is persisted");
+        CurrentCycleSummary cycle = observed.get(0);
+        assertEquals(1, cycle.fillCount());
+        assertEquals(new BigDecimal("100"), cycle.marketPrice());
+        assertEquals(0, execution.fillQty().subtract(execution.fee()).compareTo(cycle.markPricePnl()));
+        assertEquals(time, store.currentCycleFills("RBAL:BTCUSDT").get(0).time());
+        service.onExecution(execution, "test", persist);
+        assertEquals(1, observed.size(), "Duplicate execution must not trigger another notification query");
+    }
+
+    @Test
     void waterExitCompletesCycleAndEnabledBoundMonitorCanStartNextCycle() throws Exception {
         RebalanceWaterExitTest.Fixture f = new RebalanceWaterExitTest.Fixture();
         f.price = new BigDecimal("105000");
