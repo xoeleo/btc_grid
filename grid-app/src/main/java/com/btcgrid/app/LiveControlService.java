@@ -18,7 +18,9 @@ import com.btcgrid.common.indicator.FourHourIndicatorCalculator;
 import com.btcgrid.common.model.InstrumentSpec;
 import com.btcgrid.common.model.GridState;
 import com.btcgrid.common.model.MarketSnapshot;
+import com.btcgrid.common.model.OrderIntent;
 import com.btcgrid.common.model.OrderStatus;
+import com.btcgrid.common.model.OrderType;
 import com.btcgrid.common.model.ProductCategory;
 import com.btcgrid.common.model.TradeSide;
 import com.btcgrid.common.model.WorkingOrder;
@@ -26,6 +28,7 @@ import com.btcgrid.ledger.model.StrategyLedgerSnapshot;
 import com.btcgrid.ledger.service.InMemoryStrategyLedger;
 import com.btcgrid.ledger.service.StrategyLedger;
 import com.btcgrid.strategy.model.StrategyRuntimeState;
+import com.btcgrid.strategy.model.QuantityRoundingState;
 import com.btcgrid.strategy.service.ClientOrderIdFactory;
 import com.btcgrid.strategy.service.GridOrderPlanner;
 import com.btcgrid.strategy.service.GridStrategyEngine;
@@ -34,11 +37,14 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.math.BigDecimal;
 import java.math.MathContext;
-import java.nio.file.Files;
-import java.nio.file.Path;
+import java.math.RoundingMode;
 import java.time.Duration;
 import java.time.Instant;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -51,6 +57,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class LiveControlService {
 
@@ -78,6 +85,10 @@ public class LiveControlService {
         return thread;
     });
     private final AtomicReference<FlattenStopStatus> flattenStopStatus = new AtomicReference<>(FlattenStopStatus.idle());
+    private final AtomicBoolean flattenStopLocked = new AtomicBoolean(false);
+    private final Path flattenStopLockPath;
+    private final Path solContractBollMonitorStatusPath;
+    private final RebalanceMonitorStore rebalanceMonitorStore;
     private volatile GridLiveRunner activeRunner;
     private volatile RebalanceLiveRunner activeRebalanceRunner;
     private volatile GridStrategyConfig lastConfig;
@@ -110,7 +121,20 @@ public class LiveControlService {
         this.statusStore = statusStore;
         this.fallbackWorkingOrderRegistry = fallbackWorkingOrderRegistry;
         this.fillStore = fillStore;
+        Path runtimeStatePath = PathResolver.absolutePath(baseProperties.runtimeSettings().stateFilePath());
+        this.flattenStopLockPath = Path.of(runtimeStatePath + ".flatten-stop.lock");
+        this.solContractBollMonitorStatusPath = runtimeStatePath.resolveSibling("sol-contract-boll-monitor.json");
+        this.rebalanceMonitorStore = new RebalanceMonitorStore(
+                PathResolver.absolutePath(baseProperties.rebalanceSettings().stateFilePath()));
+        this.flattenStopLocked.set(Files.exists(flattenStopLockPath));
         this.lastConfig = baseProperties.strategyConfig();
+        finalizeFlatOpenCycleIfNeeded();
+        if (!rebalanceMonitorStore.configured()) {
+            RebalanceSettings legacySettings = currentRebalanceSettings();
+            RebalanceState legacyState = new FileRebalanceStateStore(
+                    PathResolver.absolutePath(legacySettings.stateFilePath())).load().orElse(null);
+            rebalanceMonitorStore.importLegacyLongBelow(legacySettings, legacyState);
+        }
         RebalanceSettings rebalanceSettings = currentRebalanceSettings();
         if (rebalanceSettings.enabled()) {
             startRebalanceRunner(rebalanceSettings);
@@ -118,6 +142,9 @@ public class LiveControlService {
     }
 
     public synchronized Map<String, Object> start(StartRequest request) {
+        if (flattenStopLocked.get()) {
+            return Map.of("ok", false, "message", "清仓停止锁已启用，请先在页面手动解除锁定");
+        }
         if (activeRunner != null && activeRunner.isRunning()) {
             return Map.of("ok", false, "message", "strategy already running");
         }
@@ -371,14 +398,26 @@ public class LiveControlService {
 
     public synchronized Map<String, Object> flattenAndStop() {
         GridLiveRunner runner = activeRunner;
-        if (runner == null || !runner.isRunning()) {
-            return Map.of("ok", false, "message", "strategy not running");
-        }
         FlattenStopStatus current = flattenStopStatus.get();
         if (current.running()) {
             return Map.of("ok", true, "message", "平仓并停止正在执行", "flattenStop", current);
         }
 
+        if (runner == null || !runner.isRunning()) {
+            if (!flattenStopLocked.get()) {
+                return Map.of("ok", false, "message", "strategy not running");
+            }
+            FlattenStopStatus submitted = FlattenStopStatus.running(Instant.now(), "按真实钱包余额重试清仓");
+            flattenStopStatus.set(submitted);
+            flattenStopExecutor.submit(() -> runDetachedSpotFlatten(lastConfig, submitted.startedAt()));
+            return Map.of("ok", true, "message", "重试清仓已提交，后台执行中", "flattenStop", submitted);
+        }
+
+        try {
+            persistFlattenStopLock();
+        } catch (RuntimeException e) {
+            return Map.of("ok", false, "message", e.getMessage());
+        }
         FlattenStopStatus submitted = FlattenStopStatus.running(Instant.now(), "撤单和平仓任务已提交");
         flattenStopStatus.set(submitted);
         flattenStopExecutor.submit(() -> runFlattenAndStop(runner, submitted.startedAt()));
@@ -386,6 +425,9 @@ public class LiveControlService {
     }
 
     public synchronized Map<String, Object> resume() {
+        if (flattenStopLocked.get()) {
+            return Map.of("ok", false, "message", "清仓停止锁已启用，请先在页面手动解除锁定");
+        }
         if (activeRunner != null && activeRunner.isRunning()) {
             return Map.of("ok", false, "message", "strategy already running");
         }
@@ -526,9 +568,33 @@ public class LiveControlService {
                 "rebalanceRunning", activeRebalanceRunner != null && activeRebalanceRunner.isRunning(),
                 "canResume", (runner == null || !runner.isRunning()) && canResume(snapshot),
                 "stopAfterCycle", runner != null && runner.isStopAfterCycleRequested(),
+                "flattenStopLocked", flattenStopLocked.get(),
                 "flattenStop", flattenStopStatus.get(),
+                "profitSizingPolicy", Map.of(
+                        "lossAddTriggerRate", gridLossAddTriggerRate()
+                ),
                 "config", lastConfig
         );
+    }
+
+    @SuppressWarnings("unchecked")
+    public Map<String, Object> solContractBollMonitorState() {
+        if (!Files.exists(solContractBollMonitorStatusPath)) {
+            return Map.of(
+                    "enabled", false,
+                    "state", "NOT_CONFIGURED",
+                    "message", "15分钟布林自动监控尚未运行"
+            );
+        }
+        try {
+            return OBJECT_MAPPER.readValue(Files.readString(solContractBollMonitorStatusPath), Map.class);
+        } catch (IOException e) {
+            return Map.of(
+                    "enabled", false,
+                    "state", "ERROR",
+                    "message", "读取自动监控状态失败: " + e.getMessage()
+            );
+        }
     }
 
     private void recordSpotInventoryDepletedCycleEnd(
@@ -553,6 +619,10 @@ public class LiveControlService {
     }
 
     private void recordSpotCycleEnd(String symbol, String reason) {
+        recordSpotCycleEnd(symbol, reason, Instant.now());
+    }
+
+    private void recordSpotCycleEnd(String symbol, String reason, Instant endTime) {
         if (symbol == null || symbol.isBlank()) {
             return;
         }
@@ -560,7 +630,7 @@ public class LiveControlService {
         if (fills.isEmpty()) {
             return;
         }
-        Instant now = Instant.now();
+        Instant now = endTime == null ? Instant.now() : endTime;
         FillRecord first = fills.get(0);
         FillRecord last = fills.get(fills.size() - 1);
         BigDecimal price = last.price() == null ? BigDecimal.ZERO : last.price();
@@ -609,59 +679,148 @@ public class LiveControlService {
         return fillStore.currentCycleFills(rebalanceLedgerSymbol(currentRebalanceSettings().symbol()));
     }
 
-    public PageResult<FillRecord> rebalanceFillsPage(int limit, int offset) {
+    public CurrentCycleFillPage rebalanceFillsPage(int limit, int offset) {
+        return rebalanceFillsPage(limit, offset, "");
+    }
+
+    public CurrentCycleFillPage rebalanceFillsPage(int limit, int offset, String price) {
         int normalizedLimit = normalizePageLimit(limit);
         int normalizedOffset = Math.max(0, offset);
-        List<FillRecord> records = new ArrayList<>(fillStore.currentCycleFills(
-                rebalanceLedgerSymbol(currentRebalanceSettings().symbol())
-        ));
-        java.util.Collections.reverse(records);
-        if (normalizedOffset >= records.size()) {
-            return new PageResult<>(List.of(), normalizedLimit, normalizedOffset, false);
-        }
-        int endExclusive = Math.min(records.size(), normalizedOffset + normalizedLimit + 1);
-        List<FillRecord> page = records.subList(normalizedOffset, endExclusive);
-        boolean hasMore = page.size() > normalizedLimit;
-        return new PageResult<>(
-                hasMore ? page.subList(0, normalizedLimit) : page,
+        RebalancePriceBucket priceBucket = rebalancePriceBucket(price);
+        return fillStore.currentCycleFillsPage(
+                rebalanceLedgerSymbol(currentRebalanceSettings().symbol()),
                 normalizedLimit,
                 normalizedOffset,
-                hasMore
+                priceBucket == null ? null : priceBucket.minInclusive(),
+                priceBucket == null ? null : priceBucket.maxExclusive(),
+                true
         );
     }
 
-    public List<FillRecord> rebalanceFundingFees() {
-        List<FillRecord> records = new ArrayList<>(fillStore.currentCycleFills(
-                rebalanceLedgerSymbol(currentRebalanceSettings().symbol())
-        ).stream()
-                .filter(fill -> fill != null && "FUNDING_FEE".equals(fill.side()))
-                .toList());
-        java.util.Collections.reverse(records);
-        return records;
+    static RebalancePriceBucket rebalancePriceBucket(String price) {
+        if (price == null || price.isBlank()) {
+            return null;
+        }
+        try {
+            BigDecimal value = new BigDecimal(price.trim());
+            BigDecimal minInclusive = value
+                    .divide(BigDecimal.TEN, 0, java.math.RoundingMode.FLOOR)
+                    .multiply(BigDecimal.TEN);
+            return new RebalancePriceBucket(minInclusive, minInclusive.add(BigDecimal.TEN));
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
+    record RebalancePriceBucket(BigDecimal minInclusive, BigDecimal maxExclusive) {
+    }
+
+    private static BigDecimal parsePriceFilter(String price) {
+        if (price == null || price.isBlank()) {
+            return null;
+        }
+        try {
+            return new BigDecimal(price.trim());
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
+    public FundingFeePage rebalanceFundingFeesPage(int limit, int offset) {
+        return fillStore.currentCycleFundingFeesPage(
+                rebalanceLedgerSymbol(currentRebalanceSettings().symbol()),
+                normalizePageLimit(limit),
+                Math.max(0, offset)
+        );
     }
 
     public List<Map<String, Object>> rebalanceCycles() {
         return rebalanceCyclesPage(200, 0).items();
     }
 
-    public PageResult<Map<String, Object>> rebalanceCyclesPage(int limit, int offset) {
+    public RebalanceCyclesPage rebalanceCyclesPage(int limit, int offset) {
         Map<String, String> reasons = rebalanceCycleEndReasons();
         int normalizedLimit = normalizePageLimit(limit);
         int normalizedOffset = Math.max(0, offset);
-        List<Map<String, Object>> rows = fillStore.recentCycles(
-                        rebalanceLedgerSymbol(currentRebalanceSettings().symbol()),
-                        normalizedLimit + 1,
-                        normalizedOffset
-                ).stream()
+        List<FillRecord> cycleEnds = fillStore.recentCycles(
+                rebalanceLedgerSymbol(currentRebalanceSettings().symbol()),
+                Integer.MAX_VALUE,
+                0
+        );
+        List<Map<String, Object>> rows = cycleEnds.stream()
+                .skip(normalizedOffset)
+                .limit((long) normalizedLimit + 1)
                 .map(cycleEnd -> rebalanceCycleRow(cycleEnd, reasons.get(cycleEnd.executionId())))
                 .toList();
         boolean hasMore = rows.size() > normalizedLimit;
-        return new PageResult<>(
+        return new RebalanceCyclesPage(
                 hasMore ? rows.subList(0, normalizedLimit) : rows,
                 normalizedLimit,
                 normalizedOffset,
-                hasMore
+                hasMore,
+                cycleEnds.size(),
+                rebalanceCycleSummary(cycleEnds)
         );
+    }
+
+    private Map<String, Object> rebalanceCycleSummary(List<FillRecord> cycleEnds) {
+        long buyCount = 0;
+        long sellCount = 0;
+        long durationSeconds = 0;
+        BigDecimal totalPnl = BigDecimal.ZERO;
+        String symbol = "";
+        for (FillRecord cycleEnd : cycleEnds) {
+            if (symbol.isBlank() && cycleEnd.symbol() != null) {
+                symbol = cycleEnd.symbol();
+            }
+            totalPnl = totalPnl.add(
+                    cycleEnd.totalPnlAtFill() == null ? BigDecimal.ZERO : cycleEnd.totalPnlAtFill(),
+                    MATH_CONTEXT
+            );
+            Map<String, Object> metadata = cycleMetadata(cycleEnd);
+            if (!metadata.containsKey("buyCount")
+                    || !metadata.containsKey("sellCount")
+                    || !metadata.containsKey("durationSeconds")) {
+                metadata = rebalanceCycleRow(cycleEnd, null);
+            }
+            buyCount += longValue(metadata.get("buyCount"));
+            sellCount += longValue(metadata.get("sellCount"));
+            durationSeconds += longValue(metadata.get("durationSeconds"));
+        }
+        Map<String, Object> summary = new LinkedHashMap<>();
+        summary.put("symbol", symbol);
+        summary.put("cycleCount", cycleEnds.size());
+        summary.put("buyCount", buyCount);
+        summary.put("sellCount", sellCount);
+        summary.put("durationSeconds", durationSeconds);
+        summary.put("totalPnl", totalPnl);
+        return summary;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> cycleMetadata(FillRecord cycleEnd) {
+        if (cycleEnd == null || cycleEnd.configJson() == null || cycleEnd.configJson().isBlank()) {
+            return Map.of();
+        }
+        try {
+            return OBJECT_MAPPER.readValue(cycleEnd.configJson(), Map.class);
+        } catch (Exception ignored) {
+            return Map.of();
+        }
+    }
+
+    private static long longValue(Object value) {
+        if (value instanceof Number number) {
+            return number.longValue();
+        }
+        if (value == null) {
+            return 0;
+        }
+        try {
+            return new BigDecimal(String.valueOf(value)).longValue();
+        } catch (NumberFormatException ignored) {
+            return 0;
+        }
     }
 
     public List<FillRecord> rebalanceCycleFills(String cycleExecutionId) {
@@ -762,7 +921,20 @@ public class LiveControlService {
         return new GridOrderPlanner(
                 new ClientOrderIdFactory(),
                 new BigDecimal(baseProperties.rawProperties().getProperty("grid.profitable-reduce-side-multiplier", "1.10").trim()),
-                (market, ledger, orderPrice) -> currentCycleMarketPnl(market, orderPrice).signum() > 0
+                (market, ledger, orderPrice, orderQty) -> GridApplication.afterEstimatedOrderFee(
+                        currentCycleMarketPnl(market, orderPrice),
+                        orderPrice,
+                        orderQty,
+                        profitSizingEstimatedFeeRate()
+                ).signum() > 0,
+                (market, ledger, orderPrice, orderQty) -> GridApplication.currentCycleLossRateAfterEstimatedFee(
+                        fillStore,
+                        market,
+                        orderPrice,
+                        orderQty,
+                        profitSizingEstimatedFeeRate()
+                ).compareTo(gridLossAddTriggerRate().negate()) < 0,
+                fillStore::profitSizingState
         );
     }
 
@@ -778,8 +950,40 @@ public class LiveControlService {
     public Map<String, Object> rebalanceConfig() {
         return Map.of(
                 "ok", true,
-                "config", currentRebalanceConfig()
+                "config", currentRebalanceConfig(),
+                "profitSizingPolicy", Map.of(
+                        "lossAddTriggerRate", rebalanceLossAddTriggerRate(),
+                        "permanentReduceTargetQty", rebalancePermanentReduceTarget(
+                                currentRebalanceSettings().symbol()
+                        ),
+                        "permanentReduceCycleStartMillis", baseProperties.rawProperties()
+                                .getProperty(
+                                        "rebalance.permanent-profit-reduce-cycle-start-millis",
+                                        "0"
+                                )
+                )
         );
+    }
+
+    public Map<String, Object> rebalanceMonitors() {
+        Object active = rebalanceMonitorStore.activeCurrentRule().<Object>map(rule -> rule).orElseGet(Map::of);
+        Object activeSnapshot = rebalanceMonitorStore.active().<Object>map(rule -> rule).orElseGet(Map::of);
+        return Map.of("ok", true, "configured", rebalanceMonitorStore.configured(),
+                "rules", rebalanceMonitorStore.rules(), "active", active,
+                "activeSnapshot", activeSnapshot);
+    }
+
+    public synchronized Map<String, Object> saveRebalanceMonitors(List<RebalanceMonitorRule> requested) {
+        try {
+            List<RebalanceMonitorRule> saved = rebalanceMonitorStore.save(requested);
+            if (activeRebalanceRunner == null || !activeRebalanceRunner.isRunning()) {
+                startRebalanceRunner(currentRebalanceSettings());
+            }
+            return Map.of("ok", true, "rules", saved,
+                    "message", "监控配置已保存；按列表顺序匹配，同一时间只运行一个 Cycle");
+        } catch (RuntimeException e) {
+            return Map.of("ok", false, "message", e.getMessage() == null ? "保存失败" : e.getMessage());
+        }
     }
 
     public Map<String, Object> rebalanceState() {
@@ -814,7 +1018,7 @@ public class LiveControlService {
                     && !"PREVIEW".equals(savedState.status())
                     && !"STOPPED_BY_USER".equals(savedState.status());
             boolean stoppedByUser = savedState != null && "STOPPED_BY_USER".equals(savedState.status());
-            BigDecimal targetRatio = runningState && savedState.targetRatio() != null && savedState.targetRatio().signum() > 0
+            BigDecimal targetRatio = runningState && savedState.targetRatio() != null
                     ? savedState.targetRatio()
                     : rebalanceTargetRatio(settings, marketSnapshot.lastPrice());
             RebalanceState state = new RebalanceState(
@@ -910,7 +1114,7 @@ public class LiveControlService {
     private RebalanceSettings currentRebalanceSettings() {
         RebalanceConfigRequest config = currentRebalanceConfig();
         return new RebalanceSettings(
-                config.enabled(),
+                config.enabled() || rebalanceMonitorStore.configured(),
                 RebalanceMode.fromConfig(config.mode()),
                 new BigDecimal(config.autoMinTotalBtc()),
                 new BigDecimal(config.autoBaseGridQty()),
@@ -949,7 +1153,7 @@ public class LiveControlService {
                 baseProperties.strategyConfig().bollLength4h(),
                 baseProperties.strategyConfig().bollStdDevMultiplier()
         );
-        return new RebalanceService(
+        RebalanceService service = new RebalanceService(
                 settings,
                 rebalanceMarketDataGateway,
                 new BybitSdkAccountGateway(clientFactory),
@@ -958,8 +1162,137 @@ public class LiveControlService {
                 new FileRebalanceStateStore(PathResolver.absolutePath(settings.stateFilePath())),
                 eventLogger,
                 alertService,
-                reason -> recordRebalanceCycleEnd(settings.symbol(), reason)
+                reason -> recordRebalanceCycleEnd(settings.symbol(), reason),
+                rebalanceGridOrderPlanner(settings)
         );
+        service.configureMonitorStore(rebalanceMonitorStore);
+        service.configureProfitExit(
+                new RebalanceExitExchange(clientFactory, settings.symbol()),
+                price -> fillStore.currentCycle(rebalanceLedgerSymbol(settings.symbol()), Instant.now(), price),
+                this::recordRebalanceFill
+        );
+        return service;
+    }
+
+    private GridOrderPlanner rebalanceGridOrderPlanner(RebalanceSettings settings) {
+        if (settings.category() == ProductCategory.LINEAR) {
+            return new GridOrderPlanner(new ClientOrderIdFactory("RBAL"), BigDecimal.ONE,
+                    (market, ledger, orderPrice, orderQty) -> false,
+                    (market, ledger, orderPrice, orderQty) -> false,
+                    symbol -> com.btcgrid.strategy.model.ProfitSizingState.empty(),
+                    symbol -> fillStore.quantityRoundingState(rebalanceLedgerSymbol(symbol)));
+        }
+        return new GridOrderPlanner(
+                new ClientOrderIdFactory("RBAL"),
+                new BigDecimal(baseProperties.rawProperties()
+                        .getProperty("grid.profitable-reduce-side-multiplier", "1.10")
+                        .trim()),
+                (market, ledger, orderPrice, orderQty) -> GridApplication.afterEstimatedOrderFee(
+                        rebalanceCycleMarketPnl(settings.symbol(), market, orderPrice),
+                        orderPrice,
+                        orderQty,
+                        profitSizingEstimatedFeeRate()
+                ).signum() > 0,
+                (market, ledger, orderPrice, orderQty) -> rebalanceCycleLossRateAfterEstimatedFee(
+                        settings.symbol(),
+                        market,
+                        orderPrice,
+                        orderQty
+                ).compareTo(rebalanceLossAddTriggerRate().negate()) < 0,
+                symbol -> fillStore.profitSizingState(rebalanceLedgerSymbol(symbol))
+                        .withPermanentReduceTarget(rebalancePermanentReduceTarget(settings.symbol())),
+                symbol -> fillStore.quantityRoundingState(rebalanceLedgerSymbol(symbol))
+        );
+    }
+
+    private BigDecimal rebalanceCycleMarketPnl(
+            String symbol,
+            com.btcgrid.common.model.MarketSnapshot marketSnapshot,
+            BigDecimal price
+    ) {
+        if (marketSnapshot == null) {
+            return BigDecimal.ZERO;
+        }
+        BigDecimal pnlPrice = price == null || price.signum() <= 0 ? marketSnapshot.markPrice() : price;
+        CurrentCycleSummary cycle = fillStore.currentCycle(
+                rebalanceLedgerSymbol(symbol),
+                Instant.now(),
+                pnlPrice
+        );
+        return cycle == null || cycle.markPricePnl() == null ? BigDecimal.ZERO : cycle.markPricePnl();
+    }
+
+    private BigDecimal rebalanceCycleLossRateAfterEstimatedFee(
+            String symbol,
+            com.btcgrid.common.model.MarketSnapshot marketSnapshot,
+            BigDecimal price,
+            BigDecimal orderQty
+    ) {
+        if (marketSnapshot == null) {
+            return BigDecimal.ZERO;
+        }
+        BigDecimal pnlPrice = price == null || price.signum() <= 0 ? marketSnapshot.markPrice() : price;
+        CurrentCycleSummary cycle = fillStore.currentCycle(
+                rebalanceLedgerSymbol(symbol),
+                Instant.now(),
+                pnlPrice
+        );
+        if (cycle == null || cycle.markPricePnl() == null
+                || cycle.cumulativeValue() == null || cycle.cumulativeValue().signum() == 0) {
+            return BigDecimal.ZERO;
+        }
+        BigDecimal pnlAfterFee = GridApplication.afterEstimatedOrderFee(
+                cycle.markPricePnl(),
+                pnlPrice,
+                orderQty,
+                profitSizingEstimatedFeeRate()
+        );
+        return pnlAfterFee.divide(cycle.cumulativeValue().abs(), 8, RoundingMode.HALF_UP);
+    }
+
+    private BigDecimal rebalanceLossAddTriggerRate() {
+        return new BigDecimal(baseProperties.rawProperties()
+                .getProperty("rebalance.loss-add-trigger-rate", "0.01")
+                .trim()).max(BigDecimal.ZERO);
+    }
+
+    private BigDecimal gridLossAddTriggerRate() {
+        return new BigDecimal(baseProperties.rawProperties()
+                .getProperty("grid.loss-add-trigger-rate", "0.01")
+                .trim()).max(BigDecimal.ZERO);
+    }
+
+    private BigDecimal rebalancePermanentReduceTarget(String symbol) {
+        BigDecimal target = new BigDecimal(baseProperties.rawProperties()
+                .getProperty("rebalance.permanent-profit-reduce-target-qty", "0")
+                .trim()).max(BigDecimal.ZERO);
+        if (target.signum() == 0) {
+            return BigDecimal.ZERO;
+        }
+        long configuredStartMillis;
+        try {
+            configuredStartMillis = Long.parseLong(baseProperties.rawProperties()
+                    .getProperty("rebalance.permanent-profit-reduce-cycle-start-millis", "0")
+                    .trim());
+        } catch (RuntimeException e) {
+            return BigDecimal.ZERO;
+        }
+        CurrentCycleSummary cycle = fillStore.currentCycle(
+                rebalanceLedgerSymbol(symbol),
+                Instant.now(),
+                BigDecimal.ZERO
+        );
+        if (cycle == null || cycle.startedAt() == null
+                || cycle.startedAt().toEpochMilli() != configuredStartMillis) {
+            return BigDecimal.ZERO;
+        }
+        return target;
+    }
+
+    private BigDecimal profitSizingEstimatedFeeRate() {
+        return new BigDecimal(baseProperties.rawProperties()
+                .getProperty("grid.profit-sizing-estimated-fee-rate", "0.0002")
+                .trim());
     }
 
     private List<RebalanceBand> parseRebalanceBands(String value) {
@@ -982,8 +1315,14 @@ public class LiveControlService {
                 : request).normalized();
         RebalanceConfigRequest existing = currentRebalanceConfig();
         RebalanceState runningState = currentRebalanceState();
-        if (!RebalanceMode.fromConfig(existing.mode()).equals(RebalanceMode.fromConfig(normalized.mode()))
-                && isActiveRebalanceCycleStatus(runningState.status())) {
+        RebalanceMode existingMode = RebalanceMode.fromConfig(existing.mode());
+        RebalanceMode normalizedMode = RebalanceMode.fromConfig(normalized.mode());
+        boolean safeLongToShortHandoff = existingMode == RebalanceMode.AUTO_CYCLE
+                && normalizedMode == RebalanceMode.AUTO_SHORT_CYCLE
+                && runningState.activeSide() == TradeSide.BUY;
+        if (!existingMode.equals(normalizedMode)
+                && isActiveRebalanceCycleStatus(runningState.status())
+                && !safeLongToShortHandoff) {
             return Map.of(
                     "ok", false,
                     "message", "当前再平衡 Cycle 正在运行，请等待本轮结束后再切换模式"
@@ -1013,6 +1352,24 @@ public class LiveControlService {
             properties.setProperty("rebalance.band-hysteresis-ratio", normalized.bandHysteresisRatio());
             properties.setProperty("rebalance.order-ttl-minutes", normalized.orderTtlMinutes());
             properties.setProperty("rebalance.confirmation-samples", normalized.confirmationSamples());
+            properties.setProperty(
+                    "rebalance.loss-add-trigger-rate",
+                    baseProperties.rawProperties().getProperty("rebalance.loss-add-trigger-rate", "0.01")
+            );
+            properties.setProperty(
+                    "rebalance.permanent-profit-reduce-target-qty",
+                    baseProperties.rawProperties().getProperty(
+                            "rebalance.permanent-profit-reduce-target-qty",
+                            "0"
+                    )
+            );
+            properties.setProperty(
+                    "rebalance.permanent-profit-reduce-cycle-start-millis",
+                    baseProperties.rawProperties().getProperty(
+                            "rebalance.permanent-profit-reduce-cycle-start-millis",
+                            "0"
+                    )
+            );
             Path path = PathResolver.absolutePath(baseProperties.rebalanceSettings().configFilePath());
             Files.createDirectories(path.getParent());
             try (java.io.OutputStream outputStream = Files.newOutputStream(path)) {
@@ -1039,13 +1396,37 @@ public class LiveControlService {
             return Map.of("ok", false, "message", "请先勾选并保存启用再平衡");
         }
         startRebalanceRunner(settings);
-        return Map.of("ok", true, "message", "再平衡监控已启动");
+        boolean resumed = activeRebalanceRunner != null && activeRebalanceRunner.resumeAfterManualCycleExit();
+        return Map.of("ok", true, "message", resumed ? "手动平仓暂停已解除，再平衡监控已启动" : "再平衡监控已启动");
     }
 
     public synchronized Map<String, Object> stopRebalance() {
         stopRebalanceRunner();
         markRebalanceStoppedByUser();
         return Map.of("ok", true, "message", "再平衡监控已停止，状态已标记为手动停止");
+    }
+
+    public synchronized Map<String, Object> closeRebalanceCycle() {
+        if (activeRebalanceRunner == null || !activeRebalanceRunner.isRunning())
+            return Map.of("ok", false, "message", "再平衡监控未运行，无法平仓当前 Cycle");
+        try {
+            activeRebalanceRunner.requestManualCycleExit();
+            return Map.of("ok", true, "message", "已锁定当前 Cycle；正在撤单，核对成交后按盘口最近价限价平仓");
+        } catch (IllegalStateException e) {
+            return Map.of("ok", false, "message", e.getMessage());
+        }
+    }
+
+    public synchronized Map<String, Object> reduceRebalanceCycle() {
+        if (activeRebalanceRunner == null || !activeRebalanceRunner.isRunning())
+            return Map.of("ok", false, "message", "再平衡监控未运行，无法减仓当前 Cycle");
+        try {
+            BigDecimal qty = activeRebalanceRunner.requestManualReduction();
+            return Map.of("ok", true, "message", "已锁定手动减仓 " + qty.toPlainString()
+                    + " BTC；撤单并核对成交后按盘口限价下单，成交后继续当前 Cycle");
+        } catch (IllegalStateException e) {
+            return Map.of("ok", false, "message", e.getMessage());
+        }
     }
 
     private void markRebalanceStoppedByUser() {
@@ -1099,9 +1480,34 @@ public class LiveControlService {
         RebalanceState persistedState = new FileRebalanceStateStore(PathResolver.absolutePath(settings.stateFilePath()))
                 .load()
                 .orElseGet(() -> RebalanceState.initial(settings.enabled(), settings.symbol()));
-        if (isActiveRebalanceCycleStatus(persistedState.status()) || !activeOpenOrders.isEmpty()) {
+        List<FillRecord> currentCycleFills = latestRebalanceCycleFills(settings.symbol());
+        boolean openCycleInLedger = !currentCycleFills.isEmpty()
+                && currentCycleFills.get(currentCycleFills.size() - 1).cumulativeQty() != null
+                && currentCycleFills.get(currentCycleFills.size() - 1).cumulativeQty().signum() != 0;
+        boolean recoveryExpected = isActiveRebalanceCycleStatus(persistedState.status())
+                || !activeOpenOrders.isEmpty()
+                || openCycleInLedger;
+        if (recoveryExpected && currentCycleFills.isEmpty()) {
+            eventLogger.error("rebalance.recovery.blocked", Map.of(
+                    "symbol", settings.symbol(),
+                    "persistedStatus", persistedState.status(),
+                    "openOrders", activeOpenOrders.size(),
+                    "reason", "active cycle evidence exists but no complete cycle fills were recovered"
+            ));
+            alertService.warning(
+                    "REBALANCE_RECOVERY_BLOCKED",
+                    "Rebalance recovery blocked to prevent a duplicate initial order",
+                    Map.of(
+                            "symbol", settings.symbol(),
+                            "persistedStatus", persistedState.status(),
+                            "openOrders", activeOpenOrders.size()
+                    )
+            );
+            return;
+        }
+        if (recoveryExpected) {
             rebalanceService.restoreActiveCycle(
-                    latestRebalanceCycleFills(settings.symbol()),
+                    currentCycleFills,
                     activeOpenOrders
             );
         }
@@ -1172,6 +1578,11 @@ public class LiveControlService {
                     "startedAt", startedAt.toString()
             ));
             runner.flattenAndStop();
+            synchronized (this) {
+                if (activeRunner == runner) {
+                    activeRunner = null;
+                }
+            }
             FlattenStopStatus completed = FlattenStopStatus.completed(startedAt, Instant.now(), "平仓并停止已完成");
             flattenStopStatus.set(completed);
             eventLogger.info("flatten.stop.completed", Map.of(
@@ -1180,6 +1591,11 @@ public class LiveControlService {
                     "finishedAt", completed.finishedAt().toString()
             ));
         } catch (RuntimeException e) {
+            synchronized (this) {
+                if (activeRunner == runner) {
+                    activeRunner = null;
+                }
+            }
             FlattenStopStatus failed = FlattenStopStatus.failed(startedAt, Instant.now(), e.getMessage());
             flattenStopStatus.set(failed);
             eventLogger.error("flatten.stop.failed", Map.of(
@@ -1193,8 +1609,315 @@ public class LiveControlService {
         }
     }
 
+    private void runDetachedSpotFlatten(GridStrategyConfig config, Instant startedAt) {
+        try {
+            if (config.category() != ProductCategory.SPOT || !config.entryDirection().isSpotLongOnly()) {
+                throw new IllegalStateException("停止状态重试清仓目前仅支持现货多头模式");
+            }
+            String symbol = config.symbol();
+            eventLogger.info("flatten.stop.retry.started", Map.of(
+                    "symbol", symbol,
+                    "startedAt", startedAt.toString()
+            ));
+
+            BybitSdkTradeGateway tradeGateway = new BybitSdkTradeGateway(clientFactory, config.category());
+            List<String> cancelFailures = new ArrayList<>();
+            new BybitSdkOrderQueryGateway(clientFactory, config.category()).fetchOpenOrders(symbol).stream()
+                    .filter(order -> order.clientOrderId() != null && order.clientOrderId().startsWith("GRID_"))
+                    .forEach(order -> {
+                        try {
+                            tradeGateway.cancel(symbol, order.clientOrderId());
+                            eventLogger.info("command.cancel", Map.of(
+                                    "commandType", "CANCEL",
+                                    "symbol", symbol,
+                                    "clientOrderId", order.clientOrderId(),
+                                    "reason", "manual-flatten-retry"
+                            ));
+                        } catch (RuntimeException e) {
+                            cancelFailures.add(e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+                        }
+                    });
+            if (!cancelFailures.isEmpty()) {
+                throw new IllegalStateException("重试清仓撤单失败: " + String.join("; ", cancelFailures));
+            }
+
+            LiveCommandExecutor commandExecutor = new LiveCommandExecutor(
+                    tradeGateway,
+                    new WorkingOrderRegistry(),
+                    new RiskGuardService(config),
+                    eventLogger,
+                    alertService,
+                    config.category(),
+                    new BybitSdkAccountGateway(clientFactory)
+            );
+            BigDecimal walletQty = commandExecutor.spotBaseWalletBalance(symbol);
+            InstrumentSpec instrumentSpec = new BybitSdkMarketDataGateway(
+                    clientFactory,
+                    config.category(),
+                    new FourHourIndicatorCalculator(),
+                    config.emaLength4h(),
+                    config.bollLength4h(),
+                    config.bollStdDevMultiplier()
+            ).loadInstrumentSpec(symbol);
+            BigDecimal flattenQty = instrumentSpec.roundQtyDown(walletQty);
+            if (flattenQty.compareTo(instrumentSpec.minOrderQty()) >= 0) {
+                OrderIntent flatten = new OrderIntent(
+                        symbol,
+                        "MANUAL_FLATTEN_" + System.currentTimeMillis(),
+                        TradeSide.SELL,
+                        OrderType.MARKET,
+                        flattenQty,
+                        null,
+                        false,
+                        "manual-flatten-and-stop"
+                );
+                List<String> failures = commandExecutor.executeManualFlatten(flatten, fallbackStatusProvider.snapshot().ledgerSnapshot());
+                if (!failures.isEmpty()) {
+                    throw new IllegalStateException("重试清仓下单失败: " + String.join("; ", failures));
+                }
+                List<FillEvent> confirmedFills = awaitManualFlattenFills(symbol, flatten.clientOrderId(), flattenQty);
+                BigDecimal referencePrice = confirmedFills.get(0).fillPrice();
+                Instant referenceTime = confirmedFills.get(0).fillTime();
+                recordInventoryReconciliation(symbol, walletQty, referencePrice, referenceTime, flatten.clientOrderId());
+                confirmedFills.forEach(this::recordFill);
+                recordSpotCycleEnd(symbol, "manual flatten and stop");
+            } else {
+                eventLogger.info("manual-flatten.dust-skipped", Map.of(
+                        "symbol", symbol,
+                        "walletQty", walletQty,
+                        "qtyStep", instrumentSpec.qtyStep(),
+                        "minOrderQty", instrumentSpec.minOrderQty()
+                ));
+            }
+
+            FlattenStopStatus completed = FlattenStopStatus.completed(startedAt, Instant.now(),
+                    "清仓停止已完成，提交数量 " + flattenQty.stripTrailingZeros().toPlainString());
+            flattenStopStatus.set(completed);
+            eventLogger.info("flatten.stop.retry.completed", Map.of(
+                    "symbol", symbol,
+                    "walletQty", walletQty,
+                    "submittedQty", flattenQty,
+                    "finishedAt", completed.finishedAt().toString()
+            ));
+        } catch (RuntimeException e) {
+            FlattenStopStatus failed = FlattenStopStatus.failed(startedAt, Instant.now(),
+                    e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+            flattenStopStatus.set(failed);
+            eventLogger.error("flatten.stop.retry.failed", Map.of(
+                    "startedAt", startedAt.toString(),
+                    "finishedAt", failed.finishedAt().toString(),
+                    "message", failed.message()
+            ));
+            alertService.warning("FLATTEN_STOP_RETRY_FAILED", "Flatten stop retry failed", Map.of(
+                    "message", failed.message()
+            ));
+        }
+    }
+
+    private List<FillEvent> awaitManualFlattenFills(String symbol, String clientOrderId, BigDecimal expectedQty) {
+        BybitSdkOrderQueryGateway queryGateway = new BybitSdkOrderQueryGateway(clientFactory, ProductCategory.SPOT);
+        Instant deadline = Instant.now().plusSeconds(30);
+        while (Instant.now().isBefore(deadline)) {
+            List<FillEvent> fills = queryGateway.fetchRecentExecutions(symbol, Set.of(clientOrderId));
+            BigDecimal filledQty = fills.stream()
+                    .map(FillEvent::fillQty)
+                    .filter(java.util.Objects::nonNull)
+                    .reduce(BigDecimal.ZERO, BigDecimal::add);
+            if (!fills.isEmpty() && filledQty.compareTo(expectedQty) >= 0) {
+                return fills.stream().sorted(Comparator.comparing(FillEvent::fillTime)).toList();
+            }
+            try {
+                Thread.sleep(500L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("等待清仓成交时被中断", e);
+            }
+        }
+        throw new IllegalStateException("清仓订单已提交，但 30 秒内未确认完整成交: " + clientOrderId);
+    }
+
+    public synchronized Map<String, Object> reconcileFlattenCycle() {
+        GridLiveRunner runner = activeRunner;
+        if (runner != null && runner.isRunning()) {
+            return Map.of("ok", false, "message", "策略运行中，不能补录清仓 Cycle");
+        }
+        if (!flattenStopLocked.get()) {
+            return Map.of("ok", false, "message", "清仓停止锁未启用");
+        }
+        GridStrategyConfig config = lastConfig;
+        if (config.category() != ProductCategory.SPOT || !config.entryDirection().isSpotLongOnly()) {
+            return Map.of("ok", false, "message", "仅支持补录现货多头清仓 Cycle");
+        }
+        List<FillRecord> openCycle = fillStore.currentCycleFills(config.symbol());
+        if (openCycle.isEmpty()) {
+            return Map.of("ok", true, "message", "没有待补录的当前 Cycle", "fillsAdded", 0);
+        }
+        Instant after = openCycle.get(openCycle.size() - 1).time();
+        List<FillEvent> missing = new BybitSdkOrderQueryGateway(clientFactory, config.category())
+                .fetchRecentExecutions(config.symbol())
+                .stream()
+                .filter(fill -> fill.fillTime() != null && fill.fillTime().isAfter(after))
+                .sorted(Comparator.comparing(FillEvent::fillTime))
+                .map(this::normalizeUnlinkedFill)
+                .toList();
+        boolean hasFlattenFill = missing.stream()
+                .anyMatch(fill -> fill.clientOrderId() != null && fill.clientOrderId().startsWith("MANUAL_FLATTEN_"));
+        if (!hasFlattenFill) {
+            return Map.of("ok", false, "message", "Bybit 最近成交中未找到本次 MANUAL_FLATTEN 成交");
+        }
+        List<FillEvent> flattenFills = missing.stream()
+                .filter(fill -> fill.clientOrderId() != null && fill.clientOrderId().startsWith("MANUAL_FLATTEN_"))
+                .toList();
+        List<FillEvent> beforeFlatten = missing.stream()
+                .filter(fill -> fill.clientOrderId() == null || !fill.clientOrderId().startsWith("MANUAL_FLATTEN_"))
+                .toList();
+        beforeFlatten.forEach(this::recordFill);
+        BigDecimal currentWalletQty = new LiveCommandExecutor(
+                new BybitSdkTradeGateway(clientFactory, config.category()),
+                new WorkingOrderRegistry(),
+                new RiskGuardService(config),
+                eventLogger,
+                alertService,
+                config.category(),
+                new BybitSdkAccountGateway(clientFactory)
+        ).spotBaseWalletBalance(config.symbol());
+        BigDecimal flattenFilledQty = flattenFills.stream()
+                .map(FillEvent::fillQty)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        BigDecimal walletBeforeFlatten = currentWalletQty.add(flattenFilledQty, MATH_CONTEXT);
+        FillEvent firstFlattenFill = flattenFills.get(0);
+        recordInventoryReconciliation(
+                config.symbol(),
+                walletBeforeFlatten,
+                firstFlattenFill.fillPrice(),
+                firstFlattenFill.fillTime(),
+                firstFlattenFill.clientOrderId()
+        );
+        flattenFills.forEach(this::recordFill);
+        recordSpotCycleEnd(config.symbol(), "manual flatten and stop");
+        List<String> executionIds = missing.stream().map(FillEvent::executionId).toList();
+        eventLogger.info("flatten.cycle.reconciled", Map.of(
+                "symbol", config.symbol(),
+                "after", after.toString(),
+                "fillsAdded", missing.size(),
+                "executionIds", executionIds
+        ));
+        return Map.of(
+                "ok", true,
+                "message", "清仓成交与历史 Cycle 已补录",
+                "fillsAdded", missing.size(),
+                "executionIds", executionIds
+        );
+    }
+
+    private void recordInventoryReconciliation(
+            String symbol,
+            BigDecimal realWalletQty,
+            BigDecimal referencePrice,
+            Instant referenceTime,
+            String flattenClientOrderId
+    ) {
+        List<FillRecord> current = fillStore.currentCycleFills(symbol);
+        if (current.isEmpty()) {
+            return;
+        }
+        BigDecimal recordedQty = current.get(current.size() - 1).cumulativeQty();
+        BigDecimal delta = recordedQty.subtract(realWalletQty, MATH_CONTEXT);
+        if (delta.abs().compareTo(new BigDecimal("0.000001")) < 0) {
+            return;
+        }
+        TradeSide side = delta.signum() > 0 ? TradeSide.SELL : TradeSide.BUY;
+        BigDecimal qty = delta.abs();
+        String suffix = flattenClientOrderId == null ? Long.toString(System.currentTimeMillis()) : flattenClientOrderId;
+        FillEvent adjustment = new FillEvent(
+                "INVENTORY_RECONCILE_" + suffix,
+                symbol,
+                "INVENTORY_RECONCILE_" + suffix,
+                side,
+                qty,
+                referencePrice,
+                referenceTime.minusMillis(1),
+                qty.multiply(referencePrice, MATH_CONTEXT),
+                BigDecimal.ZERO,
+                "USDT"
+        );
+        recordFill(adjustment);
+        eventLogger.warn("flatten.inventory.reconciled", Map.of(
+                "symbol", symbol,
+                "recordedQty", recordedQty,
+                "realWalletQty", realWalletQty,
+                "adjustmentSide", side.name(),
+                "adjustmentQty", qty,
+                "referencePrice", referencePrice
+        ));
+    }
+
+    private FillEvent normalizeUnlinkedFill(FillEvent fill) {
+        if (fill.clientOrderId() != null && !fill.clientOrderId().isBlank()) {
+            return fill;
+        }
+        return new FillEvent(
+                fill.executionId(),
+                fill.symbol(),
+                "EXTERNAL_FILL_" + fill.executionId(),
+                fill.side(),
+                fill.fillQty(),
+                fill.fillPrice(),
+                fill.fillTime(),
+                fill.fillValue(),
+                fill.fee(),
+                fill.feeCurrency()
+        );
+    }
+
+    public synchronized Map<String, Object> unlockFlattenStop() {
+        GridLiveRunner runner = activeRunner;
+        if (runner != null && runner.isRunning()) {
+            return Map.of("ok", false, "message", "策略仍在运行，不能解除清仓停止锁");
+        }
+        try {
+            Files.deleteIfExists(flattenStopLockPath);
+            flattenStopLocked.set(false);
+            flattenStopStatus.set(FlattenStopStatus.idle());
+            eventLogger.info("flatten.stop.unlocked", Map.of("lockFile", flattenStopLockPath.toString()));
+            return Map.of("ok", true, "message", "清仓停止锁已解除");
+        } catch (IOException e) {
+            return Map.of("ok", false, "message", "解除清仓停止锁失败: " + e.getMessage());
+        }
+    }
+
+    private void persistFlattenStopLock() {
+        try {
+            Path parent = flattenStopLockPath.getParent();
+            if (parent != null) {
+                Files.createDirectories(parent);
+            }
+            Files.writeString(flattenStopLockPath, Instant.now().toString());
+            flattenStopLocked.set(true);
+            eventLogger.info("flatten.stop.locked", Map.of("lockFile", flattenStopLockPath.toString()));
+        } catch (IOException e) {
+            throw new IllegalStateException("无法写入清仓停止锁: " + e.getMessage(), e);
+        }
+    }
+
     public List<FillRecord> recentFills() {
         return fillStore.currentCycleFills(snapshot().symbol());
+    }
+
+    public CurrentCycleFillPage fillsPage(int limit, int offset, String minPrice, String maxPrice) {
+        return fillStore.currentCycleFillsPage(
+                snapshot().symbol(),
+                normalizePageLimit(limit),
+                Math.max(0, offset),
+                parsePriceFilter(minPrice),
+                parsePriceFilter(maxPrice)
+        );
+    }
+
+    public List<FillRecord> fundingFees() {
+        return fillStore.currentCycleFills(snapshot().symbol()).stream()
+                .filter(fill -> fill != null && "FUNDING_FEE".equals(fill.side()))
+                .toList();
     }
 
     public List<FillRecord> recentCycles() {
@@ -1203,6 +1926,14 @@ public class LiveControlService {
 
     public List<FillRecord> cycleFills(String cycleExecutionId) {
         return fillStore.cycleFills(cycleExecutionId);
+    }
+
+    public CycleFillPage cycleFillsPage(String cycleExecutionId, int limit, int offset) {
+        return fillStore.cycleFillsPage(
+                cycleExecutionId,
+                normalizePageLimit(limit),
+                Math.max(0, offset)
+        );
     }
 
     private static int normalizePageLimit(int limit) {
@@ -1279,7 +2010,10 @@ public class LiveControlService {
                 : runtimeSnapshot.latestMarketSnapshot().markPrice();
         BigDecimal floatingPnlAtFill = cumulativeProfit(cumulativeQty, cumulativeValue, cumulativeFee, fillEvent.fillPrice());
         BigDecimal totalPnlAtFill = cumulativeProfit(cumulativeQty, cumulativeValue, cumulativeFee, markPrice);
-        String fillMetadataJson = profitReduceBoostMetadataJson(fillEvent, currentCycleFills, runtimeSnapshot);
+        String fillMetadataJson = fillEvent.clientOrderId() != null
+                && fillEvent.clientOrderId().startsWith("INVENTORY_RECONCILE_")
+                ? inventoryReconciliationMetadataJson(currentCycleFills)
+                : profitSizingMetadataJson(fillEvent, currentCycleFills, runtimeSnapshot);
         FillRecord record = new FillRecord(
                 fillEvent.fillTime(),
                 fillEvent.symbol(),
@@ -1302,7 +2036,7 @@ public class LiveControlService {
                 fillMetadataJson
         );
         fillStore.save(record);
-        if (isCycleEnd(runtimeSnapshot)) {
+        if (shouldRecordCycleEndAfterFill(ledgerSnapshot.netQty())) {
             fillStore.save(cycleEndRecord(fillEvent, ledgerSnapshot, totalPnlAtFill, cumulativeQty, cumulativeValue, cumulativeFee));
         }
     }
@@ -1369,7 +2103,9 @@ public class LiveControlService {
         }
         cumulativeFee = cumulativeFee.add(fee, MATH_CONTEXT);
         BigDecimal totalPnlAtFill = cumulativeProfit(cumulativeQty, cumulativeValue, cumulativeFee, fillEvent.fillPrice());
-        String configJson = previous == null ? rebalanceStartMetadataJson() : null;
+        String configJson = previous == null
+                ? rebalanceStartMetadataJson()
+                : rebalanceProfitSizingMetadataJson(fillEvent, currentCycleFills);
         fillStore.save(new FillRecord(
                 fillEvent.fillTime(),
                 ledgerSymbol,
@@ -1675,26 +2411,7 @@ public class LiveControlService {
     }
 
     private List<FillRecord> latestRebalanceCycleFills(String symbol) {
-        String ledgerSymbol = rebalanceLedgerSymbol(symbol);
-        List<FillRecord> recent = fillStore.recent(ledgerSymbol, 1000).stream()
-                .filter(fill -> !"CYCLE_END".equals(fill.side()))
-                .toList();
-        if (recent.isEmpty()) {
-            return List.of();
-        }
-        List<FillRecord> newestFirst = recent;
-        List<FillRecord> cycle = new ArrayList<>();
-        for (FillRecord fill : newestFirst) {
-            cycle.add(fill);
-            if (ClientOrderIds.isInitialPositionOrder(fill.clientOrderId())) {
-                break;
-            }
-        }
-        if (cycle.isEmpty() || !ClientOrderIds.isInitialPositionOrder(cycle.get(cycle.size() - 1).clientOrderId())) {
-            return List.of();
-        }
-        java.util.Collections.reverse(cycle);
-        return cycle;
+        return fillStore.currentCycleFills(rebalanceLedgerSymbol(symbol));
     }
 
     private static String rebalanceLedgerSymbol(String symbol) {
@@ -1720,6 +2437,32 @@ public class LiveControlService {
     private boolean isCycleEnd(RuntimeStatusSnapshot snapshot) {
         return snapshot.ledgerSnapshot().netQty().signum() == 0
                 && snapshot.runtimeState().state() == com.btcgrid.common.model.GridState.INIT;
+    }
+
+    static boolean shouldRecordCycleEndAfterFill(BigDecimal netQty) {
+        return netQty != null && netQty.signum() == 0;
+    }
+
+    private void finalizeFlatOpenCycleIfNeeded() {
+        RuntimeStatusSnapshot snapshot = fallbackStatusProvider.snapshot();
+        if (snapshot == null || !isCycleEnd(snapshot) || snapshot.symbol() == null || snapshot.symbol().isBlank()) {
+            return;
+        }
+        List<FillRecord> fills = fillStore.currentCycleFills(snapshot.symbol());
+        if (fills.isEmpty()) {
+            return;
+        }
+        FillRecord last = fills.get(fills.size() - 1);
+        if (last.cumulativeQty() == null || last.cumulativeQty().signum() != 0) {
+            return;
+        }
+        Instant repairedEndTime = last.time() == null ? Instant.now() : last.time().plusMillis(1);
+        recordSpotCycleEnd(snapshot.symbol(), "flat cycle end marker repaired at startup", repairedEndTime);
+        eventLogger.warn("cycle.end.repaired", Map.of(
+                "symbol", snapshot.symbol(),
+                "lastFillExecutionId", last.executionId() == null ? "" : last.executionId(),
+                "lastFillTime", last.time() == null ? "" : last.time().toString()
+        ));
     }
 
     private boolean canResume(RuntimeStatusSnapshot snapshot) {
@@ -1823,25 +2566,132 @@ public class LiveControlService {
         }
     }
 
-    private String profitReduceBoostMetadataJson(
+    private String profitSizingMetadataJson(
             FillEvent fillEvent,
             List<FillRecord> currentCycleFills,
             RuntimeStatusSnapshot runtimeSnapshot
     ) {
-        BigDecimal previousCumulative = latestProfitReduceBoostCumulative(currentCycleFills);
-        ProfitReduceBoost boost = profitReduceBoost(fillEvent, runtimeSnapshot);
-        BigDecimal extraQty = boost == null ? BigDecimal.ZERO : boost.extraFillQty(fillEvent.fillQty());
-        BigDecimal cumulative = previousCumulative.add(extraQty, MATH_CONTEXT);
-        if (extraQty.signum() <= 0 && cumulative.signum() <= 0) {
+        List<WorkingOrder> workingOrders = runtimeSnapshot == null
+                ? List.of()
+                : runtimeSnapshot.workingOrders();
+        return profitSizingMetadataJson(
+                fillEvent,
+                currentCycleFills,
+                orderSizingReason(fillEvent, workingOrders, "profit-reduce-boost"),
+                orderSizingReason(fillEvent, workingOrders, "loss-add-release"),
+                orderQuantityRoundingReason(fillEvent, workingOrders)
+        );
+    }
+
+    private String rebalanceProfitSizingMetadataJson(
+            FillEvent fillEvent,
+            List<FillRecord> currentCycleFills
+    ) {
+        Collection<WorkingOrder> workingOrders = rebalanceWorkingOrderRegistry.snapshot();
+        return profitSizingMetadataJson(
+                fillEvent,
+                currentCycleFills,
+                orderSizingReason(fillEvent, workingOrders, "profit-reduce-boost"),
+                orderSizingReason(fillEvent, workingOrders, "loss-add-release"),
+                orderQuantityRoundingReason(fillEvent, workingOrders)
+        );
+    }
+
+    private String profitSizingMetadataJson(
+            FillEvent fillEvent,
+            List<FillRecord> currentCycleFills,
+            SizingReason reduce,
+            SizingReason add,
+            QuantityRoundingReason rounding
+    ) {
+        BigDecimal cumulativeReduce = metadataSum(currentCycleFills, "profitReduceBoostExtraQty");
+        BigDecimal cumulativeAdd = metadataSum(currentCycleFills, "lossAddBoostExtraQty");
+        BigDecimal cumulativePermanentReduce = metadataSum(
+                currentCycleFills,
+                "permanentProfitReduceExtraQty"
+        );
+        BigDecimal reduceCarry = latestMetadataDecimal(currentCycleFills, "profitReduceCarryQty");
+        BigDecimal addCarry = latestMetadataDecimal(currentCycleFills, "lossAddCarryQty");
+        BigDecimal buyRoundingCarry = latestMetadataDecimal(currentCycleFills, "buyGridRoundingCarryQty");
+        BigDecimal sellRoundingCarry = latestMetadataDecimal(currentCycleFills, "sellGridRoundingCarryQty");
+        BigDecimal extraReduceQty = reduce == null ? BigDecimal.ZERO : reduce.scaledApplied(fillEvent.fillQty());
+        BigDecimal extraAddQty = add == null ? BigDecimal.ZERO : add.scaledApplied(fillEvent.fillQty());
+        BigDecimal permanentReduceQty = reduce == null
+                ? BigDecimal.ZERO
+                : reduce.scaledPermanentApplied(fillEvent.fillQty());
+        if (reduce != null) {
+            reduceCarry = reduceCarry.add(reduce.scaledIntended(fillEvent.fillQty()), MATH_CONTEXT)
+                    .subtract(extraReduceQty, MATH_CONTEXT)
+                    .max(BigDecimal.ZERO);
+        }
+        if (add != null) {
+            addCarry = addCarry.add(add.scaledIntended(fillEvent.fillQty()), MATH_CONTEXT)
+                    .subtract(extraAddQty, MATH_CONTEXT)
+                    .max(BigDecimal.ZERO);
+        }
+        cumulativeReduce = cumulativeReduce.add(extraReduceQty, MATH_CONTEXT);
+        cumulativeAdd = cumulativeAdd.add(extraAddQty, MATH_CONTEXT);
+        cumulativePermanentReduce = cumulativePermanentReduce.add(permanentReduceQty, MATH_CONTEXT);
+        BigDecimal releaseReserve = cumulativeReduce
+                .subtract(cumulativePermanentReduce)
+                .subtract(cumulativeAdd)
+                .max(BigDecimal.ZERO);
+        addCarry = addCarry.min(releaseReserve);
+        if (rounding != null) {
+            QuantityRoundingState updatedRounding = new QuantityRoundingState(buyRoundingCarry, sellRoundingCarry)
+                    .afterFill(
+                            fillEvent.side(),
+                            rounding.rawQty(),
+                            rounding.roundedQty(),
+                            rounding.orderQty(),
+                            fillEvent.fillQty()
+                    );
+            buyRoundingCarry = updatedRounding.buyCarryQty();
+            sellRoundingCarry = updatedRounding.sellCarryQty();
+        }
+        if (reduce == null && add == null && cumulativeReduce.signum() <= 0
+                && reduceCarry.signum() <= 0 && addCarry.signum() <= 0
+                && rounding == null && buyRoundingCarry.signum() <= 0 && sellRoundingCarry.signum() <= 0) {
             return null;
         }
         Map<String, Object> meta = new LinkedHashMap<>();
-        meta.put("profitReduceBoostExtraQty", extraQty);
-        meta.put("cumulativeProfitReduceBoostQty", cumulative);
-        if (boost != null) {
-            meta.put("profitReduceBoostBaseQty", boost.baseQty());
-            meta.put("profitReduceBoostOrderQty", boost.boostedQty());
+        meta.put("profitReduceBoostExtraQty", extraReduceQty);
+        meta.put("cumulativeProfitReduceBoostQty", cumulativeReduce);
+        meta.put("permanentProfitReduceExtraQty", permanentReduceQty);
+        meta.put("cumulativePermanentProfitReduceQty", cumulativePermanentReduce);
+        meta.put("profitReduceCarryQty", reduceCarry);
+        meta.put("lossAddBoostExtraQty", extraAddQty);
+        meta.put("cumulativeLossAddBoostQty", cumulativeAdd);
+        meta.put("lossAddCarryQty", addCarry);
+        meta.put("profitReleaseReserveQty", releaseReserve);
+        meta.put("buyGridRoundingCarryQty", buyRoundingCarry);
+        meta.put("sellGridRoundingCarryQty", sellRoundingCarry);
+        if (reduce != null) {
+            putSizingMetadata(meta, "profitReduceBoost", reduce);
         }
+        if (add != null) {
+            putSizingMetadata(meta, "lossAddBoost", add);
+        }
+        if (rounding != null) {
+            meta.put("gridRoundingRawQty", rounding.rawQty());
+            meta.put("gridRoundingCarryBeforeQty", rounding.carryBeforeQty());
+            meta.put("gridRoundingRoundedQty", rounding.roundedQty());
+        }
+        try {
+            return OBJECT_MAPPER.writeValueAsString(meta);
+        } catch (JsonProcessingException e) {
+            return null;
+        }
+    }
+
+    private String inventoryReconciliationMetadataJson(List<FillRecord> currentCycleFills) {
+        Map<String, Object> meta = new LinkedHashMap<>();
+        meta.put("inventoryReconciliation", true);
+        meta.put("reason", "real wallet quantity differed from cycle ledger before manual flatten");
+        meta.put("cumulativeProfitReduceBoostQty", latestProfitReduceBoostCumulative(currentCycleFills));
+        meta.put("cumulativeLossAddBoostQty", metadataSum(currentCycleFills, "lossAddBoostExtraQty"));
+        meta.put("profitReduceCarryQty", latestMetadataDecimal(currentCycleFills, "profitReduceCarryQty"));
+        meta.put("lossAddCarryQty", latestMetadataDecimal(currentCycleFills, "lossAddCarryQty"));
         try {
             return OBJECT_MAPPER.writeValueAsString(meta);
         } catch (JsonProcessingException e) {
@@ -1863,22 +2713,82 @@ public class LiveControlService {
         return BigDecimal.ZERO;
     }
 
-    private ProfitReduceBoost profitReduceBoost(FillEvent fillEvent, RuntimeStatusSnapshot runtimeSnapshot) {
-        if (fillEvent == null || runtimeSnapshot == null || runtimeSnapshot.workingOrders() == null) {
+    private BigDecimal metadataSum(List<FillRecord> fills, String key) {
+        if (fills == null || fills.isEmpty()) {
+            return BigDecimal.ZERO;
+        }
+        BigDecimal total = BigDecimal.ZERO;
+        for (FillRecord fill : fills) {
+            total = total.add(metadataDecimal(fill, key), MATH_CONTEXT);
+        }
+        return total;
+    }
+
+    private BigDecimal latestMetadataDecimal(List<FillRecord> fills, String key) {
+        if (fills == null || fills.isEmpty()) {
+            return BigDecimal.ZERO;
+        }
+        for (int i = fills.size() - 1; i >= 0; i--) {
+            Object value = metadataValue(fills.get(i), key);
+            BigDecimal decimal = value == null ? null : decimalOrNull(String.valueOf(value));
+            if (decimal != null) {
+                return decimal;
+            }
+        }
+        return BigDecimal.ZERO;
+    }
+
+    private void putSizingMetadata(Map<String, Object> meta, String prefix, SizingReason sizing) {
+        meta.put(prefix + "BaseQty", sizing.baseQty());
+        meta.put(prefix + "OrderQty", sizing.orderQty());
+        meta.put(prefix + "IntendedQty", sizing.intendedQty());
+        meta.put(prefix + "AppliedQty", sizing.appliedQty());
+    }
+
+    private SizingReason orderSizingReason(
+            FillEvent fillEvent,
+            Collection<WorkingOrder> workingOrders,
+            String tag
+    ) {
+        if (fillEvent == null) {
             return null;
         }
-        Optional<ProfitReduceBoost> currentOrderBoost = runtimeSnapshot.workingOrders().stream()
+        Optional<SizingReason> currentOrderSizing = (workingOrders == null ? List.<WorkingOrder>of() : workingOrders).stream()
                 .filter(order -> order != null && fillEvent.clientOrderId() != null
                         && fillEvent.clientOrderId().equals(order.clientOrderId()))
-                .map(order -> parseProfitReduceBoost(order.reason()))
+                .map(order -> parseSizingReason(order.reason(), tag))
                 .filter(Optional::isPresent)
                 .map(Optional::get)
                 .findFirst();
-        if (currentOrderBoost.isPresent()) {
-            return currentOrderBoost.get();
+        if (currentOrderSizing.isPresent()) {
+            return currentOrderSizing.get();
         }
         return commandPlaceReason(fillEvent.clientOrderId())
-                .flatMap(this::parseProfitReduceBoost)
+                .flatMap(reason -> parseSizingReason(reason, tag))
+                .orElse(null);
+    }
+
+    private QuantityRoundingReason orderQuantityRoundingReason(
+            FillEvent fillEvent,
+            Collection<WorkingOrder> workingOrders
+    ) {
+        if (fillEvent == null) {
+            return null;
+        }
+        Optional<QuantityRoundingReason> currentOrderRounding = (workingOrders == null
+                ? List.<WorkingOrder>of()
+                : workingOrders).stream()
+                .filter(order -> order != null && fillEvent.clientOrderId() != null
+                        && fillEvent.clientOrderId().equals(order.clientOrderId()))
+                .map(order -> parseQuantityRoundingReason(order.reason()))
+                .filter(Optional::isPresent)
+                .map(Optional::get)
+                .findFirst();
+        if (currentOrderRounding.isPresent()) {
+            return currentOrderRounding.get();
+        }
+        return commandPlaceReason(fillEvent.clientOrderId())
+                .flatMap(this::parseQuantityRoundingReason)
                 .orElse(null);
     }
 
@@ -1931,17 +2841,21 @@ public class LiveControlService {
         return Optional.of(reason);
     }
 
-    private Optional<ProfitReduceBoost> parseProfitReduceBoost(String reason) {
-        if (reason == null || !reason.contains("profit-reduce-boost:")) {
+    private Optional<SizingReason> parseSizingReason(String reason, String tag) {
+        String marker = tag + ":";
+        if (reason == null || !reason.contains(marker)) {
             return Optional.empty();
         }
-        String payload = reason.substring(reason.indexOf("profit-reduce-boost:") + "profit-reduce-boost:".length());
+        String payload = reason.substring(reason.indexOf(marker) + marker.length());
         int end = payload.indexOf('|');
         if (end >= 0) {
             payload = payload.substring(0, end);
         }
         BigDecimal baseQty = null;
-        BigDecimal boostedQty = null;
+        BigDecimal orderQty = null;
+        BigDecimal intendedQty = null;
+        BigDecimal appliedQty = null;
+        BigDecimal permanentAppliedQty = BigDecimal.ZERO;
         for (String token : payload.split(",")) {
             String[] parts = token.split("=", 2);
             if (parts.length != 2) {
@@ -1949,14 +2863,71 @@ public class LiveControlService {
             }
             if ("base".equals(parts[0])) {
                 baseQty = decimalOrNull(parts[1]);
-            } else if ("boosted".equals(parts[0])) {
-                boostedQty = decimalOrNull(parts[1]);
+            } else if ("order".equals(parts[0]) || "boosted".equals(parts[0])) {
+                orderQty = decimalOrNull(parts[1]);
+            } else if ("intended".equals(parts[0])) {
+                intendedQty = decimalOrNull(parts[1]);
+            } else if ("applied".equals(parts[0])) {
+                appliedQty = decimalOrNull(parts[1]);
+            } else if ("permanent".equals(parts[0])) {
+                permanentAppliedQty = decimalOrNull(parts[1]);
             }
         }
-        if (baseQty == null || boostedQty == null || boostedQty.compareTo(baseQty) <= 0) {
+        if (baseQty == null || orderQty == null || orderQty.compareTo(baseQty) < 0) {
             return Optional.empty();
         }
-        return Optional.of(new ProfitReduceBoost(baseQty, boostedQty));
+        if (appliedQty == null) {
+            appliedQty = orderQty.subtract(baseQty).max(BigDecimal.ZERO);
+        }
+        if (intendedQty == null) {
+            intendedQty = appliedQty;
+        }
+        if (permanentAppliedQty == null) {
+            permanentAppliedQty = BigDecimal.ZERO;
+        }
+        return Optional.of(new SizingReason(
+                baseQty,
+                orderQty,
+                intendedQty,
+                appliedQty,
+                permanentAppliedQty
+        ));
+    }
+
+    private Optional<QuantityRoundingReason> parseQuantityRoundingReason(String reason) {
+        String marker = "qty-rounding:";
+        if (reason == null || !reason.contains(marker)) {
+            return Optional.empty();
+        }
+        String payload = reason.substring(reason.indexOf(marker) + marker.length());
+        int end = payload.indexOf('|');
+        if (end >= 0) {
+            payload = payload.substring(0, end);
+        }
+        BigDecimal rawQty = null;
+        BigDecimal carryBeforeQty = null;
+        BigDecimal roundedQty = null;
+        BigDecimal orderQty = null;
+        for (String token : payload.split(",")) {
+            String[] parts = token.split("=", 2);
+            if (parts.length != 2) {
+                continue;
+            }
+            if ("raw".equals(parts[0])) {
+                rawQty = decimalOrNull(parts[1]);
+            } else if ("carry".equals(parts[0])) {
+                carryBeforeQty = decimalOrNull(parts[1]);
+            } else if ("rounded".equals(parts[0])) {
+                roundedQty = decimalOrNull(parts[1]);
+            } else if ("order".equals(parts[0])) {
+                orderQty = decimalOrNull(parts[1]);
+            }
+        }
+        if (rawQty == null || carryBeforeQty == null || roundedQty == null || orderQty == null
+                || orderQty.signum() <= 0) {
+            return Optional.empty();
+        }
+        return Optional.of(new QuantityRoundingReason(rawQty, carryBeforeQty, roundedQty, orderQty));
     }
 
     private BigDecimal metadataDecimal(FillRecord record, String key) {
@@ -1979,18 +2950,40 @@ public class LiveControlService {
         }
     }
 
-    private record ProfitReduceBoost(BigDecimal baseQty, BigDecimal boostedQty) {
-        private BigDecimal extraFillQty(BigDecimal fillQty) {
-            if (fillQty == null || fillQty.signum() <= 0 || boostedQty.signum() <= 0) {
-                return BigDecimal.ZERO;
-            }
-            BigDecimal extraOrderQty = boostedQty.subtract(baseQty).max(BigDecimal.ZERO);
-            if (extraOrderQty.signum() <= 0) {
-                return BigDecimal.ZERO;
-            }
-            BigDecimal fillRatio = fillQty.divide(boostedQty, MathContext.DECIMAL64).min(BigDecimal.ONE);
-            return extraOrderQty.multiply(fillRatio, MathContext.DECIMAL64);
+    private record SizingReason(
+            BigDecimal baseQty,
+            BigDecimal orderQty,
+            BigDecimal intendedQty,
+            BigDecimal appliedQty,
+            BigDecimal permanentAppliedQty
+    ) {
+        private BigDecimal scaledIntended(BigDecimal fillQty) {
+            return scaled(intendedQty, fillQty);
         }
+
+        private BigDecimal scaledApplied(BigDecimal fillQty) {
+            return scaled(appliedQty, fillQty);
+        }
+
+        private BigDecimal scaledPermanentApplied(BigDecimal fillQty) {
+            return scaled(permanentAppliedQty, fillQty);
+        }
+
+        private BigDecimal scaled(BigDecimal value, BigDecimal fillQty) {
+            if (fillQty == null || fillQty.signum() <= 0 || orderQty.signum() <= 0 || value.signum() <= 0) {
+                return BigDecimal.ZERO;
+            }
+            BigDecimal fillRatio = fillQty.divide(orderQty, MathContext.DECIMAL64).min(BigDecimal.ONE);
+            return value.multiply(fillRatio, MathContext.DECIMAL64);
+        }
+    }
+
+    private record QuantityRoundingReason(
+            BigDecimal rawQty,
+            BigDecimal carryBeforeQty,
+            BigDecimal roundedQty,
+            BigDecimal orderQty
+    ) {
     }
 
     private BigDecimal fillValue(FillEvent fillEvent) {
@@ -2046,6 +3039,16 @@ public class LiveControlService {
     }
 
     public record PageResult<T>(List<T> items, int limit, int offset, boolean hasMore) {
+    }
+
+    public record RebalanceCyclesPage(
+            List<Map<String, Object>> items,
+            int limit,
+            int offset,
+            boolean hasMore,
+            long total,
+            Map<String, Object> summary
+    ) {
     }
 
     public record RebalanceConfigRequest(
@@ -2125,8 +3128,8 @@ public class LiveControlService {
             return new RebalanceConfigRequest(
                     enabled,
                     nextMode.configValue(),
-                    blankDefault(autoMinTotalBtc, "7").trim(),
-                    blankDefault(autoBaseGridQty, "0.005").trim(),
+                    blankDefault(autoMinTotalBtc, "6").trim(),
+                    blankDefault(autoBaseGridQty, "0.003").trim(),
                     blankDefault(autoInitialSteps, "5").trim(),
                     nextCategory,
                     blankDefault(symbol, "BTCUSDT").trim().toUpperCase(),

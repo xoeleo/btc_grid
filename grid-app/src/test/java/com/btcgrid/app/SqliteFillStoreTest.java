@@ -1,10 +1,13 @@
 package com.btcgrid.app;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.math.BigDecimal;
 import java.nio.file.Path;
 import java.time.Instant;
+import java.util.List;
 import java.util.Set;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -40,6 +43,65 @@ class SqliteFillStoreTest {
         assertEquals("exec-1", saved.executionId());
         assertEquals(new BigDecimal("77.0001"), saved.value());
         assertEquals(new BigDecimal("-0.001"), saved.cumulativeQty());
+    }
+
+    @Test
+    void duplicateExecutionBackfillsRicherFeeAndRecomputesCycleTotals() {
+        Path dbPath = tempDir.resolve("fee-reconcile.sqlite");
+        SqliteFillStore store = new SqliteFillStore(dbPath);
+        FillRecord initialWithoutFee = fill(
+                Instant.ofEpochSecond(1), "BUY", new BigDecimal("0.015"), new BigDecimal("100"),
+                BigDecimal.ZERO, "RBAL_BTCUSDT_I_fee", "initial-fee-exec"
+        );
+        store.save(initialWithoutFee);
+        store.save(fill(
+                Instant.ofEpochSecond(2), "SELL", new BigDecimal("0.003"), new BigDecimal("101"),
+                new BigDecimal("0.03"), "RBAL_BTCUSDT_PS_fee", "sell-fee-exec"
+        ));
+        store.save(fill(
+                Instant.ofEpochSecond(1), "BUY", new BigDecimal("0.015"), new BigDecimal("100"),
+                new BigDecimal("0.40"), "RBAL_BTCUSDT_I_fee", "initial-fee-exec"
+        ));
+
+        List<FillRecord> fills = store.currentCycleFills("BTCUSDT");
+        assertEquals(2, fills.size());
+        assertEquals(0, new BigDecimal("0.40").compareTo(fills.get(0).fee()));
+        assertEquals(0, new BigDecimal("0.43").compareTo(fills.get(1).cumulativeFee()));
+        assertEquals(0, new BigDecimal("0.43").compareTo(
+                store.currentCycle("BTCUSDT", Instant.now(), new BigDecimal("101")).cumulativeTradingFee()));
+    }
+
+    @Test
+    void restoresBuyAndSellGridRoundingCarryFromCurrentCycleMetadata() {
+        Path dbPath = tempDir.resolve("rounding-carry.sqlite");
+        SqliteFillStore store = new SqliteFillStore(dbPath);
+        store.save(fillWithMetadata(
+                Instant.ofEpochSecond(1000L),
+                "BUY",
+                new BigDecimal("0.015"),
+                new BigDecimal("76000"),
+                "GRID_BTCUSDT_INIT_rounding",
+                "rounding-initial",
+                "{}"
+        ));
+        store.save(fillWithMetadata(
+                Instant.ofEpochSecond(1100L),
+                "SELL",
+                new BigDecimal("0.004"),
+                new BigDecimal("76323.9"),
+                "GRID_BTCUSDT_PS_rounding",
+                "rounding-sell",
+                "{\"buyGridRoundingCarryQty\":\"0.0002\","
+                        + "\"sellGridRoundingCarryQty\":\"0.0005\"}"
+        ));
+
+        assertEquals(
+                new com.btcgrid.strategy.model.QuantityRoundingState(
+                        new BigDecimal("0.0002"),
+                        new BigDecimal("0.0005")
+                ),
+                new SqliteFillStore(dbPath).quantityRoundingState("BTCUSDT")
+        );
     }
 
     @Test
@@ -153,6 +215,144 @@ class SqliteFillStoreTest {
         assertEquals(new BigDecimal("-4.45524035"), summary.fillPricePnl());
         assertEquals(new BigDecimal("-4.26324035"), summary.markPricePnl());
         assertEquals(300L, summary.durationSeconds());
+    }
+
+    @Test
+    void mergedRecoveryInitialOrderDoesNotSplitTheCurrentCycle() {
+        Path dbPath = tempDir.resolve("merged-recovery-cycle.sqlite");
+        SqliteFillStore store = new SqliteFillStore(dbPath);
+        store.save(fill(
+                Instant.ofEpochSecond(1000L),
+                "BUY",
+                new BigDecimal("0.025"),
+                new BigDecimal("100"),
+                BigDecimal.ZERO,
+                "RBAL_BTCUSDT_I_original",
+                "original-initial"
+        ));
+        store.save(fill(
+                Instant.ofEpochSecond(1100L),
+                "SELL",
+                new BigDecimal("0.005"),
+                new BigDecimal("101"),
+                BigDecimal.ZERO,
+                "RBAL_BTCUSDT_PS_follow",
+                "follow-fill"
+        ));
+        store.save(new FillRecord(
+                Instant.ofEpochSecond(1200L),
+                "BTCUSDT",
+                "BUY",
+                new BigDecimal("0.025"),
+                new BigDecimal("102"),
+                new BigDecimal("2.55"),
+                BigDecimal.ZERO,
+                "USDT",
+                new BigDecimal("0.045"),
+                new BigDecimal("4.545"),
+                BigDecimal.ZERO,
+                new BigDecimal("0.045"),
+                new BigDecimal("101"),
+                BigDecimal.ZERO,
+                BigDecimal.ZERO,
+                BigDecimal.ZERO,
+                "RBAL_BTCUSDT_I_recovered",
+                "recovered-initial",
+                "{\"targetRatio\":1,\"mergedIntoRecoveredCycle\":true}"
+        ));
+
+        List<FillRecord> fills = store.currentCycleFills("BTCUSDT");
+        CurrentCycleFillPage page = store.currentCycleFillsPage("BTCUSDT", 10, 0, null, null);
+
+        assertEquals(3, fills.size());
+        assertEquals("original-initial", fills.get(0).executionId());
+        assertEquals("recovered-initial", fills.get(2).executionId());
+        assertEquals(3, page.total());
+        assertEquals(3, page.items().size());
+    }
+
+    @Test
+    void pagesCurrentCycleFillsInSqliteWithTotalsFiltersAndCrossPageMetrics() {
+        Path dbPath = tempDir.resolve("current-cycle-pages.sqlite");
+        SqliteFillStore store = new SqliteFillStore(dbPath);
+        for (int index = 0; index < 125; index++) {
+            store.save(fill(
+                    Instant.ofEpochSecond(1000L + index),
+                    index % 2 == 0 ? "BUY" : "SELL",
+                    new BigDecimal("0.001"),
+                    new BigDecimal(100 + index),
+                    BigDecimal.ZERO,
+                    index == 0 ? "GRID_BTCUSDT_INIT_page" : "GRID_BTCUSDT_PB_page_" + index,
+                    "current-page-" + index
+            ));
+        }
+
+        CurrentCycleFillPage first = store.currentCycleFillsPage("BTCUSDT", 50, 0, null, null);
+        CurrentCycleFillPage third = store.currentCycleFillsPage("BTCUSDT", 50, 100, null, null);
+        CurrentCycleFillPage filtered = store.currentCycleFillsPage(
+                "BTCUSDT",
+                50,
+                0,
+                new BigDecimal("150"),
+                new BigDecimal("159")
+        );
+        CurrentCycleFillPage exclusiveBucket = store.currentCycleFillsPage(
+                "BTCUSDT",
+                50,
+                0,
+                new BigDecimal("150"),
+                new BigDecimal("160"),
+                true
+        );
+
+        assertEquals(125, first.total());
+        assertEquals(125, first.tradingCount());
+        assertEquals(0, first.fundingCount());
+        assertEquals(50, first.items().size());
+        assertTrue(first.hasMore());
+        assertEquals("current-page-124", first.items().get(0).fill().executionId());
+        assertEquals(0, first.items().get(0).cumulativeTurnover().compareTo(new BigDecimal("20.250")));
+        assertEquals(new BigDecimal("223"), first.items().get(0).previousTradingPrice());
+        assertEquals(25, third.items().size());
+        assertFalse(third.hasMore());
+        assertEquals("current-page-24", third.items().get(0).fill().executionId());
+        assertEquals("current-page-0", third.items().get(24).fill().executionId());
+        assertEquals(null, third.items().get(24).previousTradingPrice());
+        assertEquals(10, filtered.total());
+        assertEquals("current-page-59", filtered.items().get(0).fill().executionId());
+        assertEquals("current-page-50", filtered.items().get(9).fill().executionId());
+        assertEquals(10, exclusiveBucket.total());
+        assertEquals("current-page-59", exclusiveBucket.items().get(0).fill().executionId());
+        assertEquals(
+                new LiveControlService.RebalancePriceBucket(
+                        new BigDecimal("150"),
+                        new BigDecimal("160")
+                ),
+                LiveControlService.rebalancePriceBucket("159.99")
+        );
+    }
+
+    @Test
+    void loadsRebalanceRecoveryCycleBeyondLegacyThousandRowLimit() {
+        Path dbPath = tempDir.resolve("long-rebalance-cycle.sqlite");
+        SqliteFillStore store = new SqliteFillStore(dbPath);
+        for (int index = 0; index < 1_005; index++) {
+            store.save(fill(
+                    Instant.ofEpochSecond(10_000L + index),
+                    index % 2 == 0 ? "BUY" : "SELL",
+                    new BigDecimal("0.001"),
+                    new BigDecimal(60_000 + index),
+                    BigDecimal.ZERO,
+                    index == 0 ? "RBAL_BTCUSDT_I_long_cycle" : "RBAL_BTCUSDT_PB_long_cycle_" + index,
+                    "long-cycle-" + index
+            ));
+        }
+
+        List<FillRecord> fills = store.currentCycleFills("BTCUSDT");
+
+        assertEquals(1_005, fills.size());
+        assertEquals("long-cycle-0", fills.get(0).executionId());
+        assertEquals("long-cycle-1004", fills.get(1_004).executionId());
     }
 
     @Test
@@ -279,7 +479,8 @@ class SqliteFillStoreTest {
                 new BigDecimal("102"),
                 "GRID_BTCUSDT_PS_boost_2",
                 "boost-sell-2",
-                "{\"profitReduceBoostExtraQty\":\"0.2\",\"cumulativeProfitReduceBoostQty\":\"0.3\"}"
+                "{\"profitReduceBoostExtraQty\":\"0.2\",\"cumulativeProfitReduceBoostQty\":\"0.3\","
+                        + "\"permanentProfitReduceExtraQty\":\"0.2\"}"
         ));
         store.save(fillWithMetadata(
                 Instant.ofEpochSecond(1300L),
@@ -290,6 +491,16 @@ class SqliteFillStoreTest {
                 "boost-sell-3",
                 "{\"profitReduceBoostExtraQty\":\"0.1\",\"cumulativeProfitReduceBoostQty\":\"0.1\"}"
         ));
+        store.save(fillWithMetadata(
+                Instant.ofEpochSecond(1350L),
+                "BUY",
+                new BigDecimal("0.5"),
+                new BigDecimal("99"),
+                "GRID_BTCUSDT_PB_release_1",
+                "release-buy-1",
+                "{\"lossAddBoostExtraQty\":\"0.1\",\"cumulativeLossAddBoostQty\":\"0.1\","
+                        + "\"profitReduceCarryQty\":\"0.05\",\"lossAddCarryQty\":\"0.02\"}"
+        ));
 
         CurrentCycleSummary summary = store.currentCycle(
                 "BTCUSDT",
@@ -298,6 +509,24 @@ class SqliteFillStoreTest {
         );
 
         assertEquals(new BigDecimal("0.4"), summary.profitReduceBoostExtraQty());
+        assertEquals(new BigDecimal("102"), summary.profitReduceBoostAveragePrice());
+        assertEquals(new BigDecimal("0.2"), summary.permanentProfitReduceQty());
+        assertEquals(new BigDecimal("0.1"), summary.lossAddBoostExtraQty());
+        assertEquals(new BigDecimal("99"), summary.lossAddBoostAveragePrice());
+        assertEquals(new BigDecimal("0.1"), summary.profitReleaseReserveQty());
+        assertEquals(new BigDecimal("0.05"), summary.profitReduceCarryQty());
+        assertEquals(new BigDecimal("0.02"), summary.lossAddCarryQty());
+        assertEquals(
+                new com.btcgrid.strategy.model.ProfitSizingState(
+                        new BigDecimal("0.05"),
+                        new BigDecimal("0.4"),
+                        new BigDecimal("0.02"),
+                        new BigDecimal("0.1"),
+                        new BigDecimal("0.2"),
+                        BigDecimal.ZERO
+                ),
+                store.profitSizingState("BTCUSDT")
+        );
     }
 
     @Test
@@ -478,6 +707,55 @@ class SqliteFillStoreTest {
     }
 
     @Test
+    void pagesHistoricalCycleFillsWithoutLoadingTheWholeCycle() {
+        Path dbPath = tempDir.resolve("cycle-detail-page.sqlite");
+        SqliteFillStore store = new SqliteFillStore(dbPath);
+        for (int index = 0; index < 75; index++) {
+            store.save(fill(
+                    Instant.ofEpochSecond(1000L + index),
+                    index % 2 == 0 ? "BUY" : "SELL",
+                    new BigDecimal("0.001"),
+                    new BigDecimal("100"),
+                    BigDecimal.ZERO,
+                    index == 0 ? "GRID_BTCUSDT_INIT_page" : "GRID_BTCUSDT_PB_page_" + index,
+                    "page-fill-" + index
+            ));
+        }
+        store.save(new FillRecord(
+                Instant.ofEpochSecond(1100L),
+                "BTCUSDT",
+                "CYCLE_END",
+                BigDecimal.ZERO,
+                new BigDecimal("100"),
+                BigDecimal.ZERO,
+                BigDecimal.ZERO,
+                "USDT",
+                BigDecimal.ZERO,
+                BigDecimal.ZERO,
+                BigDecimal.ZERO,
+                BigDecimal.ZERO,
+                BigDecimal.ZERO,
+                BigDecimal.ZERO,
+                BigDecimal.ZERO,
+                BigDecimal.ZERO,
+                "CYCLE_END_GRID_BTCUSDT_PB_page",
+                "cycle-end-page"
+        ));
+
+        CycleFillPage first = store.cycleFillsPage("cycle-end-page", 50, 0);
+        CycleFillPage second = store.cycleFillsPage("cycle-end-page", 50, 50);
+
+        assertEquals(75, first.total());
+        assertEquals(50, first.items().size());
+        assertTrue(first.hasMore());
+        assertEquals("page-fill-0", first.items().get(0).executionId());
+        assertEquals(25, second.items().size());
+        assertFalse(second.hasMore());
+        assertEquals("page-fill-50", second.items().get(0).executionId());
+        assertEquals(0, second.turnoverBefore().compareTo(new BigDecimal("5.000")));
+    }
+
+    @Test
     void saveRecomputesCumulativeQtyWhenPartialFillsArriveOutOfTimeOrder() {
         Path dbPath = tempDir.resolve("late-partial-fill.sqlite");
         SqliteFillStore store = new SqliteFillStore(dbPath);
@@ -518,6 +796,70 @@ class SqliteFillStoreTest {
         assertEquals("sell-later", fills.get(2).executionId());
         assertEquals(new BigDecimal("0.14054409"), fills.get(2).cumulativeQty());
         assertEquals(new BigDecimal("0.14054409"), fills.get(2).netQty());
+    }
+
+    @Test
+    void pagesCurrentCycleFundingFeesNewestFirstWithCycleCumulativeFunding() {
+        Path dbPath = tempDir.resolve("funding-fees-page.sqlite");
+        SqliteFillStore store = new SqliteFillStore(dbPath);
+        store.save(fill(
+                Instant.ofEpochSecond(1000L),
+                "BUY",
+                new BigDecimal("1"),
+                new BigDecimal("100"),
+                BigDecimal.ZERO,
+                "GRID_BTCUSDT_INIT_funding_page",
+                "initial"
+        ));
+        store.save(fill(
+                Instant.ofEpochSecond(1100L),
+                "FUNDING_FEE",
+                BigDecimal.ZERO,
+                new BigDecimal("101"),
+                new BigDecimal("-0.1"),
+                "FUNDING_BTCUSDT_1",
+                "funding-1"
+        ));
+        store.save(fill(
+                Instant.ofEpochSecond(1150L),
+                "BUY",
+                new BigDecimal("0.1"),
+                new BigDecimal("99"),
+                BigDecimal.ZERO,
+                "GRID_BTCUSDT_PB_funding_page",
+                "buy-1"
+        ));
+        store.save(fill(
+                Instant.ofEpochSecond(1200L),
+                "FUNDING_FEE",
+                BigDecimal.ZERO,
+                new BigDecimal("102"),
+                new BigDecimal("0.2"),
+                "FUNDING_BTCUSDT_2",
+                "funding-2"
+        ));
+        store.save(fill(
+                Instant.ofEpochSecond(1300L),
+                "FUNDING_FEE",
+                BigDecimal.ZERO,
+                new BigDecimal("103"),
+                new BigDecimal("-0.05"),
+                "FUNDING_BTCUSDT_3",
+                "funding-3"
+        ));
+
+        FundingFeePage first = store.currentCycleFundingFeesPage("BTCUSDT", 2, 0);
+        FundingFeePage second = store.currentCycleFundingFeesPage("BTCUSDT", 2, 2);
+
+        assertEquals(3, first.total());
+        assertTrue(first.hasMore());
+        assertEquals("funding-3", first.items().get(0).fill().executionId());
+        assertEquals(new BigDecimal("0.05"), first.items().get(0).cumulativeFundingFee());
+        assertEquals("funding-2", first.items().get(1).fill().executionId());
+        assertEquals(new BigDecimal("0.1"), first.items().get(1).cumulativeFundingFee());
+        assertFalse(second.hasMore());
+        assertEquals("funding-1", second.items().get(0).fill().executionId());
+        assertEquals(new BigDecimal("-0.1"), second.items().get(0).cumulativeFundingFee());
     }
 
     private FillRecord record(String side, String executionId) {

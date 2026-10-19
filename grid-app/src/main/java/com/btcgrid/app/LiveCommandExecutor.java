@@ -170,6 +170,59 @@ public class LiveCommandExecutor {
         return failures;
     }
 
+    /**
+     * Submits the operator-requested flatten order outside the ordinary grid
+     * order-size guard.  This path is intentionally narrow: it only accepts
+     * the dedicated market flatten reason and still caps a spot sell to the
+     * real trading-wallet inventory.
+     */
+    public List<String> executeManualFlatten(OrderIntent orderIntent, StrategyLedgerSnapshot ledgerSnapshot) {
+        List<String> failures = new ArrayList<>();
+        if (orderIntent == null
+                || orderIntent.type() != com.btcgrid.common.model.OrderType.MARKET
+                || !"manual-flatten-and-stop".equals(orderIntent.reason())) {
+            return List.of("invalid manual flatten order");
+        }
+        OrderIntent adjusted = adjustedForSpotInventory(orderIntent, ledgerSnapshot);
+        if (adjusted == null) {
+            return List.of();
+        }
+        StrategyCommand command = StrategyCommand.place(adjusted);
+        workingOrderRegistry.trackSubmitted(adjusted, Instant.now());
+        try {
+            BybitOrderSubmission submission = tradeGateway.submit(adjusted);
+            workingOrderRegistry.markAccepted(adjusted.clientOrderId(), submission.orderId(), Instant.now());
+            logCommand("command.place.manual-flatten", command, submission);
+        } catch (RuntimeException e) {
+            failures.add(e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+            workingOrderRegistry.markExpired(adjusted.clientOrderId(), Instant.now());
+            logCommandFailure("command.place.manual-flatten.failed", command, e);
+            alertService.warning("MANUAL_FLATTEN_FAILED", "Manual flatten order placement failed", Map.of(
+                    "clientOrderId", adjusted.clientOrderId(),
+                    "symbol", adjusted.symbol(),
+                    "message", e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage()
+            ));
+        }
+        return failures;
+    }
+
+    public BigDecimal spotBaseWalletBalance(String symbol) {
+        if (productCategory != ProductCategory.SPOT || accountGateway == null) {
+            return BigDecimal.ZERO;
+        }
+        String baseCoin = FillEvent.baseCoin(symbol);
+        String quoteCoin = quoteCoin(symbol);
+        if (baseCoin == null || quoteCoin == null) {
+            return BigDecimal.ZERO;
+        }
+        AccountAssetSnapshot snapshot = accountGateway.tradingWalletSnapshot(
+                "UNIFIED", baseCoin, quoteCoin, ProductCategory.SPOT, symbol
+        );
+        return snapshot.baseWalletBalance() == null
+                ? BigDecimal.ZERO
+                : snapshot.baseWalletBalance().max(BigDecimal.ZERO);
+    }
+
     private OrderIntent adjustedForSpotInventory(OrderIntent orderIntent, StrategyLedgerSnapshot ledgerSnapshot) {
         if (orderIntent == null
                 || productCategory != ProductCategory.SPOT

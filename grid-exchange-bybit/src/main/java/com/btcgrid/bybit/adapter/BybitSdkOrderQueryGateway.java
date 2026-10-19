@@ -38,6 +38,25 @@ public class BybitSdkOrderQueryGateway implements BybitOrderQueryGateway {
                 .limit(50)
                 .build();
         JsonNode root = objectMapper.valueToTree(client.getOpenOrders(request));
+        return workingOrders(root, symbol, null);
+    }
+
+    @Override
+    public List<WorkingOrder> fetchRecentOrders(String symbol, Set<String> clientOrderIds) {
+        if (clientOrderIds == null || clientOrderIds.isEmpty()) {
+            return List.of();
+        }
+        BybitApiTradeRestClient client = clientFactory.createTradeRestClient();
+        TradeOrderRequest request = TradeOrderRequest.builder()
+                .category(BybitSdkMapper.toCategory(category))
+                .symbol(symbol)
+                .limit(50)
+                .build();
+        JsonNode root = objectMapper.valueToTree(client.getOrderHistory(request));
+        return workingOrders(root, symbol, clientOrderIds);
+    }
+
+    private List<WorkingOrder> workingOrders(JsonNode root, String symbol, Set<String> clientOrderIds) {
         JsonNode list = root.path("result").path("list");
         List<WorkingOrder> result = new ArrayList<>();
         if (!list.isArray()) {
@@ -45,7 +64,7 @@ public class BybitSdkOrderQueryGateway implements BybitOrderQueryGateway {
         }
         for (JsonNode node : list) {
             String clientOrderId = node.path("orderLinkId").asText("");
-            if (clientOrderId.isBlank()) {
+            if (clientOrderId.isBlank() || (clientOrderIds != null && !clientOrderIds.contains(clientOrderId))) {
                 continue;
             }
             result.add(new WorkingOrder(
@@ -70,6 +89,15 @@ public class BybitSdkOrderQueryGateway implements BybitOrderQueryGateway {
         if (clientOrderIds == null || clientOrderIds.isEmpty()) {
             return List.of();
         }
+        return fetchRecentExecutionsInternal(symbol, clientOrderIds);
+    }
+
+    /** Returns recent executions for the symbol, including orders without an orderLinkId. */
+    public List<FillEvent> fetchRecentExecutions(String symbol) {
+        return fetchRecentExecutionsInternal(symbol, null);
+    }
+
+    private List<FillEvent> fetchRecentExecutionsInternal(String symbol, Set<String> clientOrderIds) {
         BybitApiTradeRestClient client = clientFactory.createTradeRestClient();
         TradeOrderRequest request = TradeOrderRequest.builder()
                 .category(BybitSdkMapper.toCategory(category))
@@ -84,7 +112,7 @@ public class BybitSdkOrderQueryGateway implements BybitOrderQueryGateway {
         }
         for (JsonNode node : list) {
             String clientOrderId = node.path("orderLinkId").asText("");
-            if (clientOrderId.isBlank() || !clientOrderIds.contains(clientOrderId)) {
+            if (clientOrderIds != null && (clientOrderId.isBlank() || !clientOrderIds.contains(clientOrderId))) {
                 continue;
             }
             String executionId = node.path("execId").asText("");
@@ -113,8 +141,8 @@ public class BybitSdkOrderQueryGateway implements BybitOrderQueryGateway {
             return OrderStatus.NEW;
         }
         return switch (status.toUpperCase()) {
-            case "FILLED", "PARTIALLYFILLED", "PARTIALLY_FILLED" -> OrderStatus.FILLED;
-            case "CANCELLED", "CANCELED", "DEACTIVATED" -> OrderStatus.CANCELED;
+            case "FILLED" -> OrderStatus.FILLED;
+            case "CANCELLED", "CANCELED", "DEACTIVATED", "PARTIALLYFILLEDCANCELED", "PARTIALLY_FILLED_CANCELED" -> OrderStatus.CANCELED;
             case "REJECTED", "EXPIRED" -> OrderStatus.EXPIRED;
             default -> OrderStatus.NEW;
         };

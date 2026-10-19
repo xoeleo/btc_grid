@@ -1,0 +1,15 @@
+# Track research source, tests, documentation and text configuration.
+# Keep downloaded market data, reports, ledgers and compiled artifacts local.
+*
+!*/
+!.gitignore
+!*.java
+!*.py
+!*.sh
+!*.md
+!*.properties
+!requirements*.txt
+!pyproject.toml
+!*.toml
+!*.yaml
+!*.yml

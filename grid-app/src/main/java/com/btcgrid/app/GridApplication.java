@@ -64,6 +64,8 @@ public class GridApplication {
         InstrumentSpec instrumentSpec = marketDataGateway.loadInstrumentSpec(config.symbol());
         MarketSnapshot snapshot = marketDataGateway.latestSnapshot(config.symbol());
         StrategyLedger strategyLedger = new InMemoryStrategyLedger(config.symbol());
+        BigDecimal profitSizingFeeRate = profitSizingEstimatedFeeRate(properties);
+        BigDecimal lossAddTriggerRate = lossAddTriggerRate(properties);
         GridStrategyEngine engine = new GridStrategyEngine(
                 config,
                 instrumentSpec,
@@ -72,7 +74,20 @@ public class GridApplication {
                 new GridOrderPlanner(
                         new ClientOrderIdFactory(),
                         profitableReduceSideMultiplier(properties),
-                        (market, ledger, orderPrice) -> currentCycleMarketPnl(fillStore, market, orderPrice).signum() > 0
+                        (market, ledger, orderPrice, orderQty) -> afterEstimatedOrderFee(
+                                currentCycleMarketPnl(fillStore, market, orderPrice),
+                                orderPrice,
+                                orderQty,
+                                profitSizingFeeRate
+                        ).signum() > 0,
+                        (market, ledger, orderPrice, orderQty) -> currentCycleLossRateAfterEstimatedFee(
+                                fillStore,
+                                market,
+                                orderPrice,
+                                orderQty,
+                                profitSizingFeeRate
+                        ).compareTo(lossAddTriggerRate.negate()) < 0,
+                        fillStore::profitSizingState
                 ),
                 true
         );
@@ -483,6 +498,74 @@ public class GridApplication {
 
     private static BigDecimal profitableReduceSideMultiplier(GridProperties properties) {
         return new BigDecimal(properties.rawProperties().getProperty("grid.profitable-reduce-side-multiplier", "1.10").trim());
+    }
+
+    private static BigDecimal profitSizingEstimatedFeeRate(GridProperties properties) {
+        return new BigDecimal(properties.rawProperties()
+                .getProperty("grid.profit-sizing-estimated-fee-rate", "0.0002")
+                .trim());
+    }
+
+    private static BigDecimal lossAddTriggerRate(GridProperties properties) {
+        return new BigDecimal(properties.rawProperties()
+                .getProperty("grid.loss-add-trigger-rate", "0.01")
+                .trim()).max(BigDecimal.ZERO);
+    }
+
+    static BigDecimal afterEstimatedOrderFee(
+            BigDecimal cyclePnl,
+            BigDecimal orderPrice,
+            BigDecimal orderQty,
+            BigDecimal feeRate
+    ) {
+        BigDecimal pnl = cyclePnl == null ? BigDecimal.ZERO : cyclePnl;
+        if (orderPrice == null || orderQty == null || feeRate == null
+                || orderPrice.signum() <= 0 || orderQty.signum() <= 0 || feeRate.signum() <= 0) {
+            return pnl;
+        }
+        return pnl.subtract(orderPrice.multiply(orderQty).multiply(feeRate));
+    }
+
+    static BigDecimal lossRateAfterEstimatedOrderFee(
+            BigDecimal cyclePnl,
+            BigDecimal cumulativeValue,
+            BigDecimal orderPrice,
+            BigDecimal orderQty,
+            BigDecimal feeRate
+    ) {
+        if (cumulativeValue == null || cumulativeValue.signum() == 0) {
+            return BigDecimal.ZERO;
+        }
+        return afterEstimatedOrderFee(cyclePnl, orderPrice, orderQty, feeRate)
+                .divide(cumulativeValue.abs(), 8, java.math.RoundingMode.HALF_UP);
+    }
+
+    static BigDecimal currentCycleLossRateAfterEstimatedFee(
+            FillStore fillStore,
+            MarketSnapshot marketSnapshot,
+            BigDecimal price,
+            BigDecimal orderQty,
+            BigDecimal feeRate
+    ) {
+        if (fillStore == null || marketSnapshot == null) {
+            return BigDecimal.ZERO;
+        }
+        BigDecimal pnlPrice = price == null || price.signum() <= 0 ? marketSnapshot.markPrice() : price;
+        CurrentCycleSummary cycle = fillStore.currentCycle(
+                marketSnapshot.symbol(),
+                Instant.now(),
+                pnlPrice
+        );
+        if (cycle == null) {
+            return BigDecimal.ZERO;
+        }
+        return lossRateAfterEstimatedOrderFee(
+                cycle.markPricePnl(),
+                cycle.cumulativeValue(),
+                pnlPrice,
+                orderQty,
+                feeRate
+        );
     }
 
     private static BigDecimal currentCycleMarketPnl(FillStore fillStore, MarketSnapshot marketSnapshot, BigDecimal price) {

@@ -11,3 +11,16 @@ runtime/
 test-results/
 local_108_migration/
 ff7c789-grid-startup-runtime-safeguards.patch
+
+# Python caches and compiled Java files
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.class
+
+# Local credentials and environment overrides
+.env
+.env.*
+*.env
+!.env.example
+!*.env.example

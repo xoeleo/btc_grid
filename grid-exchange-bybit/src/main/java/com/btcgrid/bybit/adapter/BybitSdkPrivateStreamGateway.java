@@ -15,33 +15,67 @@ import com.bybit.api.client.domain.websocket_message.private_channel.ExecutionDa
 import com.bybit.api.client.domain.websocket_message.private_channel.OrderData;
 import com.bybit.api.client.domain.websocket_message.private_channel.WebSocketExecutionMessage;
 import com.bybit.api.client.domain.websocket_message.private_channel.WebSocketOrderMessage;
-import com.bybit.api.client.service.BybitApiClientFactory;
-import com.bybit.api.client.websocket.httpclient.WebsocketStreamClient;
-import com.bybit.api.client.websocket.impl.WebsocketStreamClientImpl;
+import com.bybit.api.client.security.HmacSHA256Signer;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.JsonNode;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
 import okhttp3.WebSocket;
+import okhttp3.WebSocketListener;
 
 public class BybitSdkPrivateStreamGateway implements BybitPrivateStreamGateway {
 
     private static final String DEMO_STREAM_DOMAIN = "wss://stream-demo.bybit.com";
     private static final Logger LOGGER = Logger.getLogger(BybitSdkPrivateStreamGateway.class.getName());
-    private static final List<String> PRIVATE_TOPICS = List.of("execution", "execution.fast", "order");
+    // execution.fast can arrive before the standard execution event but omits
+    // fields such as execFee. Subscribing to both makes execution-id dedupe keep
+    // the incomplete event, so accounting must use the complete stream only.
+    private static final List<String> PRIVATE_TOPICS = List.of("execution", "order");
+    private static final long HEARTBEAT_INTERVAL_SECONDS = 20L;
 
     private final BybitSdkConfig config;
     private final ObjectMapper objectMapper = new ObjectMapper();
-    private WebsocketStreamClient websocketClient;
+    private final OkHttpClient httpClient;
+    private final ScheduledExecutorService heartbeatScheduler;
+    private final Object connectionLock = new Object();
+    private long connectionGeneration;
     private WebSocket webSocket;
+    private ScheduledFuture<?> heartbeatFuture;
 
     public BybitSdkPrivateStreamGateway(BybitSdkConfig config) {
+        this(
+                config,
+                new OkHttpClient.Builder().readTimeout(0, TimeUnit.MILLISECONDS).build(),
+                Executors.newSingleThreadScheduledExecutor(runnable -> {
+                    Thread thread = new Thread(runnable, "bybit-private-heartbeat");
+                    thread.setDaemon(true);
+                    return thread;
+                })
+        );
+    }
+
+    BybitSdkPrivateStreamGateway(
+            BybitSdkConfig config,
+            OkHttpClient httpClient,
+            ScheduledExecutorService heartbeatScheduler
+    ) {
         this.config = config;
+        this.httpClient = httpClient;
+        this.heartbeatScheduler = heartbeatScheduler;
     }
 
     @Override
@@ -54,30 +88,48 @@ public class BybitSdkPrivateStreamGateway implements BybitPrivateStreamGateway {
         String streamDomain = config.demo()
                 ? DEMO_STREAM_DOMAIN
                 : (config.testnet() ? BybitApiConfig.STREAM_TESTNET_DOMAIN : BybitApiConfig.STREAM_MAINNET_DOMAIN);
-        websocketClient = new WebsocketStreamClientImpl(
-                config.apiKey(),
-                config.apiSecret(),
-                streamDomain,
-                5,
-                "60s",
-                config.debugMode(),
-                "slf4j",
-                message -> handleMessage(message, executionListener, fundingFeeListener, orderListener, lifecycleListener)
-        ) {
+        long generation = beginConnection();
+        Request request = new Request.Builder()
+                .url(streamDomain + BybitApiConfig.V5_PRIVATE)
+                .build();
+        WebSocket socket = httpClient.newWebSocket(request, new WebSocketListener() {
             @Override
-            public void onOpen(WebSocket ws) {
-                super.onOpen(ws);
+            public void onOpen(WebSocket ws, Response response) {
+                if (!isCurrent(generation)) {
+                    ws.close(1000, "superseded");
+                    return;
+                }
                 logInfo("bybit.private-stream.socket-open", Map.of(
                         "streamDomain", streamDomain,
                         "path", BybitApiConfig.V5_PRIVATE,
                         "topics", PRIVATE_TOPICS
                 ));
                 lifecycleListener.onConnected();
+                sendJson(ws, authMessage(config.apiKey(), config.apiSecret(), System.currentTimeMillis()));
+                startHeartbeat(generation, ws);
             }
 
             @Override
-            public void onError(Throwable t) {
-                super.onError(t);
+            public void onMessage(WebSocket ws, String message) {
+                if (!isCurrent(generation)) {
+                    return;
+                }
+                handleMessage(
+                        message,
+                        ws,
+                        executionListener,
+                        fundingFeeListener,
+                        orderListener,
+                        lifecycleListener
+                );
+            }
+
+            @Override
+            public void onFailure(WebSocket ws, Throwable t, Response response) {
+                if (!isCurrent(generation)) {
+                    return;
+                }
+                clearCurrentConnection(generation);
                 logWarning("bybit.private-stream.socket-error", Map.of(
                         "message", t == null || t.getMessage() == null ? "" : t.getMessage()
                 ));
@@ -85,29 +137,38 @@ public class BybitSdkPrivateStreamGateway implements BybitPrivateStreamGateway {
             }
 
             @Override
-            public void onClose(WebSocket ws, int code, String reason) {
-                super.onClose(ws, code, reason);
+            public void onClosed(WebSocket ws, int code, String reason) {
+                if (!isCurrent(generation)) {
+                    return;
+                }
+                clearCurrentConnection(generation);
                 logWarning("bybit.private-stream.socket-close", Map.of(
                         "code", code,
                         "reason", reason == null ? "" : reason
                 ));
                 lifecycleListener.onDisconnected(code, reason);
             }
-        };
-        webSocket = websocketClient.getPrivateChannelStream(PRIVATE_TOPICS, BybitApiConfig.V5_PRIVATE);
+        });
+        finishConnection(generation, socket);
     }
 
     @Override
     public void close() {
-        if (webSocket != null) {
-            webSocket.close(1000, "btc-grid reconnect");
+        WebSocket socket;
+        synchronized (connectionLock) {
+            connectionGeneration++;
+            cancelHeartbeatLocked();
+            socket = webSocket;
+            webSocket = null;
         }
-        webSocket = null;
-        websocketClient = null;
+        if (socket != null) {
+            socket.close(1000, "btc-grid reconnect");
+        }
     }
 
-    private void handleMessage(
+    void handleMessage(
             String message,
+            WebSocket socket,
             PrivateExecutionListener executionListener,
             PrivateFundingFeeListener fundingFeeListener,
             PrivateOrderListener orderListener,
@@ -124,8 +185,8 @@ public class BybitSdkPrivateStreamGateway implements BybitPrivateStreamGateway {
                 lifecycleListener.onMessageReceived(op, "");
                 boolean success = root.path("success").asBoolean(root.path("retCode").asInt(-1) == 0);
                 handleOperationAck(op, success, message, lifecycleListener);
-                if ("auth".equalsIgnoreCase(op) && success && webSocket != null) {
-                    websocketClient.sendSubscribeMessage(webSocket, PRIVATE_TOPICS);
+                if ("auth".equalsIgnoreCase(op) && success) {
+                    sendJson(socket, subscribeMessage());
                     logInfo("bybit.private-stream.subscribe.sent", Map.of("topics", PRIVATE_TOPICS));
                 }
                 return;
@@ -214,6 +275,99 @@ public class BybitSdkPrivateStreamGateway implements BybitPrivateStreamGateway {
         } catch (IOException e) {
             logWarning("bybit.private-stream.message-parse-failed", Map.of("message", e.getMessage()));
             lifecycleListener.onStreamError(new IllegalStateException("Failed to parse private stream message", e));
+        }
+    }
+
+    static Map<String, Object> authMessage(String apiKey, String apiSecret, long nowMillis) {
+        long expires = nowMillis + 10_000L;
+        Map<String, Object> message = new LinkedHashMap<>();
+        message.put("req_id", UUID.randomUUID().toString());
+        message.put("op", "auth");
+        message.put("args", List.of(
+                apiKey,
+                expires,
+                HmacSHA256Signer.getSignature("GET/realtime" + expires, apiSecret)
+        ));
+        return message;
+    }
+
+    static Map<String, Object> subscribeMessage() {
+        Map<String, Object> message = new LinkedHashMap<>();
+        message.put("req_id", UUID.randomUUID().toString());
+        message.put("op", "subscribe");
+        message.put("args", PRIVATE_TOPICS);
+        return message;
+    }
+
+    private void sendJson(WebSocket socket, Map<String, Object> message) {
+        try {
+            socket.send(objectMapper.writeValueAsString(message));
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to serialize Bybit private stream message", e);
+        }
+    }
+
+    private long beginConnection() {
+        WebSocket previous;
+        long generation;
+        synchronized (connectionLock) {
+            generation = ++connectionGeneration;
+            cancelHeartbeatLocked();
+            previous = webSocket;
+            webSocket = null;
+        }
+        if (previous != null) {
+            previous.close(1000, "superseded");
+        }
+        return generation;
+    }
+
+    private void finishConnection(long generation, WebSocket socket) {
+        synchronized (connectionLock) {
+            if (generation == connectionGeneration) {
+                webSocket = socket;
+                return;
+            }
+        }
+        socket.close(1000, "superseded");
+    }
+
+    private boolean isCurrent(long generation) {
+        synchronized (connectionLock) {
+            return generation == connectionGeneration;
+        }
+    }
+
+    private void clearCurrentConnection(long generation) {
+        synchronized (connectionLock) {
+            if (generation != connectionGeneration) {
+                return;
+            }
+            connectionGeneration++;
+            cancelHeartbeatLocked();
+            webSocket = null;
+        }
+    }
+
+    private void startHeartbeat(long generation, WebSocket socket) {
+        synchronized (connectionLock) {
+            if (generation != connectionGeneration) {
+                return;
+            }
+            cancelHeartbeatLocked();
+            heartbeatFuture = heartbeatScheduler.scheduleAtFixedRate(() -> {
+                if (!isCurrent(generation)) {
+                    return;
+                }
+                socket.send("{\"op\":\"ping\"}");
+            }, HEARTBEAT_INTERVAL_SECONDS, HEARTBEAT_INTERVAL_SECONDS, TimeUnit.SECONDS);
+        }
+    }
+
+    private void cancelHeartbeatLocked() {
+        if (heartbeatFuture != null) {
+            heartbeatFuture.cancel(false);
+            heartbeatFuture = null;
         }
     }
 

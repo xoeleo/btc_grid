@@ -1,0 +1,14 @@
+[Unit]
+Description=BTC Grid SOL contract 5m Bollinger auto-cycle watcher
+After=network-online.target btc-grid.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/btc_grid/scripts/sol-contract-boll-cycle-watch.py
+Restart=always
+RestartSec=10
+WorkingDirectory=/opt/btc_grid
+
+[Install]
+WantedBy=multi-user.target
