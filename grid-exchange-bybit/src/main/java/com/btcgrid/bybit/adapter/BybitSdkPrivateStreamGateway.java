@@ -41,7 +41,10 @@ public class BybitSdkPrivateStreamGateway implements BybitPrivateStreamGateway {
 
     private static final String DEMO_STREAM_DOMAIN = "wss://stream-demo.bybit.com";
     private static final Logger LOGGER = Logger.getLogger(BybitSdkPrivateStreamGateway.class.getName());
-    private static final List<String> PRIVATE_TOPICS = List.of("execution", "execution.fast", "order");
+    // execution.fast can arrive before the standard execution event but omits
+    // fields such as execFee. Subscribing to both makes execution-id dedupe keep
+    // the incomplete event, so accounting must use the complete stream only.
+    private static final List<String> PRIVATE_TOPICS = List.of("execution", "order");
     private static final long HEARTBEAT_INTERVAL_SECONDS = 20L;
 
     private final BybitSdkConfig config;

@@ -100,8 +100,8 @@ public final class GridConfigLoader {
     private static RebalanceSettings rebalanceSettings(Properties properties, String runtimeEnvironment) {
         boolean enabled = Boolean.parseBoolean(properties.getProperty("rebalance.enabled", "false"));
         RebalanceMode mode = RebalanceMode.fromConfig(properties.getProperty("rebalance.mode", "price_target"));
-        BigDecimal autoMinTotalBtc = new BigDecimal(properties.getProperty("rebalance.auto-min-total-btc", "7").trim());
-        BigDecimal autoBaseGridQty = new BigDecimal(properties.getProperty("rebalance.auto-base-grid-qty", "0.005").trim());
+        BigDecimal autoMinTotalBtc = new BigDecimal(properties.getProperty("rebalance.auto-min-total-btc", "6").trim());
+        BigDecimal autoBaseGridQty = new BigDecimal(properties.getProperty("rebalance.auto-base-grid-qty", "0.003").trim());
         BigDecimal autoInitialSteps = new BigDecimal(properties.getProperty("rebalance.auto-initial-steps", "5").trim());
         ProductCategory category = ProductCategory.fromConfig(properties.getProperty("rebalance.category", "spot"));
         String symbol = properties.getProperty("rebalance.symbol", "BTCUSDT").trim().toUpperCase();

@@ -6,6 +6,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Set;
 import com.btcgrid.strategy.model.ProfitSizingState;
+import com.btcgrid.strategy.model.QuantityRoundingState;
 
 public interface FillStore {
 
@@ -55,6 +56,8 @@ public interface FillStore {
     CurrentCycleSummary currentCycle(String symbol, Instant now, BigDecimal markPrice);
 
     ProfitSizingState profitSizingState(String symbol);
+
+    QuantityRoundingState quantityRoundingState(String symbol);
 
     CurrentCycleSummary latestOpenCycle(Instant now, BigDecimal markPrice);
 

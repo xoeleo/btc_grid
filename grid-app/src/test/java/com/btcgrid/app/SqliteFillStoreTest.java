@@ -46,6 +46,65 @@ class SqliteFillStoreTest {
     }
 
     @Test
+    void duplicateExecutionBackfillsRicherFeeAndRecomputesCycleTotals() {
+        Path dbPath = tempDir.resolve("fee-reconcile.sqlite");
+        SqliteFillStore store = new SqliteFillStore(dbPath);
+        FillRecord initialWithoutFee = fill(
+                Instant.ofEpochSecond(1), "BUY", new BigDecimal("0.015"), new BigDecimal("100"),
+                BigDecimal.ZERO, "RBAL_BTCUSDT_I_fee", "initial-fee-exec"
+        );
+        store.save(initialWithoutFee);
+        store.save(fill(
+                Instant.ofEpochSecond(2), "SELL", new BigDecimal("0.003"), new BigDecimal("101"),
+                new BigDecimal("0.03"), "RBAL_BTCUSDT_PS_fee", "sell-fee-exec"
+        ));
+        store.save(fill(
+                Instant.ofEpochSecond(1), "BUY", new BigDecimal("0.015"), new BigDecimal("100"),
+                new BigDecimal("0.40"), "RBAL_BTCUSDT_I_fee", "initial-fee-exec"
+        ));
+
+        List<FillRecord> fills = store.currentCycleFills("BTCUSDT");
+        assertEquals(2, fills.size());
+        assertEquals(0, new BigDecimal("0.40").compareTo(fills.get(0).fee()));
+        assertEquals(0, new BigDecimal("0.43").compareTo(fills.get(1).cumulativeFee()));
+        assertEquals(0, new BigDecimal("0.43").compareTo(
+                store.currentCycle("BTCUSDT", Instant.now(), new BigDecimal("101")).cumulativeTradingFee()));
+    }
+
+    @Test
+    void restoresBuyAndSellGridRoundingCarryFromCurrentCycleMetadata() {
+        Path dbPath = tempDir.resolve("rounding-carry.sqlite");
+        SqliteFillStore store = new SqliteFillStore(dbPath);
+        store.save(fillWithMetadata(
+                Instant.ofEpochSecond(1000L),
+                "BUY",
+                new BigDecimal("0.015"),
+                new BigDecimal("76000"),
+                "GRID_BTCUSDT_INIT_rounding",
+                "rounding-initial",
+                "{}"
+        ));
+        store.save(fillWithMetadata(
+                Instant.ofEpochSecond(1100L),
+                "SELL",
+                new BigDecimal("0.004"),
+                new BigDecimal("76323.9"),
+                "GRID_BTCUSDT_PS_rounding",
+                "rounding-sell",
+                "{\"buyGridRoundingCarryQty\":\"0.0002\","
+                        + "\"sellGridRoundingCarryQty\":\"0.0005\"}"
+        ));
+
+        assertEquals(
+                new com.btcgrid.strategy.model.QuantityRoundingState(
+                        new BigDecimal("0.0002"),
+                        new BigDecimal("0.0005")
+                ),
+                new SqliteFillStore(dbPath).quantityRoundingState("BTCUSDT")
+        );
+    }
+
+    @Test
     void returnsCycleEndRecordsSeparately() {
         Path dbPath = tempDir.resolve("cycles.sqlite");
         SqliteFillStore store = new SqliteFillStore(dbPath);

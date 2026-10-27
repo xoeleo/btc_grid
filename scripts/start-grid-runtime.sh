@@ -65,6 +65,12 @@ start_app() {
   fi
 
   local jar cp
+  local feishu_env="${REBALANCE_FEISHU_ENV_FILE:-${HOME}/.config/btc-grid/rebalance-feishu.env}"
+  if [[ -f "${feishu_env}" ]]; then
+    set -a
+    source "${feishu_env}"
+    set +a
+  fi
   jar="$(app_jar)"
   cp="${jar}:${ROOT_DIR}/lib/*"
   local java_args="${JAVA_OPTS:-}"

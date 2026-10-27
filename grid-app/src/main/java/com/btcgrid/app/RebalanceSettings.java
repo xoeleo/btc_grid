@@ -53,7 +53,7 @@ public record RebalanceSettings(
             String configFilePath,
             String stateFilePath
     ) {
-        this(enabled, RebalanceMode.PRICE_TARGET, new BigDecimal("7"), new BigDecimal("0.005"),
+        this(enabled, RebalanceMode.PRICE_TARGET, new BigDecimal("6"), new BigDecimal("0.003"),
                 new BigDecimal("5"), category, symbol, accountType,
                 baseCoin, quoteCoin, bands, ratioThreshold, baseGridSpacing, gridRequoteShrinkFactor,
                 baseGridQty, maxInitialSteps, maxOrderQty, maxInventoryQty, priceOffsetRatio,
