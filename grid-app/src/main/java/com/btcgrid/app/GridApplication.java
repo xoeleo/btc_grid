@@ -20,6 +20,7 @@ import com.btcgrid.ledger.service.InMemoryStrategyLedger;
 import com.btcgrid.ledger.service.StrategyLedger;
 import com.btcgrid.strategy.model.StrategyRuntimeState;
 import com.btcgrid.strategy.model.StrategyStateSnapshot;
+import com.btcgrid.strategy.model.GridSafetyState;
 import com.btcgrid.strategy.service.ClientOrderIdFactory;
 import com.btcgrid.strategy.service.GridOrderPlanner;
 import com.btcgrid.strategy.service.GridStrategyEngine;
@@ -125,7 +126,6 @@ public class GridApplication {
                 eventLogger,
                 alertService
         );
-        repairFilledWorkingOrders(config.symbol(), fillStore, workingOrderRegistry);
         RuntimeConsistencyResult consistencyResult = new ActivePairConsistencyService()
                 .reconcile(engine.runtimeState(), workingOrderRegistry.snapshot());
         if (consistencyResult.corrected()) {
@@ -146,7 +146,9 @@ public class GridApplication {
                 engine.activeSpacing(),
                 Set.copyOf(processedExecutionIds),
                 List.copyOf(workingOrderRegistry.snapshot()),
-                config
+                config,
+                stateStore.load().filter(saved -> saved.ledgerSnapshot().netQty().compareTo(strategyLedger.snapshot().netQty()) == 0)
+                        .map(StrategyStateSnapshot::safetyState).orElse(null)
         ));
         eventLogger.info("startup.ready", java.util.Map.of(
                 "symbol", config.symbol(),
@@ -183,6 +185,15 @@ public class GridApplication {
                 workingOrderRegistry,
                 fillStore
         );
+        // A persisted UI stop lock also interlocks the direct auto-start path.
+        if (Boolean.TRUE.equals(liveControlService.controlState().get("flattenStopLocked"))) {
+            StrategyStateSnapshot saved = stateStore.load().orElseThrow();
+            GridSafetyState old = saved.safetyState();
+            stateStore.save(new StrategyStateSnapshot(saved.ledgerSnapshot(), saved.runtimeState(), saved.activeSpacing(),
+                    saved.processedExecutionIds(), saved.trackedWorkingOrders(), saved.cycleConfig(),
+                    new GridSafetyState(true, old == null ? null : old.flattenClientOrderId(), old == null ? null : old.executionsThrough(),
+                            old != null && old.ledgerTrusted(), old == null ? java.util.Map.of() : old.accountedExecutionQty())));
+        }
         new RuntimeStatusPublisher(
                 config.symbol(),
                 engine,
@@ -222,7 +233,8 @@ public class GridApplication {
                     new BybitSdkPrivateStreamGateway(properties.bybitSdkConfig()),
                     engine,
                     strategyLedger,
-                    new LiveCommandExecutor(tradeGateway, workingOrderRegistry, new RiskGuardService(config), eventLogger, alertService),
+                    new LiveCommandExecutor(tradeGateway, workingOrderRegistry, new RiskGuardService(config), eventLogger, alertService,
+                            config.category(), new BybitSdkAccountGateway(sdkClientFactory)),
                     new BybitSdkOrderQueryGateway(sdkClientFactory, config.category()),
                     new BybitSdkFundingFeeQueryGateway(sdkClientFactory, config.category()),
                     stateStore,
@@ -577,16 +589,4 @@ public class GridApplication {
         return cycle == null || cycle.markPricePnl() == null ? BigDecimal.ZERO : cycle.markPricePnl();
     }
 
-    private static void repairFilledWorkingOrders(String symbol, FillStore fillStore, WorkingOrderRegistry workingOrderRegistry) {
-        Collection<String> openClientOrderIds = workingOrderRegistry.snapshot().stream()
-                .filter(order -> order.status() == com.btcgrid.common.model.OrderStatus.NEW)
-                .map(order -> order.clientOrderId())
-                .collect(Collectors.toSet());
-        Set<String> filledClientOrderIds = fillStore.filledClientOrderIds(symbol, openClientOrderIds);
-        if (filledClientOrderIds.isEmpty()) {
-            return;
-        }
-        Instant now = Instant.now();
-        filledClientOrderIds.forEach(clientOrderId -> workingOrderRegistry.markFilled(clientOrderId, now));
-    }
 }

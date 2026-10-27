@@ -23,6 +23,7 @@ import com.btcgrid.common.model.WorkingOrder;
 import com.btcgrid.ledger.service.StrategyLedger;
 import com.btcgrid.strategy.model.ActiveOrderPair;
 import com.btcgrid.strategy.model.StrategyStateSnapshot;
+import com.btcgrid.strategy.model.GridSafetyState;
 import com.btcgrid.strategy.service.GridStrategyEngine;
 import java.math.BigDecimal;
 import java.time.Duration;
@@ -77,6 +78,22 @@ public class GridLiveRunner implements AutoCloseable, PrivateExecutionListener, 
     private final AtomicReference<Instant> lastPrivateStreamMessageAt = new AtomicReference<>(Instant.EPOCH);
     private final Object privateStreamConnectionMonitor = new Object();
     private volatile ScheduledFuture<?> reconnectFuture;
+    private boolean stopRequested;
+    private String flattenClientOrderId;
+    private Instant executionsThrough;
+    private Instant queriedThrough;
+    private boolean ledgerTrusted;
+    private volatile boolean recoveryReady;
+    private boolean reconciling;
+    private String recoveryError = "启动对账尚未完成";
+    private final Map<String, BigDecimal> accountedExecutionQty = new java.util.HashMap<>();
+
+    public synchronized String recoveryStatus() {
+        return recoveryReady ? (stopRequested ? "停止待确认，仅保留对账监控" : "ready") : recoveryError;
+    }
+
+    public synchronized boolean isStopPending() { return stopRequested; }
+
 
     public GridLiveRunner(
             GridProperties properties,
@@ -350,30 +367,82 @@ public class GridLiveRunner implements AutoCloseable, PrivateExecutionListener, 
                 latestSnapshot,
                 processedExecutionIds
         );
+        commandExecutor.setBeforeExchangeMutation(this::persistState);
     }
 
-    public void start() {
+    public synchronized void start() {
+        restoreSafetyState();
         running.set(true);
         MarketSnapshot snapshot = marketDataGateway.latestSnapshot(properties.strategyConfig().symbol());
         latestSnapshot.set(snapshot);
         connectPrivateStream();
-        waitForPrivateStreamConnection();
+        try { waitForPrivateStreamConnection(); }
+        catch (RuntimeException e) {
+            running.set(true);
+            recoveryReady = false;
+            eventLogger.warn("private-stream.monitor-only", Map.of("message", e.getMessage()));
+            scheduleReconnect();
+        }
         eventLogger.info("live.start", Map.of("symbol", properties.strategyConfig().symbol(), "state", strategyEngine.runtimeState().state().name()));
         reconcileFundingFees();
-        boolean recoveredExecution = reconcileMissingExecutions();
-        List<String> failures = commandExecutor.execute(evaluateMarket(snapshot, recoveredExecution), strategyLedger.snapshot());
-        pollRebalance();
-        if (strategyEngine.runtimeState().state() == GridState.OPENING_FIRST_POSITION && noOpenOrders()) {
-            running.set(false);
-            throw new IllegalStateException(failures.isEmpty()
-                    ? "Initial position order was not accepted by Bybit"
-                    : failures.get(0));
-        }
+        recoverAndEvaluate(snapshot);
         persistState();
         runtimeStatusPublisher.publish();
-        long pollSeconds = properties.runtimeSettings().marketPollInterval().toSeconds();
+        long pollSeconds = Math.max(1, properties.runtimeSettings().marketPollInterval().toSeconds());
         scheduler.scheduleAtFixedRate(this::pollMarket, pollSeconds, pollSeconds, TimeUnit.SECONDS);
         scheduler.scheduleAtFixedRate(this::checkPrivateStreamFreshness, 30, 30, TimeUnit.SECONDS);
+    }
+
+    private void restoreSafetyState() {
+        StrategyStateSnapshot saved = stateStore.load().orElse(null);
+        GridSafetyState safety = saved != null && saved.ledgerSnapshot().symbol().equalsIgnoreCase(properties.strategyConfig().symbol())
+                ? saved.safetyState() : null;
+        if (safety != null) {
+            stopRequested = safety.stopRequested();
+            flattenClientOrderId = safety.flattenClientOrderId();
+            executionsThrough = safety.executionsThrough();
+            ledgerTrusted = safety.ledgerTrusted() && safety.executionsThrough() != null;
+            accountedExecutionQty.putAll(safety.accountedExecutionQty());
+            if (!saved.ledgerSnapshot().equals(strategyLedger.snapshot())
+                    || !saved.processedExecutionIds().equals(processedExecutionIds)) {
+                ledgerTrusted = false;
+            }
+        } else {
+            // Only a new, empty strategy has an unambiguous zero-inventory baseline.
+            ledgerTrusted = strategyLedger.snapshot().netQty().signum() == 0
+                    && workingOrderRegistry.snapshot().isEmpty()
+                    && processedExecutionIds.isEmpty();
+            executionsThrough = ledgerTrusted ? Instant.now() : null;
+        }
+        if (strategyWorkingOrders().stream().anyMatch(o -> "unattributed-startup-order".equals(o.reason()))) ledgerTrusted = false;
+    }
+
+    private void recoverAndEvaluate(MarketSnapshot snapshot) {
+        try {
+            reconciling = true;
+            recoveryReady = false;
+            boolean recovered = reconcileMissingExecutions();
+            OpenOrderReconciliation orders = reconcileOpenOrders();
+            if (!ledgerTrusted) {
+                throw new IllegalStateException("缺少可信策略账本或恢复水位，需人工核对历史成交；禁止下单和自动清仓");
+            }
+            executionsThrough = queriedThrough;
+            if (!stopRequested && !privateStreamSubscribed.get()) throw new IllegalStateException("私有流未订阅，仅保留对账监控");
+            recoveryReady = true;
+            reconciling = false;
+            persistState();
+            if (!stopRequested) {
+                commandExecutor.execute(evaluateMarket(snapshot, recovered || orders.recoveredExecution(), orders.orderStateChanged()), strategyLedger.snapshot());
+                pollRebalance();
+            }
+        } catch (RuntimeException e) {
+            recoveryReady = false;
+            recoveryError = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+            eventLogger.error("recovery.blocked", Map.of("message", recoveryError));
+            alertService.warning("RECOVERY_BLOCKED", "仅保留查询监控，禁止策略下单", Map.of("message", recoveryError));
+        } finally {
+            reconciling = false;
+        }
     }
 
     @Override
@@ -408,7 +477,7 @@ public class GridLiveRunner implements AutoCloseable, PrivateExecutionListener, 
     }
 
     @Override
-    public void onOrderUpdate(OrderUpdateEvent orderUpdateEvent) {
+    public synchronized void onOrderUpdate(OrderUpdateEvent orderUpdateEvent) {
         if (rebalanceService != null && RebalanceService.isRebalanceClientOrder(orderUpdateEvent.clientOrderId())) {
             workingOrderRegistry.applyUpdate(orderUpdateEvent);
             rebalanceService.onOrderUpdate(
@@ -419,10 +488,11 @@ public class GridLiveRunner implements AutoCloseable, PrivateExecutionListener, 
             );
             return;
         }
-        if (!isStrategySymbol(orderUpdateEvent.symbol())) {
+        if (!isStrategySymbol(orderUpdateEvent.symbol()) || !isOwnedOrderId(orderUpdateEvent.clientOrderId())) {
             return;
         }
         workingOrderRegistry.applyUpdate(orderUpdateEvent);
+        recoveryReady = false;
         eventLogger.info("order.update", Map.of(
                 "clientOrderId", orderUpdateEvent.clientOrderId(),
                 "exchangeOrderId", orderUpdateEvent.exchangeOrderId(),
@@ -472,12 +542,29 @@ public class GridLiveRunner implements AutoCloseable, PrivateExecutionListener, 
         return stopAfterCycle.get();
     }
 
-    public void stopNow() {
-        cancelWorkingOrders();
+    public synchronized void stopNow() {
+        stopRequested = true;
+        recoveryReady = false;
+        persistState();
+        List<String> failures = cancelWorkingOrders();
+        persistState();
+        if (!failures.isEmpty() || !noOpenOrders()) {
+            throw new IllegalStateException("停止待确认：保留监控，等待撤单终态与成交对账");
+        }
+        reconcileMissingExecutions();
+        reconcileOpenOrders();
+        executionsThrough = queriedThrough;
+        if (flattenClientOrderId == null) stopRequested = false;
+        persistState();
         close();
     }
 
     public synchronized List<String> cancelOrder(String symbol, String clientOrderId) {
+        if (!isStrategySymbol(symbol) || !isOwnedOrderId(clientOrderId)
+                || strategyWorkingOrders().stream().noneMatch(o -> o.clientOrderId().equals(clientOrderId))) {
+            return List.of("拒绝撤销未归属本策略的订单");
+        }
+        recoveryReady = false;
         List<String> failures = commandExecutor.execute(
                 List.of(StrategyCommand.cancel(symbol, clientOrderId, "manual-cancel")),
                 strategyLedger.snapshot()
@@ -487,52 +574,99 @@ public class GridLiveRunner implements AutoCloseable, PrivateExecutionListener, 
         return failures;
     }
 
+    public synchronized void requestStopForFlatten() {
+        stopRequested = true;
+        recoveryReady = false;
+        recoveryError = "停止待确认：保留对账监控，禁止新策略订单";
+        persistState();
+    }
+
     public void flattenAndStop() {
-        RuntimeException failure = null;
-        try {
-            List<String> cancelFailures = cancelWorkingOrders();
-            if (!cancelFailures.isEmpty()) {
-                throw new IllegalStateException("撤单失败: " + String.join("; ", cancelFailures));
+        synchronized (this) {
+            stopRequested = true;
+            recoveryReady = false;
+            recoveryError = "停止待确认：保留对账监控，禁止新策略订单";
+            persistState(); // Must succeed before any exchange mutation.
+            List<String> failures = cancelWorkingOrders();
+            persistState();
+            if (!failures.isEmpty()) {
+                throw new IllegalStateException("撤单结果待确认，保留监控: " + String.join("; ", failures));
             }
-            BigDecimal netQty = properties.strategyConfig().entryDirection().isSpotLongOnly()
-                    ? commandExecutor.spotBaseWalletBalance(properties.strategyConfig().symbol())
-                    : strategyLedger.snapshot().netQty();
-            if (netQty.signum() != 0) {
-                InstrumentSpec instrumentSpec = marketDataGateway.loadInstrumentSpec(properties.strategyConfig().symbol());
-                BigDecimal flattenQty = instrumentSpec.roundQtyDown(netQty.abs());
-                if (flattenQty.compareTo(instrumentSpec.minOrderQty()) < 0) {
-                    eventLogger.info("manual-flatten.dust-skipped", Map.of(
-                            "symbol", properties.strategyConfig().symbol(),
-                            "walletQty", netQty.abs(),
-                            "qtyStep", instrumentSpec.qtyStep(),
-                            "minOrderQty", instrumentSpec.minOrderQty()
-                    ));
-                    return;
-                }
-                TradeSide side = netQty.signum() > 0 ? TradeSide.SELL : TradeSide.BUY;
-                OrderIntent flatten = new OrderIntent(
-                        properties.strategyConfig().symbol(),
-                        "MANUAL_FLATTEN_" + System.currentTimeMillis(),
-                        side,
-                        OrderType.MARKET,
-                        flattenQty,
-                        null,
-                        !properties.strategyConfig().entryDirection().isSpotLongOnly(),
-                        "manual-flatten-and-stop"
-                );
-                List<String> flattenFailures = commandExecutor.executeManualFlatten(flatten, strategyLedger.snapshot());
-                if (!flattenFailures.isEmpty()) {
-                    throw new IllegalStateException("清仓下单失败: " + String.join("; ", flattenFailures));
+        }
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        do {
+            synchronized (this) {
+                reconciling = true;
+                try {
+                    reconcileMissingExecutions();
+                    reconcileOpenOrders();
+                    executionsThrough = queriedThrough;
+                    if (!ledgerTrusted) {
+                        throw new IllegalStateException("策略账本归属或恢复水位不可信，禁止自动清仓，请人工核对");
+                    }
+                    boolean gridOrdersTerminal = strategyWorkingOrders().stream()
+                            .filter(o -> !o.clientOrderId().equals(flattenClientOrderId))
+                            .noneMatch(GridLiveRunner::isActiveOrder);
+                    if (gridOrdersTerminal) {
+                        if (flattenClientOrderId == null) {
+                            BigDecimal netQty = strategyLedger.snapshot().netQty();
+                            if (netQty.signum() == 0) {
+                                persistState();
+                                close();
+                                return;
+                            }
+                            InstrumentSpec spec = marketDataGateway.loadInstrumentSpec(properties.strategyConfig().symbol());
+                            BigDecimal qty = netQty.abs();
+                            if (properties.strategyConfig().entryDirection().isSpotLongOnly()) {
+                                if (netQty.signum() < 0) throw new IllegalStateException("现货策略净持仓为负，需人工核对");
+                                qty = qty.min(commandExecutor.spotBaseWalletBalance(properties.strategyConfig().symbol()));
+                            }
+                            qty = spec.roundQtyDown(qty);
+                            if (qty.signum() <= 0 || qty.compareTo(spec.minOrderQty()) < 0) {
+                                throw new IllegalStateException("剩余策略持仓低于最小可卖数量或余额不足，未完成清仓，需人工核对");
+                            }
+                            MarketSnapshot market = latestSnapshot.get();
+                            if (spec.minNotionalValue() != null && spec.minNotionalValue().signum() > 0
+                                    && (market == null || qty.multiply(market.lastPrice()).compareTo(spec.minNotionalValue()) < 0)) {
+                                throw new IllegalStateException("剩余策略持仓未满足交易所最小成交额，未完成清仓，需人工核对");
+                            }
+                            flattenClientOrderId = "MANUAL_FLATTEN_" + java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 20);
+                            OrderIntent flatten = new OrderIntent(properties.strategyConfig().symbol(), flattenClientOrderId,
+                                    netQty.signum() > 0 ? TradeSide.SELL : TradeSide.BUY, OrderType.MARKET, qty, null,
+                                    !properties.strategyConfig().entryDirection().isSpotLongOnly(), "manual-flatten-and-stop");
+                            // Persist both the unique ID and unknown submission before sending. Never submit it again.
+                            workingOrderRegistry.trackSubmitted(flatten, Instant.now());
+                            persistState();
+                            List<String> failures = commandExecutor.executeManualFlatten(flatten, strategyLedger.snapshot());
+                            persistState();
+                            if (!failures.isEmpty()) throw new IllegalStateException("清仓请求未确认，保留原订单标识并继续对账: " + String.join("; ", failures));
+                        } else {
+                            WorkingOrder flatten = strategyWorkingOrders().stream()
+                                    .filter(o -> o.clientOrderId().equals(flattenClientOrderId)).findFirst()
+                                    .orElseThrow(() -> new IllegalStateException("清仓订单记录缺失，禁止重复清仓"));
+                            if (!isActiveOrder(flatten)) {
+                                if (strategyLedger.snapshot().netQty().signum() == 0 && flatten.status() == OrderStatus.FILLED) {
+                                    persistState();
+                                    close();
+                                    return;
+                                }
+                                throw new IllegalStateException("清仓订单已终态但策略仍有持仓，未完成清仓，需人工核对");
+                            }
+                        }
+                    }
+                    persistState();
+                    runtimeStatusPublisher.publish();
+                } finally {
+                    reconciling = false;
                 }
             }
-        } catch (RuntimeException e) {
-            failure = e;
-        } finally {
-            close();
-        }
-        if (failure != null) {
-            throw failure;
-        }
+            try { Thread.sleep(200L); }
+            catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("停止待确认：等待被中断，保留监控", e);
+            }
+        } while (System.nanoTime() < deadline && !shutdown.get());
+        throw new IllegalStateException("停止待确认：30秒内未确认所有终态及完整成交，保留监控，禁止新策略订单");
     }
 
     private List<String> cancelWorkingOrders() {
@@ -540,6 +674,8 @@ public class GridLiveRunner implements AutoCloseable, PrivateExecutionListener, 
         workingOrderRegistry.snapshot().stream()
                 .filter(order -> order != null && isStrategySymbol(order.symbol()))
                 .filter(order -> order.status() == OrderStatus.NEW)
+                .filter(order -> isOwnedOrderId(order.clientOrderId()))
+                .filter(order -> !order.clientOrderId().equals(flattenClientOrderId))
                 .forEach(order -> cancels.add(StrategyCommand.cancel(order.symbol(), order.clientOrderId(), "manual-stop")));
         return commandExecutor.execute(cancels, strategyLedger.snapshot());
     }
@@ -552,12 +688,7 @@ public class GridLiveRunner implements AutoCloseable, PrivateExecutionListener, 
             MarketSnapshot snapshot = marketDataGateway.latestSnapshot(properties.strategyConfig().symbol());
             latestSnapshot.set(snapshot);
             reconcileFundingFees();
-            boolean recoveredExecution = reconcileMissingExecutions();
-            OpenOrderReconciliation openOrderReconciliation = reconcileOpenOrders();
-            recoveredExecution = recoveredExecution || openOrderReconciliation.recoveredExecution();
-            List<StrategyCommand> commands = evaluateMarket(snapshot, recoveredExecution, openOrderReconciliation.orderStateChanged());
-            commandExecutor.execute(commands, strategyLedger.snapshot());
-            pollRebalance();
+            recoverAndEvaluate(snapshot);
             persistState();
             runtimeStatusPublisher.publish();
         } catch (Exception e) {
@@ -571,6 +702,7 @@ public class GridLiveRunner implements AutoCloseable, PrivateExecutionListener, 
     }
 
     private List<StrategyCommand> evaluateMarket(MarketSnapshot snapshot, boolean recoveredExecution, boolean reconciledOpenOrders) {
+        if (!running.get() || shutdown.get() || stopRequested || !recoveryReady || reconciling || workingOrderRegistry.hasPendingCancellation()) return List.of();
         List<StrategyCommand> commands = cancelStaleActiveOrders();
         if (commands.isEmpty() && reconciledOpenOrders && !recoveredExecution) {
             eventLogger.warn("active-pair.repair.deferred", Map.of(
@@ -621,7 +753,7 @@ public class GridLiveRunner implements AutoCloseable, PrivateExecutionListener, 
         }
         List<StrategyCommand> cancels = workingOrderRegistry.snapshot().stream()
                 .filter(GridLiveRunner::isActiveOrder)
-                .filter(order -> isStrategySymbol(order.symbol()))
+                .filter(order -> isStrategySymbol(order.symbol()) && isOwnedOrderId(order.clientOrderId()))
                 .filter(order -> !pairClientOrderIds.contains(order.clientOrderId()))
                 .map(order -> StrategyCommand.cancel(order.symbol(), order.clientOrderId(), "stale-active-order"))
                 .toList();
@@ -730,26 +862,27 @@ public class GridLiveRunner implements AutoCloseable, PrivateExecutionListener, 
     }
 
     private boolean reconcileMissingExecutions() {
-        if (orderQueryGateway == null) {
-            return false;
+        if (orderQueryGateway == null) throw new IllegalStateException("缺少成交查询接口，禁止下单");
+        Instant end = Instant.now();
+        List<WorkingOrder> owned = strategyWorkingOrders().stream().filter(o -> isOwnedOrderId(o.clientOrderId())).toList();
+        Set<String> ids = owned.stream().map(WorkingOrder::clientOrderId).collect(Collectors.toSet());
+        Instant start = executionsThrough;
+        if (start == null) {
+            start = owned.stream().map(WorkingOrder::createdAt).filter(java.util.Objects::nonNull).min(Instant::compareTo).orElse(end);
         }
-        Set<String> clientOrderIds = workingOrderRegistry.snapshot().stream()
-                .map(order -> order.clientOrderId())
-                .filter(clientOrderId -> clientOrderId != null && clientOrderId.startsWith("GRID_"))
-                .collect(Collectors.toSet());
-        if (clientOrderIds.isEmpty()) {
-            return false;
-        }
-        boolean reconciled = false;
-        try {
-            for (FillEvent fillEvent : orderQueryGateway.fetchRecentExecutions(properties.strategyConfig().symbol(), clientOrderIds)) {
-                reconciled = handleExecution(fillEvent, "rest-reconcile") || reconciled;
+        if (start.isAfter(end)) throw new IllegalStateException("恢复水位晚于当前时间，禁止下单");
+        boolean recovered = false;
+        for (FillEvent fill : orderQueryGateway.fetchExecutions(properties.strategyConfig().symbol(), null, start.minusSeconds(1), end)) {
+            if (!isStrategySymbol(fill.symbol()) || !isOwnedOrderId(fill.clientOrderId())) continue;
+            if (!ids.contains(fill.clientOrderId())) {
+                ledgerTrusted = false;
+                throw new IllegalStateException("发现本地未跟踪的策略前缀成交，需人工核对: " + fill.clientOrderId());
             }
-        } catch (RuntimeException e) {
-            eventLogger.error("execution.reconcile.failed", Map.of("at", Instant.now(), "message", e.getMessage()));
-            alertService.warning("EXECUTION_RECONCILE_FAILED", "Execution reconciliation failed", Map.of("message", e.getMessage()));
+            recovered = handleExecution(fill, "rest-reconcile") || recovered;
         }
-        return reconciled;
+        // Keep an overlap; execution IDs make replay idempotent.
+        queriedThrough = end;
+        return recovered;
     }
 
     private boolean reconcileFundingFees() {
@@ -774,107 +907,44 @@ public class GridLiveRunner implements AutoCloseable, PrivateExecutionListener, 
     }
 
     private OpenOrderReconciliation reconcileOpenOrders() {
-        if (orderQueryGateway == null) {
-            return OpenOrderReconciliation.none();
+        if (orderQueryGateway == null) throw new IllegalStateException("缺少订单查询接口");
+        List<WorkingOrder> remote = orderQueryGateway.fetchOpenOrders(properties.strategyConfig().symbol()).stream()
+                .filter(o -> isStrategySymbol(o.symbol()) && isOwnedOrderId(o.clientOrderId())).toList();
+        Set<String> known = strategyWorkingOrders().stream().map(WorkingOrder::clientOrderId).collect(Collectors.toSet());
+        if (remote.stream().anyMatch(o -> !known.contains(o.clientOrderId()))) {
+            throw new IllegalStateException("发现未归属的策略前缀开放订单，需人工核对");
         }
-        try {
-            List<WorkingOrder> remoteOpenOrders = orderQueryGateway.fetchOpenOrders(properties.strategyConfig().symbol()).stream()
-                    .filter(order -> order != null && isStrategySymbol(order.symbol()))
-                    .filter(order -> order.clientOrderId() != null && order.clientOrderId().startsWith("GRID_"))
-                    .filter(GridLiveRunner::isActiveOrder)
-                    .toList();
-            Set<String> remoteOpenClientOrderIds = remoteOpenOrders.stream()
-                    .map(WorkingOrder::clientOrderId)
-                    .collect(Collectors.toSet());
-            remoteOpenClientOrderIds.forEach(missingOpenOrderObservations::remove);
-            remoteOpenOrders.forEach(workingOrderRegistry::trackRemote);
+        Set<String> openIds = remote.stream().filter(GridLiveRunner::isActiveOrder).map(WorkingOrder::clientOrderId).collect(Collectors.toSet());
+        for (WorkingOrder order : remote) workingOrderRegistry.trackRemote(order);
+        Set<String> missing = strategyWorkingOrders().stream().filter(GridLiveRunner::isActiveOrder)
+                .filter(o -> isOwnedOrderId(o.clientOrderId()) && !openIds.contains(o.clientOrderId()))
+                .map(WorkingOrder::clientOrderId).collect(Collectors.toSet());
+        List<WorkingOrder> history = missing.isEmpty() ? List.of() : orderQueryGateway.fetchRecentOrders(properties.strategyConfig().symbol(), missing);
+        boolean changed = false;
+        for (WorkingOrder order : history) {
+            if (!missing.contains(order.clientOrderId()) || !isStrategySymbol(order.symbol())) continue;
+            if (!isActiveOrder(order)) {
+                verifyAccountedExecutions(order);
+                workingOrderRegistry.trackRemote(order);
+                changed = true;
+                missing.remove(order.clientOrderId());
+            }
+        }
+        for (WorkingOrder order : strategyWorkingOrders()) verifyAccountedExecutions(order);
+        if (!missing.isEmpty()) throw new IllegalStateException("订单终态尚未确认，禁止下单: " + missing);
+        return new OpenOrderReconciliation(changed, false);
+    }
 
-            Instant visibilityCutoff = Instant.now().minus(OPEN_ORDER_VISIBILITY_GRACE);
-            List<WorkingOrder> locallyOpenButMissingRemote = workingOrderRegistry.snapshot().stream()
-                    .filter(GridLiveRunner::isActiveOrder)
-                    .filter(order -> isStrategySymbol(order.symbol()))
-                    .filter(order -> order.clientOrderId() != null && order.clientOrderId().startsWith("GRID_"))
-                    .filter(order -> !remoteOpenClientOrderIds.contains(order.clientOrderId()))
-                    .filter(order -> order.createdAt() == null || !order.createdAt().isAfter(visibilityCutoff))
-                    .toList();
-            if (locallyOpenButMissingRemote.isEmpty()) {
-                return OpenOrderReconciliation.none();
-            }
-            List<FillEvent> missingOrderExecutions = orderQueryGateway.fetchRecentExecutions(
-                    properties.strategyConfig().symbol(),
-                    locallyOpenButMissingRemote.stream()
-                            .map(WorkingOrder::clientOrderId)
-                            .collect(Collectors.toSet())
-            );
-            Set<String> clientOrderIdsWithExecutions = missingOrderExecutions.stream()
-                    .map(FillEvent::clientOrderId)
-                    .collect(Collectors.toSet());
-            boolean recoveredExecution = false;
-            for (FillEvent fillEvent : missingOrderExecutions) {
-                recoveredExecution = handleExecution(fillEvent, "rest-reconcile-missing-open") || recoveredExecution;
-            }
-            if (!clientOrderIdsWithExecutions.isEmpty()) {
-                clientOrderIdsWithExecutions.forEach(missingOpenOrderObservations::remove);
-                eventLogger.warn("open-orders.missing.execution-found", Map.of(
-                        "symbol", properties.strategyConfig().symbol(),
-                        "executionCount", missingOrderExecutions.size(),
-                        "clientOrderIds", clientOrderIdsWithExecutions
-                ));
-            }
-            List<WorkingOrder> missingWithoutExecutions = locallyOpenButMissingRemote.stream()
-                    .filter(order -> !clientOrderIdsWithExecutions.contains(order.clientOrderId()))
-                    .toList();
-            if (missingWithoutExecutions.isEmpty()) {
-                return new OpenOrderReconciliation(false, true);
-            }
-            Set<String> missingClientOrderIds = missingWithoutExecutions.stream()
-                    .map(WorkingOrder::clientOrderId)
-                    .collect(Collectors.toSet());
-            List<WorkingOrder> terminalOrders = orderQueryGateway.fetchRecentOrders(
-                            properties.strategyConfig().symbol(),
-                            missingClientOrderIds
-                    ).stream()
-                    .filter(order -> order.status() == OrderStatus.CANCELED || order.status() == OrderStatus.EXPIRED)
-                    .toList();
-            List<WorkingOrder> awaitingConfirmation = missingWithoutExecutions.stream()
-                    .filter(order -> terminalOrders.stream().noneMatch(terminal -> terminal.clientOrderId().equals(order.clientOrderId())))
-                    .toList();
-            if (!awaitingConfirmation.isEmpty()) {
-                awaitingConfirmation.forEach(order -> missingOpenOrderObservations.merge(order.clientOrderId(), 1, Integer::sum));
-                eventLogger.warn("open-orders.missing.pending", Map.of(
-                        "symbol", properties.strategyConfig().symbol(),
-                        "remoteOpenCount", remoteOpenOrders.size(),
-                        "clientOrderIds", awaitingConfirmation.stream().map(WorkingOrder::clientOrderId).toList(),
-                        "reason", "terminal-order-status-not-confirmed"
-                ));
-            }
-            if (terminalOrders.isEmpty()) {
-                return OpenOrderReconciliation.none();
-            }
-            Instant now = Instant.now();
-            terminalOrders.forEach(order -> {
-                workingOrderRegistry.markCanceled(order.clientOrderId(), now);
-                missingOpenOrderObservations.remove(order.clientOrderId());
-            });
-            eventLogger.warn("open-orders.reconciled", Map.of(
-                    "symbol", properties.strategyConfig().symbol(),
-                    "remoteOpenCount", remoteOpenOrders.size(),
-                    "locallyCanceledCount", terminalOrders.size(),
-                    "clientOrderIds", terminalOrders.stream()
-                            .map(WorkingOrder::clientOrderId)
-                            .toList()
-            ));
-            alertService.warning("OPEN_ORDERS_RECONCILED", "Local open orders were missing remotely and marked canceled", Map.of(
-                    "symbol", properties.strategyConfig().symbol(),
-                    "remoteOpenCount", remoteOpenOrders.size(),
-                    "locallyCanceledCount", terminalOrders.size()
-            ));
-            return new OpenOrderReconciliation(true, recoveredExecution);
-        } catch (RuntimeException e) {
-            eventLogger.error("open-orders.reconcile.failed", Map.of("at", Instant.now(), "message", e.getMessage()));
-            alertService.warning("OPEN_ORDERS_RECONCILE_FAILED", "Open order reconciliation failed", Map.of("message", e.getMessage()));
-            return OpenOrderReconciliation.none();
+    private void verifyAccountedExecutions(WorkingOrder order) {
+        BigDecimal expected = order.cumulativeExecutedQty();
+        if (expected == null) expected = order.status() == OrderStatus.FILLED ? order.qty() : BigDecimal.ZERO;
+        if (expected != null && accountedExecutionQty.getOrDefault(order.clientOrderId(), BigDecimal.ZERO).compareTo(expected) < 0) {
+            throw new IllegalStateException("订单成交尚未完整入账: " + order.clientOrderId());
         }
+    }
+
+    private static boolean isOwnedOrderId(String id) {
+        return id != null && (id.startsWith("GRID_") || id.startsWith("MANUAL_FLATTEN_"));
     }
 
     private record OpenOrderReconciliation(boolean orderStateChanged, boolean recoveredExecution) {
@@ -890,8 +960,20 @@ public class GridLiveRunner implements AutoCloseable, PrivateExecutionListener, 
             }
             return rebalanceService.onExecution(fillEvent, source);
         }
-        if (!isStrategySymbol(fillEvent.symbol())) {
+        if (!isStrategySymbol(fillEvent.symbol()) || !isOwnedOrderId(fillEvent.clientOrderId())) return false;
+        if (workingOrderRegistry.snapshot().stream().noneMatch(o -> o.clientOrderId().equals(fillEvent.clientOrderId()))) {
+            ledgerTrusted = false;
+            recoveryReady = false;
+            recoveryError = "收到无法归属的策略前缀成交，需人工核对";
+            persistState();
+            alertService.warning("UNATTRIBUTED_EXECUTION", recoveryError, Map.of("clientOrderId", fillEvent.clientOrderId()));
             return false;
+        }
+        if (fillEvent.executionId() == null || fillEvent.executionId().isBlank()
+                || fillEvent.fillQty() == null || fillEvent.fillQty().signum() <= 0
+                || fillEvent.fillPrice() == null || fillEvent.fillPrice().signum() <= 0 || fillEvent.fillTime() == null) {
+            recoveryReady = false;
+            throw new IllegalStateException("策略成交字段不完整，禁止继续下单");
         }
         if (fillEvent.executionId() != null && !processedExecutionIds.add(fillEvent.executionId())) {
             return false;
@@ -918,14 +1000,28 @@ public class GridLiveRunner implements AutoCloseable, PrivateExecutionListener, 
             ));
             scheduleReconnect();
         }
-        workingOrderRegistry.markFilled(fillEvent.clientOrderId(), fillEvent.fillTime() == null ? Instant.now() : fillEvent.fillTime());
-        commandExecutor.execute(
-                strategyEngine.onFill(fillEvent, snapshot, () -> fillObserver.accept(fillEvent)),
-                strategyLedger.snapshot()
-        );
+        BigDecimal cumulative = accountedExecutionQty.merge(fillEvent.clientOrderId(), fillEvent.fillQty(), BigDecimal::add);
+        WorkingOrder order = workingOrderRegistry.snapshot().stream().filter(o -> o.clientOrderId().equals(fillEvent.clientOrderId())).findFirst().orElseThrow();
+        if (order.qty() != null && cumulative.compareTo(order.qty()) >= 0) {
+            workingOrderRegistry.markFilled(fillEvent.clientOrderId(), fillEvent.fillTime() == null ? Instant.now() : fillEvent.fillTime());
+        }
+        List<StrategyCommand> commands;
+        try {
+            commands = strategyEngine.onFill(fillEvent, snapshot, () -> fillObserver.accept(fillEvent));
+            persistState();
+        } catch (RuntimeException e) {
+            recoveryReady = false;
+            ledgerTrusted = false;
+            recoveryError = "成交入账或持久化失败，需人工核对";
+            try { persistState(); } catch (RuntimeException persistenceFailure) { e.addSuppressed(persistenceFailure); }
+            throw e;
+        }
+        if (running.get() && !shutdown.get() && !stopRequested && recoveryReady && !reconciling) {
+            commandExecutor.execute(commands, strategyLedger.snapshot());
+        }
         persistState();
         runtimeStatusPublisher.publish();
-        if (stopAfterCycle.get()
+        if (!stopRequested && !reconciling && recoveryReady && stopAfterCycle.get()
                 && strategyLedger.snapshot().netQty().signum() == 0
                 && strategyEngine.runtimeState().state() == com.btcgrid.common.model.GridState.INIT) {
             close();
@@ -935,19 +1031,22 @@ public class GridLiveRunner implements AutoCloseable, PrivateExecutionListener, 
 
     private void persistState() {
         StrategyStateSnapshot base = strategyEngine.snapshot(Set.copyOf(processedExecutionIds));
-        stateStore.save(new StrategyStateSnapshot(
-                base.ledgerSnapshot(),
-                base.runtimeState(),
-                base.activeSpacing(),
-                base.processedExecutionIds(),
-                strategyWorkingOrders(),
-                properties.strategyConfig()
-        ));
+        try {
+            stateStore.save(new StrategyStateSnapshot(
+                    base.ledgerSnapshot(), base.runtimeState(), base.activeSpacing(), base.processedExecutionIds(),
+                    strategyWorkingOrders(), properties.strategyConfig(),
+                    new GridSafetyState(stopRequested, flattenClientOrderId, executionsThrough, ledgerTrusted, accountedExecutionQty)));
+        } catch (RuntimeException e) {
+            recoveryReady = false;
+            ledgerTrusted = false;
+            recoveryError = "状态持久化失败，禁止交易，需恢复磁盘与账本一致性";
+            throw e;
+        }
     }
 
     private List<WorkingOrder> strategyWorkingOrders() {
         return workingOrderRegistry.snapshot().stream()
-                .filter(order -> order != null && isStrategySymbol(order.symbol()))
+                .filter(order -> order != null && isStrategySymbol(order.symbol()) && isOwnedOrderId(order.clientOrderId()))
                 .toList();
     }
 
@@ -976,6 +1075,7 @@ public class GridLiveRunner implements AutoCloseable, PrivateExecutionListener, 
 
     @Override
     public void onDisconnected(int code, String reason) {
+        recoveryReady = false;
         privateStreamConnected.set(false);
         privateStreamSubscribed.set(false);
         eventLogger.warn("private-stream.disconnected", Map.of("code", code, "reason", reason));
@@ -985,6 +1085,7 @@ public class GridLiveRunner implements AutoCloseable, PrivateExecutionListener, 
 
     @Override
     public void onStreamError(Throwable throwable) {
+        recoveryReady = false;
         privateStreamConnected.set(false);
         privateStreamSubscribed.set(false);
         String message = throwable == null || throwable.getMessage() == null ? "unknown private stream error" : throwable.getMessage();

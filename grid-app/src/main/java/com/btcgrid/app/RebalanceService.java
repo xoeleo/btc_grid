@@ -754,6 +754,7 @@ public class RebalanceService {
         if (rebalanceEngine == null || rebalanceLedger == null || rebalanceCommandExecutor == null) {
             return;
         }
+        if (workingOrderRegistry.hasPendingCancellation()) return;
         List<WorkingOrder> activeOrders = activeRebalanceOrders();
         if (completePair(activeOrders) || rebalanceLedger.snapshot().netQty().signum() == 0) {
             return;
@@ -770,6 +771,8 @@ public class RebalanceService {
                 ));
                 return;
             }
+            // Request acceptance is not a terminal cancellation. Rebuild on a later poll after confirmation.
+            if (workingOrderRegistry.hasPendingCancellation()) return;
             eventLogger.warn("rebalance.grid.incomplete-pair", Map.of(
                     "symbol", settings.symbol(),
                     "openOrders", activeOrders.size(),
@@ -806,6 +809,7 @@ public class RebalanceService {
         }
         List<WorkingOrder> orphanOrders = activeRebalanceOrders().stream()
                 .filter(order -> !activePair.contains(order.clientOrderId()))
+                .filter(order -> !order.cancellationRequested())
                 .toList();
         if (orphanOrders.isEmpty()) {
             return;
@@ -842,6 +846,7 @@ public class RebalanceService {
         if (rebalanceEngine == null || rebalanceLedger == null || rebalanceCommandExecutor == null) {
             return;
         }
+        if (workingOrderRegistry.hasPendingCancellation()) return;
         GridState runtimeState = rebalanceEngine.runtimeState().state();
         if (runtimeState != GridState.GRID_ACTIVE && runtimeState != GridState.REQUOTE) {
             return;

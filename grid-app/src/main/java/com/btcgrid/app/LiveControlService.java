@@ -28,6 +28,8 @@ import com.btcgrid.ledger.model.StrategyLedgerSnapshot;
 import com.btcgrid.ledger.service.InMemoryStrategyLedger;
 import com.btcgrid.ledger.service.StrategyLedger;
 import com.btcgrid.strategy.model.StrategyRuntimeState;
+import com.btcgrid.strategy.model.StrategyStateSnapshot;
+import com.btcgrid.strategy.model.GridSafetyState;
 import com.btcgrid.strategy.service.ClientOrderIdFactory;
 import com.btcgrid.strategy.service.GridOrderPlanner;
 import com.btcgrid.strategy.service.GridStrategyEngine;
@@ -132,6 +134,11 @@ public class LiveControlService {
     }
 
     public synchronized Map<String, Object> start(StartRequest request) {
+        StrategyStateSnapshot previous = stateStore.load().orElse(null);
+        if (previous != null && (previous.ledgerSnapshot().netQty().signum() != 0
+                || previous.trackedWorkingOrders() != null && previous.trackedWorkingOrders().stream().anyMatch(o -> o.status() == OrderStatus.NEW))) {
+            return Map.of("ok", false, "message", "已有持仓或待确认订单，请恢复原策略对账，不能新建策略覆盖恢复状态");
+        }
         if (flattenStopLocked.get()) {
             return Map.of("ok", false, "message", "清仓停止锁已启用，请先在页面手动解除锁定");
         }
@@ -172,6 +179,10 @@ public class LiveControlService {
         restoreSpotLongInventoryIfEnough(config, strategyLedger, engine, marketDataGateway);
         WorkingOrderRegistry workingOrderRegistry = new WorkingOrderRegistry();
         Set<String> processedExecutionIds = ConcurrentHashMap.newKeySet();
+        if (previous != null && previous.ledgerSnapshot().symbol().equalsIgnoreCase(config.symbol())) {
+            workingOrderRegistry.replaceAll(previous.trackedWorkingOrders());
+            processedExecutionIds.addAll(previous.processedExecutionIds());
+        }
         BybitSdkTradeGateway tradeGateway = new BybitSdkTradeGateway(clientFactory, config.category());
         GridLiveRunner runner = new GridLiveRunner(
                 properties,
@@ -216,15 +227,19 @@ public class LiveControlService {
             alertService.warning("LIVE_START_FAILED", "Live start failed", Map.of("symbol", config.symbol(), "message", e.getMessage()));
             return Map.of("ok", false, "message", e.getMessage());
         }
-        return Map.of("ok", true, "message", "started", "symbol", config.symbol());
+        return Map.of("ok", true, "message", runner.recoveryStatus(), "symbol", config.symbol());
     }
 
     public synchronized Map<String, Object> stop() {
         if (activeRunner == null || !activeRunner.isRunning()) {
             return Map.of("ok", false, "message", "strategy not running");
         }
-        activeRunner.stopNow();
-        return Map.of("ok", true, "message", "stopped");
+        try {
+            activeRunner.stopNow();
+            return Map.of("ok", true, "message", "stopped");
+        } catch (RuntimeException e) {
+            return Map.of("ok", false, "message", e.getMessage(), "recoveryStatus", activeRunner.recoveryStatus());
+        }
     }
 
     private void restoreSpotLongInventoryIfEnough(
@@ -250,57 +265,8 @@ public class LiveControlService {
             ));
             return;
         }
-        String baseCoin = FillEvent.baseCoin(config.symbol());
-        String quoteCoin = quoteCoin(config.symbol());
-        if (baseCoin == null || quoteCoin == null) {
-            return;
-        }
-        AccountAssetSnapshot accountSnapshot = new BybitSdkAccountGateway(clientFactory).tradingWalletSnapshot(
-                "UNIFIED",
-                baseCoin,
-                quoteCoin,
-                config.category(),
-                config.symbol()
-        );
-        BigDecimal walletQty = accountSnapshot.baseWalletBalance();
-        if (walletQty == null || walletQty.compareTo(targetInitialQty) < 0) {
-            eventLogger.info("spot.inventory.start.skip", Map.of(
-                    "symbol", config.symbol(),
-                    "baseCoin", baseCoin,
-                    "walletQty", walletQty == null ? BigDecimal.ZERO : walletQty,
-                    "targetInitialQty", targetInitialQty,
-                    "reason", "wallet below target initial quantity"
-            ));
-            return;
-        }
-
-        MarketSnapshot marketSnapshot = marketDataGateway.latestSnapshot(config.symbol());
-        BigDecimal price = marketSnapshot.markPrice().signum() > 0 ? marketSnapshot.markPrice() : marketSnapshot.lastPrice();
-        strategyLedger.restore(new StrategyLedgerSnapshot(
-                config.symbol(),
-                walletQty,
-                price,
-                BigDecimal.ZERO,
-                BigDecimal.ZERO,
-                BigDecimal.ZERO,
-                price,
-                TradeSide.BUY,
-                BandZone.INSIDE_BAND,
-                0,
-                0,
-                com.btcgrid.common.model.InventoryMode.NORMAL,
-                accountSnapshot.timestamp()
-        ));
-        recordSpotInventoryStart(config, accountSnapshot.timestamp(), walletQty, price, targetInitialQty, baseCoin);
-        engine.restoreRuntimeState(new StrategyRuntimeState(GridState.WAITING_TRIGGER, null, Instant.EPOCH));
-        eventLogger.info("spot.inventory.start.restored", Map.of(
-                "symbol", config.symbol(),
-                "baseCoin", baseCoin,
-                "walletQty", walletQty,
-                "targetInitialQty", targetInitialQty,
-                "referencePrice", price,
-                "reason", "wallet inventory is enough; skipped initial market buy"
-        ));
+        // Wallet ownership cannot be inferred from its balance in a shared account.
+        // A new strategy starts from zero; only its own confirmed fills create inventory.
     }
 
     private void restoreSpotLongOpenCycle(
@@ -337,85 +303,33 @@ public class LiveControlService {
         engine.restoreRuntimeState(new StrategyRuntimeState(GridState.WAITING_TRIGGER, null, Instant.EPOCH));
     }
 
-    private void recordSpotInventoryStart(
-            GridStrategyConfig config,
-            Instant time,
-            BigDecimal walletQty,
-            BigDecimal price,
-            BigDecimal targetInitialQty,
-            String baseCoin
-    ) {
-        BigDecimal value = walletQty.multiply(price, MATH_CONTEXT);
-        String suffix = Long.toString((time == null ? Instant.now() : time).toEpochMilli(), 36);
-        String clientOrderId = "GRID_" + config.symbol() + "_I_INV_" + suffix;
-        String executionId = "SPOT_INVENTORY_START_" + config.symbol() + "_" + suffix;
-        String metadataJson = spotInventoryStartMetadataJson(walletQty, targetInitialQty, baseCoin);
-        fillStore.save(new FillRecord(
-                time == null ? Instant.now() : time,
-                config.symbol(),
-                "BUY",
-                walletQty,
-                price,
-                value,
-                BigDecimal.ZERO,
-                baseCoin,
-                walletQty,
-                value,
-                BigDecimal.ZERO,
-                walletQty,
-                price,
-                BigDecimal.ZERO,
-                BigDecimal.ZERO,
-                BigDecimal.ZERO,
-                clientOrderId,
-                executionId,
-                metadataJson
-        ));
-    }
-
-    private String spotInventoryStartMetadataJson(BigDecimal walletQty, BigDecimal targetInitialQty, String baseCoin) {
-        Map<String, Object> meta = new LinkedHashMap<>();
-        meta.put("inventoryStart", true);
-        meta.put("walletQty", walletQty);
-        meta.put("targetInitialQty", targetInitialQty);
-        meta.put("baseCoin", baseCoin);
-        try {
-            return OBJECT_MAPPER.writeValueAsString(meta);
-        } catch (JsonProcessingException e) {
-            return null;
-        }
-    }
-
     public synchronized Map<String, Object> flattenAndStop() {
-        GridLiveRunner runner = activeRunner;
         FlattenStopStatus current = flattenStopStatus.get();
-        if (current.running()) {
-            return Map.of("ok", true, "message", "平仓并停止正在执行", "flattenStop", current);
-        }
-
-        if (runner == null || !runner.isRunning()) {
-            if (!flattenStopLocked.get()) {
-                return Map.of("ok", false, "message", "strategy not running");
+        if (current.running()) return Map.of("ok", true, "message", "平仓并停止正在执行", "flattenStop", current);
+        if (activeRunner == null || !activeRunner.isRunning()) {
+            StrategyStateSnapshot saved = stateStore.load().orElse(null);
+            if (saved == null || saved.safetyState() == null || !saved.safetyState().stopRequested()) {
+                return Map.of("ok", false, "message", "没有可安全恢复的停止任务；禁止按钱包余额清仓，请先核对策略账本");
             }
-            FlattenStopStatus submitted = FlattenStopStatus.running(Instant.now(), "按真实钱包余额重试清仓");
-            flattenStopStatus.set(submitted);
-            flattenStopExecutor.submit(() -> runDetachedSpotFlatten(lastConfig, submitted.startedAt()));
-            return Map.of("ok", true, "message", "重试清仓已提交，后台执行中", "flattenStop", submitted);
+            Map<String, Object> resumed = resume();
+            if (!Boolean.TRUE.equals(resumed.get("ok"))) return resumed;
         }
-
         try {
+            activeRunner.requestStopForFlatten();
             persistFlattenStopLock();
-        } catch (RuntimeException e) {
-            return Map.of("ok", false, "message", e.getMessage());
         }
-        FlattenStopStatus submitted = FlattenStopStatus.running(Instant.now(), "撤单和平仓任务已提交");
+        catch (RuntimeException e) { return Map.of("ok", false, "message", e.getMessage()); }
+        GridLiveRunner runner = activeRunner;
+        FlattenStopStatus submitted = FlattenStopStatus.running(Instant.now(), "撤单、成交对账及策略持仓清仓任务已提交");
         flattenStopStatus.set(submitted);
         flattenStopExecutor.submit(() -> runFlattenAndStop(runner, submitted.startedAt()));
         return Map.of("ok", true, "message", "平仓并停止已提交，后台执行中", "flattenStop", submitted);
     }
 
     public synchronized Map<String, Object> resume() {
-        if (flattenStopLocked.get()) {
+        StrategyStateSnapshot saved = stateStore.load().orElse(null);
+        boolean monitoringStop = saved != null && saved.safetyState() != null && saved.safetyState().stopRequested();
+        if (flattenStopLocked.get() && !monitoringStop) {
             return Map.of("ok", false, "message", "清仓停止锁已启用，请先在页面手动解除锁定");
         }
         if (activeRunner != null && activeRunner.isRunning()) {
@@ -424,8 +338,12 @@ public class LiveControlService {
         if (baseProperties.bybitSdkConfig().apiKey().isBlank() || baseProperties.bybitSdkConfig().apiSecret().isBlank()) {
             return Map.of("ok", false, "message", "missing bybit api key or secret");
         }
+        RecoveryState restored = new RecoveryBootstrap(stateStore, eventLogger).restore(resumeEngine, resumeLedger);
+        fallbackWorkingOrderRegistry.replaceAll(restored.trackedWorkingOrders());
+        resumeProcessedExecutionIds.clear();
+        resumeProcessedExecutionIds.addAll(restored.processedExecutionIds());
         RuntimeStatusSnapshot snapshot = fallbackStatusProvider.snapshot();
-        if (!canResume(snapshot)) {
+        if (!monitoringStop && !canResume(snapshot)) {
             return Map.of("ok", false, "message", "no resumable strategy state");
         }
         GridStrategyConfig config = resumeEngine.config();
@@ -492,7 +410,7 @@ public class LiveControlService {
             alertService.warning("LIVE_RESUME_FAILED", "Live resume failed", Map.of("symbol", config.symbol(), "message", e.getMessage()));
             return Map.of("ok", false, "message", e.getMessage());
         }
-        return Map.of("ok", true, "message", "resumed", "symbol", config.symbol(), "state", liveResumeEngine.runtimeState().state().name());
+        return Map.of("ok", true, "message", runner.recoveryStatus(), "symbol", config.symbol(), "state", liveResumeEngine.runtimeState().state().name());
     }
 
     public synchronized Map<String, Object> cancelOrder(CancelOrderRequest request) {
@@ -500,7 +418,8 @@ public class LiveControlService {
         if (clientOrderId == null || clientOrderId.isBlank()) {
             return Map.of("ok", false, "message", "missing clientOrderId");
         }
-        clientOrderId = clientOrderId.trim();
+        final String ownedClientOrderId = clientOrderId.trim();
+        clientOrderId = ownedClientOrderId;
 
         GridLiveRunner runner = activeRunner;
         if (runner != null && runner.isRunning()) {
@@ -515,34 +434,21 @@ public class LiveControlService {
             return Map.of("ok", false, "message", "missing bybit api key or secret");
         }
 
-        RuntimeStatusSnapshot snapshot = fallbackStatusProvider.snapshot();
-        String symbol = symbolFor(clientOrderId, request.symbol(), snapshot);
-        fallbackWorkingOrderRegistry.markCanceled(clientOrderId, Instant.now());
-        statusStore.save(fallbackStatusProvider.snapshot());
-        try {
-            new BybitSdkTradeGateway(clientFactory, lastConfig.category()).cancel(symbol, clientOrderId);
-            eventLogger.info("command.cancel", Map.of(
-                    "commandType", "CANCEL",
-                    "symbol", symbol,
-                    "clientOrderId", clientOrderId,
-                    "reason", "manual-cancel"
-            ));
-            return Map.of("ok", true, "message", "cancel submitted", "clientOrderId", clientOrderId);
-        } catch (RuntimeException e) {
-            eventLogger.error("command.cancel.failed", Map.of(
-                    "commandType", "CANCEL",
-                    "symbol", symbol,
-                    "clientOrderId", clientOrderId,
-                    "reason", "manual-cancel",
-                    "message", e.getMessage()
-            ));
-            alertService.warning("ORDER_CANCEL_FAILED", "Bybit order cancellation failed", Map.of(
-                    "clientOrderId", clientOrderId,
-                    "symbol", symbol,
-                    "message", e.getMessage()
-            ));
-            return Map.of("ok", false, "message", e.getMessage(), "clientOrderId", clientOrderId);
+        StrategyStateSnapshot saved = stateStore.load().orElse(null);
+        if (saved == null || fallbackWorkingOrderRegistry.snapshot().stream().noneMatch(o -> o.clientOrderId().equals(ownedClientOrderId))) {
+            return Map.of("ok", false, "message", "订单归属或恢复记录缺失，禁止盲目撤单");
         }
+        fallbackWorkingOrderRegistry.markCancelPending(clientOrderId, Instant.now());
+        GridSafetyState old = saved.safetyState();
+        stateStore.save(new StrategyStateSnapshot(saved.ledgerSnapshot(), saved.runtimeState(), saved.activeSpacing(),
+                saved.processedExecutionIds(), List.copyOf(fallbackWorkingOrderRegistry.snapshot()), saved.cycleConfig(),
+                new GridSafetyState(true, old == null ? null : old.flattenClientOrderId(), old == null ? null : old.executionsThrough(),
+                        old != null && old.ledgerTrusted(), old == null ? Map.of() : old.accountedExecutionQty())));
+        Map<String, Object> resumed = resume();
+        if (!Boolean.TRUE.equals(resumed.get("ok"))) return resumed;
+        List<String> failures = activeRunner.cancelOrder(symbolFor(clientOrderId, request.symbol(), fallbackStatusProvider.snapshot()), clientOrderId);
+        return Map.of("ok", failures.isEmpty(), "message", failures.isEmpty()
+                ? "撤单请求已提交，保留监控等待终态" : String.join("; ", failures), "clientOrderId", clientOrderId);
     }
 
     public RuntimeStatusSnapshot snapshot() {
@@ -558,6 +464,7 @@ public class LiveControlService {
                 "rebalanceRunning", activeRebalanceRunner != null && activeRebalanceRunner.isRunning(),
                 "canResume", (runner == null || !runner.isRunning()) && canResume(snapshot),
                 "stopAfterCycle", runner != null && runner.isStopAfterCycleRequested(),
+                "recoveryStatus", runner == null ? "stopped" : runner.recoveryStatus(),
                 "flattenStopLocked", flattenStopLocked.get(),
                 "flattenStop", flattenStopStatus.get(),
                 "profitSizingPolicy", Map.of(
@@ -1437,11 +1344,6 @@ public class LiveControlService {
                     "startedAt", startedAt.toString()
             ));
             runner.flattenAndStop();
-            synchronized (this) {
-                if (activeRunner == runner) {
-                    activeRunner = null;
-                }
-            }
             FlattenStopStatus completed = FlattenStopStatus.completed(startedAt, Instant.now(), "平仓并停止已完成");
             flattenStopStatus.set(completed);
             eventLogger.info("flatten.stop.completed", Map.of(
@@ -1450,12 +1352,8 @@ public class LiveControlService {
                     "finishedAt", completed.finishedAt().toString()
             ));
         } catch (RuntimeException e) {
-            synchronized (this) {
-                if (activeRunner == runner) {
-                    activeRunner = null;
-                }
-            }
-            FlattenStopStatus failed = FlattenStopStatus.failed(startedAt, Instant.now(), e.getMessage());
+            // Keep the runner attached: pending exchange orders still need monitoring.
+            FlattenStopStatus failed = FlattenStopStatus.pending(startedAt, Instant.now(), e.getMessage());
             flattenStopStatus.set(failed);
             eventLogger.error("flatten.stop.failed", Map.of(
                     "startedAt", startedAt.toString(),
@@ -1468,273 +1366,37 @@ public class LiveControlService {
         }
     }
 
-    private void runDetachedSpotFlatten(GridStrategyConfig config, Instant startedAt) {
-        try {
-            if (config.category() != ProductCategory.SPOT || !config.entryDirection().isSpotLongOnly()) {
-                throw new IllegalStateException("停止状态重试清仓目前仅支持现货多头模式");
-            }
-            String symbol = config.symbol();
-            eventLogger.info("flatten.stop.retry.started", Map.of(
-                    "symbol", symbol,
-                    "startedAt", startedAt.toString()
-            ));
-
-            BybitSdkTradeGateway tradeGateway = new BybitSdkTradeGateway(clientFactory, config.category());
-            List<String> cancelFailures = new ArrayList<>();
-            new BybitSdkOrderQueryGateway(clientFactory, config.category()).fetchOpenOrders(symbol).stream()
-                    .filter(order -> order.clientOrderId() != null && order.clientOrderId().startsWith("GRID_"))
-                    .forEach(order -> {
-                        try {
-                            tradeGateway.cancel(symbol, order.clientOrderId());
-                            eventLogger.info("command.cancel", Map.of(
-                                    "commandType", "CANCEL",
-                                    "symbol", symbol,
-                                    "clientOrderId", order.clientOrderId(),
-                                    "reason", "manual-flatten-retry"
-                            ));
-                        } catch (RuntimeException e) {
-                            cancelFailures.add(e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
-                        }
-                    });
-            if (!cancelFailures.isEmpty()) {
-                throw new IllegalStateException("重试清仓撤单失败: " + String.join("; ", cancelFailures));
-            }
-
-            LiveCommandExecutor commandExecutor = new LiveCommandExecutor(
-                    tradeGateway,
-                    new WorkingOrderRegistry(),
-                    new RiskGuardService(config),
-                    eventLogger,
-                    alertService,
-                    config.category(),
-                    new BybitSdkAccountGateway(clientFactory)
-            );
-            BigDecimal walletQty = commandExecutor.spotBaseWalletBalance(symbol);
-            InstrumentSpec instrumentSpec = new BybitSdkMarketDataGateway(
-                    clientFactory,
-                    config.category(),
-                    new FourHourIndicatorCalculator(),
-                    config.emaLength4h(),
-                    config.bollLength4h(),
-                    config.bollStdDevMultiplier()
-            ).loadInstrumentSpec(symbol);
-            BigDecimal flattenQty = instrumentSpec.roundQtyDown(walletQty);
-            if (flattenQty.compareTo(instrumentSpec.minOrderQty()) >= 0) {
-                OrderIntent flatten = new OrderIntent(
-                        symbol,
-                        "MANUAL_FLATTEN_" + System.currentTimeMillis(),
-                        TradeSide.SELL,
-                        OrderType.MARKET,
-                        flattenQty,
-                        null,
-                        false,
-                        "manual-flatten-and-stop"
-                );
-                List<String> failures = commandExecutor.executeManualFlatten(flatten, fallbackStatusProvider.snapshot().ledgerSnapshot());
-                if (!failures.isEmpty()) {
-                    throw new IllegalStateException("重试清仓下单失败: " + String.join("; ", failures));
-                }
-                List<FillEvent> confirmedFills = awaitManualFlattenFills(symbol, flatten.clientOrderId(), flattenQty);
-                BigDecimal referencePrice = confirmedFills.get(0).fillPrice();
-                Instant referenceTime = confirmedFills.get(0).fillTime();
-                recordInventoryReconciliation(symbol, walletQty, referencePrice, referenceTime, flatten.clientOrderId());
-                confirmedFills.forEach(this::recordFill);
-                recordSpotCycleEnd(symbol, "manual flatten and stop");
-            } else {
-                eventLogger.info("manual-flatten.dust-skipped", Map.of(
-                        "symbol", symbol,
-                        "walletQty", walletQty,
-                        "qtyStep", instrumentSpec.qtyStep(),
-                        "minOrderQty", instrumentSpec.minOrderQty()
-                ));
-            }
-
-            FlattenStopStatus completed = FlattenStopStatus.completed(startedAt, Instant.now(),
-                    "清仓停止已完成，提交数量 " + flattenQty.stripTrailingZeros().toPlainString());
-            flattenStopStatus.set(completed);
-            eventLogger.info("flatten.stop.retry.completed", Map.of(
-                    "symbol", symbol,
-                    "walletQty", walletQty,
-                    "submittedQty", flattenQty,
-                    "finishedAt", completed.finishedAt().toString()
-            ));
-        } catch (RuntimeException e) {
-            FlattenStopStatus failed = FlattenStopStatus.failed(startedAt, Instant.now(),
-                    e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
-            flattenStopStatus.set(failed);
-            eventLogger.error("flatten.stop.retry.failed", Map.of(
-                    "startedAt", startedAt.toString(),
-                    "finishedAt", failed.finishedAt().toString(),
-                    "message", failed.message()
-            ));
-            alertService.warning("FLATTEN_STOP_RETRY_FAILED", "Flatten stop retry failed", Map.of(
-                    "message", failed.message()
-            ));
-        }
-    }
-
-    private List<FillEvent> awaitManualFlattenFills(String symbol, String clientOrderId, BigDecimal expectedQty) {
-        BybitSdkOrderQueryGateway queryGateway = new BybitSdkOrderQueryGateway(clientFactory, ProductCategory.SPOT);
-        Instant deadline = Instant.now().plusSeconds(30);
-        while (Instant.now().isBefore(deadline)) {
-            List<FillEvent> fills = queryGateway.fetchRecentExecutions(symbol, Set.of(clientOrderId));
-            BigDecimal filledQty = fills.stream()
-                    .map(FillEvent::fillQty)
-                    .filter(java.util.Objects::nonNull)
-                    .reduce(BigDecimal.ZERO, BigDecimal::add);
-            if (!fills.isEmpty() && filledQty.compareTo(expectedQty) >= 0) {
-                return fills.stream().sorted(Comparator.comparing(FillEvent::fillTime)).toList();
-            }
-            try {
-                Thread.sleep(500L);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new IllegalStateException("等待清仓成交时被中断", e);
-            }
-        }
-        throw new IllegalStateException("清仓订单已提交，但 30 秒内未确认完整成交: " + clientOrderId);
-    }
-
     public synchronized Map<String, Object> reconcileFlattenCycle() {
-        GridLiveRunner runner = activeRunner;
-        if (runner != null && runner.isRunning()) {
-            return Map.of("ok", false, "message", "策略运行中，不能补录清仓 Cycle");
+        StrategyStateSnapshot saved = stateStore.load().orElse(null);
+        if (saved == null || saved.safetyState() == null || !saved.safetyState().stopRequested()) {
+            return Map.of("ok", false, "message", "缺少可信的清仓恢复状态，禁止按钱包余额补造策略成交，请人工核对");
         }
-        if (!flattenStopLocked.get()) {
-            return Map.of("ok", false, "message", "清仓停止锁未启用");
-        }
-        GridStrategyConfig config = lastConfig;
-        if (config.category() != ProductCategory.SPOT || !config.entryDirection().isSpotLongOnly()) {
-            return Map.of("ok", false, "message", "仅支持补录现货多头清仓 Cycle");
-        }
-        List<FillRecord> openCycle = fillStore.currentCycleFills(config.symbol());
-        if (openCycle.isEmpty()) {
-            return Map.of("ok", true, "message", "没有待补录的当前 Cycle", "fillsAdded", 0);
-        }
-        Instant after = openCycle.get(openCycle.size() - 1).time();
-        List<FillEvent> missing = new BybitSdkOrderQueryGateway(clientFactory, config.category())
-                .fetchRecentExecutions(config.symbol())
-                .stream()
-                .filter(fill -> fill.fillTime() != null && fill.fillTime().isAfter(after))
-                .sorted(Comparator.comparing(FillEvent::fillTime))
-                .map(this::normalizeUnlinkedFill)
-                .toList();
-        boolean hasFlattenFill = missing.stream()
-                .anyMatch(fill -> fill.clientOrderId() != null && fill.clientOrderId().startsWith("MANUAL_FLATTEN_"));
-        if (!hasFlattenFill) {
-            return Map.of("ok", false, "message", "Bybit 最近成交中未找到本次 MANUAL_FLATTEN 成交");
-        }
-        List<FillEvent> flattenFills = missing.stream()
-                .filter(fill -> fill.clientOrderId() != null && fill.clientOrderId().startsWith("MANUAL_FLATTEN_"))
-                .toList();
-        List<FillEvent> beforeFlatten = missing.stream()
-                .filter(fill -> fill.clientOrderId() == null || !fill.clientOrderId().startsWith("MANUAL_FLATTEN_"))
-                .toList();
-        beforeFlatten.forEach(this::recordFill);
-        BigDecimal currentWalletQty = new LiveCommandExecutor(
-                new BybitSdkTradeGateway(clientFactory, config.category()),
-                new WorkingOrderRegistry(),
-                new RiskGuardService(config),
-                eventLogger,
-                alertService,
-                config.category(),
-                new BybitSdkAccountGateway(clientFactory)
-        ).spotBaseWalletBalance(config.symbol());
-        BigDecimal flattenFilledQty = flattenFills.stream()
-                .map(FillEvent::fillQty)
-                .reduce(BigDecimal.ZERO, BigDecimal::add);
-        BigDecimal walletBeforeFlatten = currentWalletQty.add(flattenFilledQty, MATH_CONTEXT);
-        FillEvent firstFlattenFill = flattenFills.get(0);
-        recordInventoryReconciliation(
-                config.symbol(),
-                walletBeforeFlatten,
-                firstFlattenFill.fillPrice(),
-                firstFlattenFill.fillTime(),
-                firstFlattenFill.clientOrderId()
-        );
-        flattenFills.forEach(this::recordFill);
-        recordSpotCycleEnd(config.symbol(), "manual flatten and stop");
-        List<String> executionIds = missing.stream().map(FillEvent::executionId).toList();
-        eventLogger.info("flatten.cycle.reconciled", Map.of(
-                "symbol", config.symbol(),
-                "after", after.toString(),
-                "fillsAdded", missing.size(),
-                "executionIds", executionIds
-        ));
-        return Map.of(
-                "ok", true,
-                "message", "清仓成交与历史 Cycle 已补录",
-                "fillsAdded", missing.size(),
-                "executionIds", executionIds
-        );
-    }
-
-    private void recordInventoryReconciliation(
-            String symbol,
-            BigDecimal realWalletQty,
-            BigDecimal referencePrice,
-            Instant referenceTime,
-            String flattenClientOrderId
-    ) {
-        List<FillRecord> current = fillStore.currentCycleFills(symbol);
-        if (current.isEmpty()) {
-            return;
-        }
-        BigDecimal recordedQty = current.get(current.size() - 1).cumulativeQty();
-        BigDecimal delta = recordedQty.subtract(realWalletQty, MATH_CONTEXT);
-        if (delta.abs().compareTo(new BigDecimal("0.000001")) < 0) {
-            return;
-        }
-        TradeSide side = delta.signum() > 0 ? TradeSide.SELL : TradeSide.BUY;
-        BigDecimal qty = delta.abs();
-        String suffix = flattenClientOrderId == null ? Long.toString(System.currentTimeMillis()) : flattenClientOrderId;
-        FillEvent adjustment = new FillEvent(
-                "INVENTORY_RECONCILE_" + suffix,
-                symbol,
-                "INVENTORY_RECONCILE_" + suffix,
-                side,
-                qty,
-                referencePrice,
-                referenceTime.minusMillis(1),
-                qty.multiply(referencePrice, MATH_CONTEXT),
-                BigDecimal.ZERO,
-                "USDT"
-        );
-        recordFill(adjustment);
-        eventLogger.warn("flatten.inventory.reconciled", Map.of(
-                "symbol", symbol,
-                "recordedQty", recordedQty,
-                "realWalletQty", realWalletQty,
-                "adjustmentSide", side.name(),
-                "adjustmentQty", qty,
-                "referencePrice", referencePrice
-        ));
-    }
-
-    private FillEvent normalizeUnlinkedFill(FillEvent fill) {
-        if (fill.clientOrderId() != null && !fill.clientOrderId().isBlank()) {
-            return fill;
-        }
-        return new FillEvent(
-                fill.executionId(),
-                fill.symbol(),
-                "EXTERNAL_FILL_" + fill.executionId(),
-                fill.side(),
-                fill.fillQty(),
-                fill.fillPrice(),
-                fill.fillTime(),
-                fill.fillValue(),
-                fill.fee(),
-                fill.feeCurrency()
-        );
+        if (activeRunner == null || !activeRunner.isRunning()) return resume();
+        return Map.of("ok", true, "message", "已保留监控；原策略与清仓成交由同一恢复流程入账", "recoveryStatus", activeRunner.recoveryStatus());
     }
 
     public synchronized Map<String, Object> unlockFlattenStop() {
+        StrategyStateSnapshot saved = stateStore.load().orElse(null);
+        if (flattenStopLocked.get() && (saved == null || saved.safetyState() == null
+                || !saved.safetyState().ledgerTrusted() || saved.safetyState().executionsThrough() == null)) {
+            return Map.of("ok", false, "message", "停止任务的可信状态或账本证据缺失，禁止解除锁定，请人工核对");
+        }
+        if (saved != null && saved.safetyState() != null && saved.safetyState().stopRequested()
+                && (saved.ledgerSnapshot().netQty().signum() != 0 || saved.trackedWorkingOrders() != null
+                && saved.trackedWorkingOrders().stream().anyMatch(o -> o.status() == OrderStatus.NEW))) {
+            return Map.of("ok", false, "message", "停止仍待确认或仍有策略持仓，禁止解除锁定；请继续恢复对账");
+        }
         GridLiveRunner runner = activeRunner;
         if (runner != null && runner.isRunning()) {
             return Map.of("ok", false, "message", "策略仍在运行，不能解除清仓停止锁");
         }
         try {
+            if (saved != null && saved.safetyState() != null) {
+                GridSafetyState old = saved.safetyState();
+                stateStore.save(new StrategyStateSnapshot(saved.ledgerSnapshot(), saved.runtimeState(), saved.activeSpacing(),
+                        saved.processedExecutionIds(), saved.trackedWorkingOrders(), saved.cycleConfig(),
+                        new GridSafetyState(false, null, old.executionsThrough(), old.ledgerTrusted(), old.accountedExecutionQty())));
+            }
             Files.deleteIfExists(flattenStopLockPath);
             flattenStopLocked.set(false);
             flattenStopStatus.set(FlattenStopStatus.idle());
@@ -2325,6 +1987,7 @@ public class LiveControlService {
     }
 
     private boolean canResume(RuntimeStatusSnapshot snapshot) {
+        if (snapshot.workingOrders().stream().anyMatch(o -> o.status() == OrderStatus.NEW)) return true;
         GridState state = snapshot.runtimeState().state();
         return state != GridState.INIT
                 && (snapshot.ledgerSnapshot().netQty().signum() != 0 || snapshot.runtimeState().activeOrderPair() != null);
@@ -2974,13 +2637,13 @@ public class LiveControlService {
             return new FlattenStopStatus("COMPLETED", false, startedAt, finishedAt, message);
         }
 
-        private static FlattenStopStatus failed(Instant startedAt, Instant finishedAt, String message) {
+        private static FlattenStopStatus pending(Instant startedAt, Instant finishedAt, String message) {
             return new FlattenStopStatus(
-                    "FAILED",
+                    "PENDING_CONFIRMATION",
                     false,
                     startedAt,
                     finishedAt,
-                    message == null || message.isBlank() ? "平仓并停止失败" : message
+                    message == null || message.isBlank() ? "停止待确认，保留监控" : message
             );
         }
     }

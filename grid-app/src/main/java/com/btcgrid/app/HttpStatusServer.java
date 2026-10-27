@@ -1727,12 +1727,15 @@ public class HttpStatusServer implements AutoCloseable {
                       const orders = status && status.workingOrders ? status.workingOrders : [];
                       const lastOrder = orders.length ? orders[orders.length - 1] : null;
                       const badge = document.getElementById('runBadge');
-                      badge.textContent = running ? '运行中' : '未运行';
+                      const monitoring = running && control.recoveryStatus && control.recoveryStatus !== 'ready';
+                      badge.textContent = monitoring ? '仅监控 / 待核对' : (running ? '运行中' : '未运行');
                       badge.className = `badge ${running ? 'badge-running' : 'badge-idle'}`;
                       document.getElementById('activeSymbol').textContent = activeSymbol;
                       document.getElementById('cycleStatus').textContent = cycleLabel(control, status);
                       document.getElementById('strategyState').textContent = state || '-';
-                      document.getElementById('operationStatus').textContent = formatOperationStatus(flattenStop);
+                      document.getElementById('operationStatus').textContent = monitoring
+                        ? `${control.recoveryStatus}；${formatOperationStatus(flattenStop)}`
+                        : formatOperationStatus(flattenStop);
                       document.getElementById('lastPrice').textContent = snapshot.markPrice == null
                         ? (snapshot.lastPrice ?? '-')
                         : `${snapshot.lastPrice ?? '-'} / ${snapshot.markPrice}`;
@@ -1785,6 +1788,7 @@ public class HttpStatusServer implements AutoCloseable {
                     function cycleLabel(control, status) {
                       if (control && control.flattenStop && control.flattenStop.running) return '平仓停止中';
                       if (!control || !control.running) return '未运行';
+                      if (control.recoveryStatus && control.recoveryStatus !== 'ready') return control.recoveryStatus;
                       const pair = status && status.runtimeState ? status.runtimeState.activeOrderPair : null;
                       if (pair) return '网格挂单中';
                       if (status && status.runtimeState && status.runtimeState.state === 'OPENING_FIRST_POSITION') return '开仓中';
@@ -1794,6 +1798,7 @@ public class HttpStatusServer implements AutoCloseable {
                       if (!flattenStop || !flattenStop.state || flattenStop.state === 'IDLE') return '-';
                       if (flattenStop.state === 'RUNNING') return flattenStop.message || '平仓并停止中';
                       if (flattenStop.state === 'COMPLETED') return flattenStop.message || '平仓并停止完成';
+                      if (flattenStop.state === 'PENDING_CONFIRMATION') return `待确认：${flattenStop.message || '-'}`;
                       if (flattenStop.state === 'FAILED') return `失败：${flattenStop.message || '-'}`;
                       return flattenStop.message || flattenStop.state;
                     }

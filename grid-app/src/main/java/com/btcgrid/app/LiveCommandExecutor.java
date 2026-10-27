@@ -12,7 +12,7 @@ import com.btcgrid.common.model.ProductCategory;
 import com.btcgrid.common.model.TradeSide;
 import com.btcgrid.ledger.model.StrategyLedgerSnapshot;
 import java.math.BigDecimal;
-import java.math.RoundingMode;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -20,6 +20,8 @@ import java.util.List;
 import java.util.Map;
 
 public class LiveCommandExecutor {
+
+    private static final Duration MAX_SPOT_ACCOUNT_SNAPSHOT_AGE = Duration.ofMinutes(2);
 
     private final BybitTradeGateway tradeGateway;
     private final WorkingOrderRegistry workingOrderRegistry;
@@ -29,6 +31,8 @@ public class LiveCommandExecutor {
     private final ProductCategory productCategory;
     private final BybitAccountGateway accountGateway;
     private final SpotInventoryDepletedHandler spotInventoryDepletedHandler;
+    private volatile Runnable beforeExchangeMutation = () -> {
+    };
 
     @FunctionalInterface
     public interface SpotInventoryDepletedHandler {
@@ -79,7 +83,12 @@ public class LiveCommandExecutor {
 
     public List<String> execute(List<StrategyCommand> commands, StrategyLedgerSnapshot ledgerSnapshot) {
         List<String> failures = new ArrayList<>();
-        boolean skipPlaceCommands = false;
+        // A cancel request is only an exchange request.  Until a private-stream
+        // update or an explicit REST reconciliation reports a terminal status,
+        // the old order may still be live.  Never submit a replacement in the
+        // same batch, even when the cancel call itself returned successfully.
+        boolean skipPlaceCommands = workingOrderRegistry.hasPendingCancellation() || commands.stream()
+                .anyMatch(command -> command != null && command.type() == StrategyCommandType.CANCEL);
         for (RiskDecision decision : riskGuardService.evaluate(commands, ledgerSnapshot)) {
             StrategyCommand command = decision.command();
             if (skipPlaceCommands && command.type() == StrategyCommandType.PLACE) {
@@ -108,18 +117,20 @@ public class LiveCommandExecutor {
             if (command.type() == StrategyCommandType.PLACE) {
                 OrderIntent orderIntent = adjustedForSpotInventory(command.orderIntent(), ledgerSnapshot);
                 if (orderIntent == null) {
-                    workingOrderRegistry.markExpired(command.clientOrderId(), Instant.now());
+                    failures.add("spot sell rejected " + command.clientOrderId() + ": inventory is not reconciled");
                     continue;
                 }
                 command = StrategyCommand.place(orderIntent);
                 workingOrderRegistry.trackSubmitted(command.orderIntent(), Instant.now());
+                beforeExchangeMutation.run();
                 try {
                     BybitOrderSubmission submission = tradeGateway.submit(command.orderIntent());
                     workingOrderRegistry.markAccepted(command.clientOrderId(), submission.orderId(), Instant.now());
                     logCommand("command.place", command, submission);
                 } catch (RuntimeException e) {
-                    failures.add(e.getMessage());
-                    workingOrderRegistry.markExpired(command.clientOrderId(), Instant.now());
+                    failures.add(e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+                    // A timeout or a lost response is not proof that Bybit did
+                    // not accept the order.  Keep it NEW for reconciliation.
                     logCommandFailure("command.place.failed", command, e);
                     if (isSpotSellInsufficientBalance(command, e)) {
                         eventLogger.warn("spot.sell.inventory.insufficient", Map.of(
@@ -132,9 +143,6 @@ public class LiveCommandExecutor {
                                 "symbol", command.symbol(),
                                 "message", e.getMessage()
                         ));
-                        if (spotInventoryDepletedHandler != null) {
-                            spotInventoryDepletedHandler.onSpotInventoryDepleted(command.symbol(), command.clientOrderId(), ledgerSnapshot);
-                        }
                         skipPlaceCommands = true;
                     }
                     alertService.warning("ORDER_PLACE_FAILED", "Bybit order placement failed", Map.of(
@@ -144,21 +152,19 @@ public class LiveCommandExecutor {
                     ));
                 }
             } else if (command.type() == StrategyCommandType.CANCEL) {
-                workingOrderRegistry.markCanceled(command.clientOrderId(), Instant.now());
+                workingOrderRegistry.markCancelPending(command.clientOrderId(), Instant.now());
+                beforeExchangeMutation.run();
                 try {
                     tradeGateway.cancel(command.symbol(), command.clientOrderId());
                     logCommand("command.cancel", command);
                 } catch (RuntimeException e) {
-                    failures.add(e.getMessage());
+                    failures.add(e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
                     logCommandFailure("command.cancel.failed", command, e);
-                    if (isManualRequoteUncertainCancel(command, e)) {
-                        skipPlaceCommands = true;
-                        eventLogger.warn("manual-requote.deferred", Map.of(
-                                "clientOrderId", command.clientOrderId(),
-                                "symbol", command.symbol(),
-                                "message", e.getMessage()
-                        ));
-                    }
+                    eventLogger.warn("manual-requote.deferred", Map.of(
+                            "clientOrderId", command.clientOrderId(),
+                            "symbol", command.symbol(),
+                            "message", e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage()
+                    ));
                     alertService.warning("ORDER_CANCEL_FAILED", "Bybit order cancellation failed", Map.of(
                             "clientOrderId", command.clientOrderId(),
                             "symbol", command.symbol(),
@@ -183,19 +189,24 @@ public class LiveCommandExecutor {
                 || !"manual-flatten-and-stop".equals(orderIntent.reason())) {
             return List.of("invalid manual flatten order");
         }
+        if (productCategory == ProductCategory.SPOT && orderIntent.side() != TradeSide.SELL) {
+            return List.of("manual flatten rejected: spot flatten only supports selling positive strategy inventory");
+        }
         OrderIntent adjusted = adjustedForSpotInventory(orderIntent, ledgerSnapshot);
         if (adjusted == null) {
-            return List.of();
+            return List.of("manual flatten rejected: strategy inventory is not reconciled");
         }
         StrategyCommand command = StrategyCommand.place(adjusted);
         workingOrderRegistry.trackSubmitted(adjusted, Instant.now());
+        beforeExchangeMutation.run();
         try {
             BybitOrderSubmission submission = tradeGateway.submit(adjusted);
             workingOrderRegistry.markAccepted(adjusted.clientOrderId(), submission.orderId(), Instant.now());
             logCommand("command.place.manual-flatten", command, submission);
         } catch (RuntimeException e) {
             failures.add(e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
-            workingOrderRegistry.markExpired(adjusted.clientOrderId(), Instant.now());
+            // Submission failure can be an acknowledgement timeout.  Leave the
+            // tracked order NEW so startup/REST reconciliation can resolve it.
             logCommandFailure("command.place.manual-flatten.failed", command, e);
             alertService.warning("MANUAL_FLATTEN_FAILED", "Manual flatten order placement failed", Map.of(
                     "clientOrderId", adjusted.clientOrderId(),
@@ -223,17 +234,33 @@ public class LiveCommandExecutor {
                 : snapshot.baseWalletBalance().max(BigDecimal.ZERO);
     }
 
+    /** Installs the durable-state hook executed after local tracking and before any exchange call. */
+    public void setBeforeExchangeMutation(Runnable beforeExchangeMutation) {
+        this.beforeExchangeMutation = beforeExchangeMutation == null ? () -> {
+        } : beforeExchangeMutation;
+    }
+
     private OrderIntent adjustedForSpotInventory(OrderIntent orderIntent, StrategyLedgerSnapshot ledgerSnapshot) {
-        if (orderIntent == null
-                || productCategory != ProductCategory.SPOT
-                || accountGateway == null
-                || orderIntent.side() != TradeSide.SELL) {
+        if (orderIntent == null || productCategory != ProductCategory.SPOT || orderIntent.side() != TradeSide.SELL) {
             return orderIntent;
+        }
+        // A spot sell must be attributable to this strategy.  A missing or
+        // non-positive ledger is an uncertainty, never permission to sell the
+        // wallet's unrelated inventory.
+        if (ledgerSnapshot == null
+                || ledgerSnapshot.netQty() == null
+                || ledgerSnapshot.netQty().signum() <= 0
+                || ledgerSnapshot.symbol() == null
+                || !ledgerSnapshot.symbol().equalsIgnoreCase(orderIntent.symbol())
+                || accountGateway == null
+                || orderIntent.qty() == null
+                || orderIntent.qty().signum() <= 0) {
+            return null;
         }
         String baseCoin = FillEvent.baseCoin(orderIntent.symbol());
         String quoteCoin = quoteCoin(orderIntent.symbol());
         if (baseCoin == null || quoteCoin == null) {
-            return orderIntent;
+            return null;
         }
         AccountAssetSnapshot snapshot = accountGateway.tradingWalletSnapshot(
                 "UNIFIED",
@@ -242,70 +269,42 @@ public class LiveCommandExecutor {
                 ProductCategory.SPOT,
                 orderIntent.symbol()
         );
-        BigDecimal available = snapshot.baseWalletBalance() == null ? BigDecimal.ZERO : snapshot.baseWalletBalance().max(BigDecimal.ZERO);
-        if (available.signum() <= 0) {
+        if (snapshot == null || snapshot.baseWalletBalance() == null || snapshot.baseWalletBalance().signum() < 0
+                || !isFreshSpotSnapshot(snapshot.timestamp())) {
+            return null;
+        }
+        BigDecimal available = snapshot.baseWalletBalance();
+        BigDecimal attributable = ledgerSnapshot.netQty().min(available);
+        if (attributable.signum() <= 0 || orderIntent.qty().compareTo(attributable) > 0) {
             eventLogger.warn("spot.sell.inventory.empty", Map.of(
                     "symbol", orderIntent.symbol(),
                     "clientOrderId", orderIntent.clientOrderId(),
                     "requestedQty", orderIntent.qty(),
-                    "availableQty", available
+                    "availableQty", available,
+                    "strategyQty", ledgerSnapshot.netQty()
             ));
             alertService.warning("SPOT_SELL_INVENTORY_EMPTY", "Spot sell skipped because base inventory is zero", Map.of(
                     "symbol", orderIntent.symbol(),
                     "clientOrderId", orderIntent.clientOrderId(),
-                    "requestedQty", orderIntent.qty()
+                    "requestedQty", orderIntent.qty(),
+                    "availableQty", available,
+                    "strategyQty", ledgerSnapshot.netQty()
             ));
-            if (spotInventoryDepletedHandler != null) {
-                spotInventoryDepletedHandler.onSpotInventoryDepleted(orderIntent.symbol(), orderIntent.clientOrderId(), ledgerSnapshot);
-            }
             return null;
         }
-        if (orderIntent.qty() == null || orderIntent.qty().compareTo(available) <= 0) {
-            return orderIntent;
-        }
-        BigDecimal cappedQty = capToOrderScale(available, orderIntent.qty());
-        if (cappedQty.signum() <= 0) {
-            eventLogger.warn("spot.sell.inventory.empty", Map.of(
-                    "symbol", orderIntent.symbol(),
-                    "clientOrderId", orderIntent.clientOrderId(),
-                    "requestedQty", orderIntent.qty(),
-                    "availableQty", available
-            ));
-            alertService.warning("SPOT_SELL_INVENTORY_EMPTY", "Spot sell skipped because base inventory is below order precision", Map.of(
-                    "symbol", orderIntent.symbol(),
-                    "clientOrderId", orderIntent.clientOrderId(),
-                    "requestedQty", orderIntent.qty(),
-                    "availableQty", available
-            ));
-            if (spotInventoryDepletedHandler != null) {
-                spotInventoryDepletedHandler.onSpotInventoryDepleted(orderIntent.symbol(), orderIntent.clientOrderId(), ledgerSnapshot);
-            }
-            return null;
-        }
-        eventLogger.warn("spot.sell.qty.capped", Map.of(
-                "symbol", orderIntent.symbol(),
-                "clientOrderId", orderIntent.clientOrderId(),
-                "requestedQty", orderIntent.qty(),
-                "availableQty", available,
-                "cappedQty", cappedQty
-        ));
-        return new OrderIntent(
-                orderIntent.symbol(),
-                orderIntent.clientOrderId(),
-                orderIntent.side(),
-                orderIntent.type(),
-                cappedQty,
-                orderIntent.price(),
-                orderIntent.reduceOnly(),
-                orderIntent.reason()
-        );
+        // Quantity sizing/step rounding belongs to the runner, where the
+        // instrument specification is available.  Do not silently rewrite a
+        // requested quantity using BigDecimal scale here.
+        return orderIntent;
     }
 
-    private BigDecimal capToOrderScale(BigDecimal available, BigDecimal requestedQty) {
-        if (available == null || requestedQty == null) {
-            return BigDecimal.ZERO;
+    private boolean isFreshSpotSnapshot(Instant timestamp) {
+        if (timestamp == null) {
+            return false;
         }
-        return available.max(BigDecimal.ZERO).setScale(Math.max(0, requestedQty.scale()), RoundingMode.DOWN);
+        Instant now = Instant.now();
+        return !timestamp.isAfter(now.plusSeconds(5))
+                && !timestamp.isBefore(now.minus(MAX_SPOT_ACCOUNT_SNAPSHOT_AGE));
     }
 
     private static String quoteCoin(String symbol) {
@@ -320,17 +319,6 @@ public class LiveCommandExecutor {
             return "USDC";
         }
         return null;
-    }
-
-    private boolean isManualRequoteUncertainCancel(StrategyCommand command, RuntimeException exception) {
-        String reason = command.reason() == null ? "" : command.reason();
-        if (!reason.contains("manual-requote")) {
-            return false;
-        }
-        String message = exception.getMessage() == null ? "" : exception.getMessage().toLowerCase();
-        return message.contains("110001")
-                || message.contains("order not exists")
-                || message.contains("too late to cancel");
     }
 
     private boolean isSpotSellInsufficientBalance(StrategyCommand command, RuntimeException exception) {

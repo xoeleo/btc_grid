@@ -34,6 +34,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class RebalanceServiceTest {
 
+    private void confirmCanceled(WorkingOrderRegistry registry, List<String> ids) {
+        for (String id : List.copyOf(ids)) {
+            WorkingOrder order = registry.snapshot().stream().filter(o -> o.clientOrderId().equals(id)).findFirst().orElseThrow();
+            registry.applyUpdate(new com.btcgrid.common.model.OrderUpdateEvent(order.symbol(), id, order.exchangeOrderId(),
+                    OrderStatus.CANCELED, order.side(), order.price(), order.qty(), BigDecimal.ZERO, Instant.now()));
+        }
+    }
+
     @Test
     void splitsFundingFeeReconciliationIntoBybitSevenDayWindows() {
         Instant start = Instant.parse("2026-07-21T08:03:39Z");
@@ -772,6 +780,9 @@ class RebalanceServiceTest {
                         )
                 )
         );
+        // Production recovery tracks the supplied exchange orders before restoring the cycle.
+        registry.trackRemote(openOrder("RBAL_BTCUSDT_PB_test", TradeSide.BUY, Instant.now()));
+        registry.trackRemote(openOrder("RBAL_BTCUSDT_PS_test", TradeSide.SELL, Instant.now()));
         FillEvent fill = new FillEvent(
                 "dup-exec",
                 "BTCUSDT",
@@ -786,7 +797,8 @@ class RebalanceServiceTest {
         int submittedAfterFirst = tradeGateway.submitted.size();
         service.onExecution(fill, "test");
 
-        assertTrue(submittedAfterFirst > 0);
+        assertEquals(0, submittedAfterFirst, "replacement waits for confirmed cancellation");
+        assertTrue(registry.hasPendingCancellation());
         assertEquals(submittedAfterFirst, tradeGateway.submitted.size());
         Files.deleteIfExists(stateFile);
     }
@@ -871,6 +883,10 @@ class RebalanceServiceTest {
         service.onPoll();
 
         assertEquals(2, tradeGateway.canceled.size());
+        assertEquals(submittedAfterPair, tradeGateway.submitted.size(), "no replacement before exchange terminal confirmation");
+        assertTrue(registry.hasPendingCancellation());
+        confirmCanceled(registry, tradeGateway.canceled);
+        service.onPoll();
         assertEquals(5, tradeGateway.submitted.size());
         assertTrue(tradeGateway.submitted.subList(submittedAfterPair, tradeGateway.submitted.size()).stream()
                 .allMatch(order -> order.clientOrderId().startsWith(RebalanceService.CLIENT_ORDER_PREFIX)));
@@ -995,6 +1011,11 @@ class RebalanceServiceTest {
         service.cancelOrphanOrdersIfNeeded();
 
         assertEquals(List.of(orphanBuy.clientOrderId()), tradeGateway.canceled);
+        assertEquals(OrderStatus.NEW, registry.snapshot().stream()
+                .filter(order -> order.clientOrderId().equals(orphanBuy.clientOrderId()))
+                .findFirst().orElseThrow().status());
+        assertTrue(registry.hasPendingCancellation());
+        confirmCanceled(registry, tradeGateway.canceled);
         assertEquals(OrderStatus.CANCELED, registry.snapshot().stream()
                 .filter(order -> order.clientOrderId().equals(orphanBuy.clientOrderId()))
                 .findFirst().orElseThrow().status());
