@@ -206,6 +206,26 @@ public class RebalanceService {
         return profitExit != null && profitExit.releaseCompletedManual();
     }
 
+    public synchronized BigDecimal requestManualAddition() {
+        if (waterExit == null || !rebalanceCycleActive() || activeCycleStartedAt == null)
+            throw new IllegalStateException("没有运行中的 Cycle");
+        if (profitExit != null && profitExit.armed())
+            throw new IllegalStateException("当前 Cycle 已有平仓指令，请等待完成");
+        BigDecimal qty = waterExit.requestManualAddition(marketDataGateway.latestSnapshot(settings.symbol()));
+        eventLogger.info("rebalance.water.manual-add", Map.of("qty", qty, "cycleStartedAt", activeCycleStartedAt.toString()));
+        save(stateWith("GRID_ACTIVE", waterExit.message()));
+        return qty;
+    }
+
+    public synchronized boolean isManualAdjustmentOrder(String clientOrderId) {
+        return RebalanceManualAdjustment.isManualOrder(clientOrderId)
+                || (waterExit != null && waterExit.isManualAdjustmentOrder(clientOrderId));
+    }
+
+    public synchronized BigDecimal gridReferencePrice() {
+        return rebalanceLedger == null ? null : rebalanceLedger.snapshot().lastFillPrice();
+    }
+
     public synchronized void onPoll() {
         if (!settings.enabled()) {
             save(stateWith("DISABLED", "rebalance disabled"));
@@ -560,7 +580,8 @@ public class RebalanceService {
         boolean fillObserved = false;
         BigDecimal notificationBaseQty = cycleBaseGridQty(cycleSide == null ? fillEvent.side() : cycleSide);
         MarketSnapshot fillMarketSnapshot = null;
-        boolean waterAccountingOnly = waterExit != null && waterExit.frozen();
+        boolean manualAdjustment = isManualAdjustmentOrder(fillEvent.clientOrderId());
+        boolean waterAccountingOnly = manualAdjustment || (waterExit != null && waterExit.frozen());
         if (waterExit != null && !waterAccountingOnly && !(profitExit != null && profitExit.frozen())) {
             try {
                 fillMarketSnapshot = marketDataGateway.latestSnapshot(settings.symbol());
@@ -575,7 +596,16 @@ public class RebalanceService {
         }
         if ((isAccountingOnlyCorrectionOrder(fillEvent.clientOrderId())
                 || (profitExit != null && profitExit.frozen()) || waterAccountingOnly) && rebalanceLedger != null) {
+            StrategyLedgerSnapshot reference = manualAdjustment ? rebalanceLedger.snapshot() : null;
             rebalanceLedger.applyFill(fillEvent);
+            if (reference != null && rebalanceLedger.snapshot().netQty().signum() != 0) {
+                StrategyLedgerSnapshot accounting = rebalanceLedger.snapshot();
+                rebalanceLedger.restore(new StrategyLedgerSnapshot(
+                        accounting.symbol(), accounting.netQty(), accounting.avgEntryPrice(), accounting.realizedPnl(),
+                        accounting.floatingPnl(), reference.previousFillPrice(), reference.lastFillPrice(),
+                        reference.lastFillSide(), reference.lastFillZone(), reference.consecutiveBuyFills(),
+                        reference.consecutiveSellFills(), accounting.inventoryMode(), accounting.updatedAt()));
+            }
             recordAndNotifyFill(fillEvent, notificationBaseQty, afterLedgerApplied, fillMarketSnapshot);
             fillObserved = true;
             eventLogger.info("rebalance.fill.correction-applied", Map.of(
@@ -696,7 +726,8 @@ public class RebalanceService {
     }
 
     static boolean isAccountingOnlyCorrectionOrder(String clientOrderId) {
-        return clientOrderId != null && (clientOrderId.contains("_PS_fix") || clientOrderId.startsWith("RBAL_WATER_"));
+        return clientOrderId != null && (clientOrderId.contains("_PS_fix") || clientOrderId.startsWith("RBAL_WATER_")
+                || RebalanceManualAdjustment.isManualOrder(clientOrderId));
     }
 
     public String symbol() {
@@ -1141,7 +1172,9 @@ public class RebalanceService {
 
     private StrategyLedgerSnapshot snapshotFromFills(List<FillRecord> fills, BigDecimal netQty) {
         FillRecord last = fills.get(fills.size() - 1);
-        FillRecord previous = fills.size() < 2 ? null : fills.get(fills.size() - 2);
+        List<FillRecord> referenceFills = fills.stream().filter(fill -> !RebalanceManualAdjustment.isManual(fill)).toList();
+        FillRecord reference = referenceFills.isEmpty() ? null : referenceFills.get(referenceFills.size() - 1);
+        FillRecord previous = referenceFills.size() < 2 ? null : referenceFills.get(referenceFills.size() - 2);
         BigDecimal avgEntryPrice = netQty.signum() == 0
                 ? BigDecimal.ZERO
                 : zero(last.cumulativeValue()).divide(netQty, java.math.MathContext.DECIMAL64).abs();
@@ -1152,8 +1185,8 @@ public class RebalanceService {
                 BigDecimal.ZERO,
                 BigDecimal.ZERO,
                 previous == null ? BigDecimal.ZERO : zero(previous.price()),
-                zero(last.price()),
-                "SELL".equals(last.side()) ? TradeSide.SELL : TradeSide.BUY,
+                reference == null ? BigDecimal.ZERO : zero(reference.price()),
+                reference == null ? null : "SELL".equals(reference.side()) ? TradeSide.SELL : TradeSide.BUY,
                 BandZone.INSIDE_BAND,
                 0,
                 0,

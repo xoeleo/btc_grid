@@ -264,6 +264,17 @@ class HttpStatusServerTest {
             assertTrue(grid.body().contains("function prefetchNextGridFillsPage"));
             assertTrue(grid.body().contains("async function loadGridFillsPage(force = false)"));
             assertTrue(grid.body().contains("id=\"rebalanceCycleScenarioLabel\""));
+            assertTrue(grid.body().contains("id=\"reduceRebalanceCycleButton\""));
+            assertTrue(grid.body().contains("id=\"addRebalanceCycleButton\""));
+            assertTrue(grid.body().contains("function addRebalanceCycle()"));
+            assertTrue(grid.body().contains("postRebalance('/api/rebalance-add-cycle')"));
+            assertTrue(grid.body().contains("当前 Cycle 净数量 × 10% 加仓（按数量步长向下取整，沿当前方向）"));
+            assertTrue(grid.body().contains("成交后继续现有动态水位规则"));
+            assertTrue(grid.body().contains("const successBanner = action === 'add' ? '加仓请求已受理'"));
+            assertTrue(grid.body().contains("previousTradingPrice: item.previousTradingPrice"));
+            assertTrue(grid.body().contains("Object.prototype.hasOwnProperty.call(f, 'previousTradingPrice')"));
+            assertTrue(grid.body().contains("function isManualRebalanceFill(fill)"));
+            assertTrue(grid.body().contains("manualPositionAdjustment === true"));
             assertTrue(grid.body().contains("达到目标比例时预计 BTC 价格"));
             assertTrue(grid.body().contains("单边下跌至 100% BTC 比例（情景推演）"));
             assertTrue(grid.body().contains("function estimateTargetRatioPrice(state, currentPrice, cycle, activeOrders, recentFillItems)"));

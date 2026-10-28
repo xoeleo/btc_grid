@@ -30,6 +30,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class RebalanceServiceTest {
@@ -1442,6 +1443,7 @@ class RebalanceServiceTest {
         service.restoreActiveCycle(List.of(new FillRecord(f.start, "RBAL:BTCUSDT", "BUY", f.qty,
                 new BigDecimal("100000"), f.qty, new BigDecimal("100000"), BigDecimal.ZERO,
                 BigDecimal.ZERO, BigDecimal.ZERO, "RBAL_initial", "initial")), List.of());
+        var gridReference = referenceSnapshot(service);
         assertEquals(0, new BigDecimal("0.010").compareTo(service.requestManualReduction()));
         org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, service::requestManualReduction);
         service.onPoll(); assertEquals(1, gateway.submitted.size());
@@ -1449,9 +1451,119 @@ class RebalanceServiceTest {
         assertEquals(0, new BigDecimal("0.010").compareTo(order.qty()));
         f.finish(order); service.onPoll();
         assertEquals(0, new BigDecimal("0.09").compareTo(f.qty));
+        assertReferenceUnchanged(gridReference, referenceSnapshot(service));
         assertEquals("GRID_ACTIVE", new FileRebalanceStateStore(state).load().orElseThrow().status());
         assertEquals(f.start, service.activeCycleStartedAt());
         assertEquals(3, gateway.submitted.size(), "confirmed reduction rebuilds the ordinary grid pair");
+    }
+
+    @Test
+    void manualAdditionKeepsCycleAndOnlyRebuildsGridAfterAllCappedOrdersFill() throws Exception {
+        RebalanceWaterExitTest.Fixture f = new RebalanceWaterExitTest.Fixture(); f.price = new BigDecimal("99000");
+        Path state = f.path.resolveSibling("service.json");
+        RebalanceMonitorStore store = new RebalanceMonitorStore(state);
+        RebalanceMonitorRule rule = new RebalanceMonitorRule("bound", "bound", true, TradeSide.BUY,
+                RebalanceMonitorRule.Trigger.BELOW, new BigDecimal("200000"),
+                new BigDecimal("5"), new BigDecimal("0.006"), BigDecimal.ONE);
+        store.save(List.of(rule)); store.setActive(rule);
+        RecordingTradeGateway gateway = new RecordingTradeGateway();
+        RebalanceService service = thresholdCycleService(state, gateway, f.price,
+                RebalanceMode.AUTO_LONG_BELOW, "200000", "0.006");
+        service.configureMonitorStore(store);
+        service.configureProfitExit(new RebalanceProfitExit.Exchange() {
+            public List<WorkingOrder> openOrders() { return List.copyOf(f.open); }
+            public RebalanceProfitExit.Evidence evidence(String id) { return f.evidence.get(id); }
+            public BigDecimal bestOppositePrice(TradeSide side) { return f.price; }
+        }, ignored -> f.cycle(), f::apply);
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, service::requestManualAddition);
+        service.restoreActiveCycle(List.of(new FillRecord(f.start, "RBAL:BTCUSDT", "BUY", f.qty,
+                new BigDecimal("100000"), f.qty, new BigDecimal("100000"), BigDecimal.ZERO,
+                BigDecimal.ZERO, BigDecimal.ZERO, "RBAL_initial", "initial")), List.of());
+        var gridReference = referenceSnapshot(service);
+        assertEquals(0, new BigDecimal("0.010").compareTo(service.requestManualAddition()));
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, service::requestManualAddition);
+        service.onPoll();
+        for (int i = 0; i < 10; i++) {
+            assertEquals(i + 1, gateway.submitted.size(), "normal grid stays frozen during addition");
+            OrderIntent order = gateway.submitted.get(i);
+            assertEquals(TradeSide.BUY, order.side());
+            assertEquals(0, new BigDecimal("0.001").compareTo(order.qty()));
+            f.finish(order); service.onPoll();
+        }
+        assertEquals(0, new BigDecimal("0.110").compareTo(f.qty));
+        assertReferenceUnchanged(gridReference, referenceSnapshot(service));
+        assertEquals(f.start, service.activeCycleStartedAt());
+        assertEquals("GRID_ACTIVE", new FileRebalanceStateStore(state).load().orElseThrow().status());
+        assertEquals(12, gateway.submitted.size(), "only confirmed addition rebuilds the ordinary grid pair");
+        service.requestManualCycleExit();
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, service::requestManualAddition);
+    }
+
+    @Test
+    void restoreIgnoresManualPricesButUsesTheirActualInventoryAndCost() throws Exception {
+        Path state = Files.createTempDirectory("manual-reference").resolve("state.json");
+        RebalanceService service = thresholdCycleService(state, new RecordingTradeGateway(), new BigDecimal("82824.9"),
+                RebalanceMode.AUTO_LONG_BELOW, "200000", "0.006");
+        var start = Instant.parse("2026-10-21T10:00:00Z");
+        List<FillRecord> fills = List.of(
+                referenceFill(start, "BUY", "0.2", "83000", "0.2", "16600", "RBAL_grid1", null),
+                referenceFill(start.plusSeconds(1), "BUY", "0.1", "82914.7", "0.3", "24891.47", "RBAL_grid2", null),
+                referenceFill(start.plusSeconds(2), "SELL", "0.028", "84571.5", "0.272", "22523.468",
+                        "RBAL_WATER_legacy_manual", "{\"manualPositionAdjustment\":true}"),
+                referenceFill(start.plusSeconds(3), "BUY", "0.02", "81000", "0.292", "24143.468",
+                        "RBAL_MANUAL_add", null));
+        service.restoreActiveCycle(fills, List.of());
+        var snapshot = referenceSnapshot(service);
+        assertEquals(0, new BigDecimal("0.292").compareTo(snapshot.netQty()));
+        assertEquals(0, new BigDecimal("24143.468").divide(new BigDecimal("0.292"), java.math.MathContext.DECIMAL64)
+                .compareTo(snapshot.avgEntryPrice()));
+        assertEquals(0, new BigDecimal("82914.7").compareTo(snapshot.lastFillPrice()));
+        assertEquals(0, new BigDecimal("83000").compareTo(snapshot.previousFillPrice()));
+        assertEquals(TradeSide.BUY, snapshot.lastFillSide());
+        assertEquals(start, service.activeCycleStartedAt());
+
+        service.onExecution(new FillEvent("grid-next", "BTCUSDT", "RBAL_grid_next", TradeSide.BUY,
+                new BigDecimal("0.006"), new BigDecimal("82900"), start.plusSeconds(4)), "test");
+        var reference = referenceSnapshot(service);
+        assertEquals(1, reference.consecutiveBuyFills());
+        FillEvent add = new FillEvent("manual-add", "BTCUSDT", "RBAL_MANUAL_buy", TradeSide.BUY,
+                new BigDecimal("0.02"), new BigDecimal("81000"), start.plusSeconds(5));
+        service.onExecution(add, "test");
+        assertReferenceUnchanged(reference, referenceSnapshot(service));
+        service.onExecution(new FillEvent("manual-reduce", "BTCUSDT", "RBAL_MANUAL_sell", TradeSide.SELL,
+                new BigDecimal("0.01"), new BigDecimal("84571.5"), start.plusSeconds(6)), "test");
+        assertReferenceUnchanged(reference, referenceSnapshot(service));
+        assertEquals(0, new BigDecimal("0.308").compareTo(referenceSnapshot(service).netQty()));
+        assertFalse(service.onExecution(add, "duplicate"));
+        assertEquals(0, new BigDecimal("0.308").compareTo(referenceSnapshot(service).netQty()));
+
+        service.onExecution(new FillEvent("auto-half", "BTCUSDT", "RBAL_WATER_auto", TradeSide.SELL,
+                new BigDecimal("0.01"), new BigDecimal("85000"), start.plusSeconds(7)), "test");
+        assertEquals(0, new BigDecimal("85000").compareTo(referenceSnapshot(service).lastFillPrice()),
+                "automatic water exits keep their original reference-price behavior");
+    }
+
+    private static FillRecord referenceFill(Instant time, String side, String qty, String price, String cumulativeQty,
+            String cumulativeValue, String id, String metadata) {
+        BigDecimal q = new BigDecimal(qty), p = new BigDecimal(price), cumulative = new BigDecimal(cumulativeQty);
+        return new FillRecord(time, "RBAL:BTCUSDT", side, q, p, q.multiply(p), new BigDecimal("0.1"), "USDT",
+                cumulative, new BigDecimal(cumulativeValue), new BigDecimal("0.4"), cumulative,
+                BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, id, id + "-exec", metadata);
+    }
+
+    private static com.btcgrid.ledger.model.StrategyLedgerSnapshot referenceSnapshot(RebalanceService service) throws Exception {
+        var field = RebalanceService.class.getDeclaredField("rebalanceLedger");
+        field.setAccessible(true);
+        return ((com.btcgrid.ledger.service.StrategyLedger) field.get(service)).snapshot();
+    }
+
+    private static void assertReferenceUnchanged(com.btcgrid.ledger.model.StrategyLedgerSnapshot before,
+            com.btcgrid.ledger.model.StrategyLedgerSnapshot after) {
+        assertEquals(before.lastFillPrice(), after.lastFillPrice());
+        assertEquals(before.previousFillPrice(), after.previousFillPrice());
+        assertEquals(before.lastFillSide(), after.lastFillSide());
+        assertEquals(before.consecutiveBuyFills(), after.consecutiveBuyFills());
+        assertEquals(before.consecutiveSellFills(), after.consecutiveSellFills());
     }
 
     private RebalanceService autoShortCycleService(

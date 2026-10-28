@@ -217,6 +217,10 @@ public class HttpStatusServer implements AutoCloseable {
                 requirePost(exchange);
                 writeJson(exchange, liveControlService.reduceRebalanceCycle());
             });
+            createProtectedContext("/api/rebalance-add-cycle", exchange -> {
+                requirePost(exchange);
+                writeJson(exchange, liveControlService.addRebalanceCycle());
+            });
             createProtectedContext("/api/fills", exchange -> writeJson(exchange, liveControlService.recentFills()));
             createProtectedContext("/api/recent-fills", exchange -> writeJson(
                     exchange,
@@ -882,6 +886,7 @@ public class HttpStatusServer implements AutoCloseable {
                       <button id="stopRebalanceButton" class="stop" onclick="postRebalance('/api/rebalance-stop')">停止再平衡</button>
                       <button id="closeRebalanceCycleButton" class="danger" onclick="closeRebalanceCycle()" disabled>平仓并停止当前 Cycle</button>
                       <button id="reduceRebalanceCycleButton" onclick="reduceRebalanceCycle()" disabled>手动减仓 10%</button>
+                      <button id="addRebalanceCycleButton" onclick="addRebalanceCycle()" disabled>手动加仓 10%</button>
                     </p>
                     <div id="rebalanceActionBanner" class="action-banner"></div>
                     <div id="rebalanceNotice" class="notice"></div>
@@ -1434,8 +1439,8 @@ public class HttpStatusServer implements AutoCloseable {
                       }
                     }
                     async function postRebalance(url) {
-                      const action = url.includes('reduce-cycle') ? 'reduce' : url.includes('close-cycle') ? 'close' : (url.includes('stop') ? 'stop' : 'start');
-                      const actionText = action === 'reduce' ? '手动减仓 10%' : action === 'close' ? '平仓并停止当前 Cycle' : (action === 'stop' ? '停止再平衡' : '启动再平衡');
+                      const action = url.includes('add-cycle') ? 'add' : url.includes('reduce-cycle') ? 'reduce' : url.includes('close-cycle') ? 'close' : (url.includes('stop') ? 'stop' : 'start');
+                      const actionText = action === 'add' ? '手动加仓 10%' : action === 'reduce' ? '手动减仓 10%' : action === 'close' ? '平仓并停止当前 Cycle' : (action === 'stop' ? '停止再平衡' : '启动再平衡');
                       setBusy(true, action);
                       showRebalanceResult('info', `${actionText}请求处理中...`);
                       showRebalanceBanner('info', `正在${actionText}...`);
@@ -1444,7 +1449,8 @@ public class HttpStatusServer implements AutoCloseable {
                         const result = await r.json();
                         const message = result.message || (result.ok ? '操作成功' : '操作失败');
                         showRebalanceResult(result.ok ? 'ok' : 'error', message);
-                        showRebalanceBanner(result.ok ? 'ok' : 'error', result.ok ? `${actionText}完成` : `${actionText}失败`);
+                        const successBanner = action === 'add' ? '加仓请求已受理' : `${actionText}完成`;
+                        showRebalanceBanner(result.ok ? 'ok' : 'error', result.ok ? successBanner : `${actionText}失败`);
                       } catch (err) {
                         const message = err && err.message ? err.message : '请求失败';
                         showRebalanceResult('error', message);
@@ -1461,6 +1467,10 @@ public class HttpStatusServer implements AutoCloseable {
                     function reduceRebalanceCycle() {
                       if (!confirm('确认按当前 Cycle 累计净数量减仓 10%（按数量步长向下取整）？将先撤单，再按盘口限价减仓；成交后继续当前 Cycle。')) return;
                       postRebalance('/api/rebalance-reduce-cycle');
+                    }
+                    function addRebalanceCycle() {
+                      if (!confirm('确认按当前 Cycle 净数量 × 10% 加仓（按数量步长向下取整，沿当前方向）？将先撤单并核对成交，再按盘口限价加仓；成交后继续现有动态水位规则。')) return;
+                      postRebalance('/api/rebalance-add-cycle');
                     }
                     async function post(url, body) {
                       setBusy(true);
@@ -1540,10 +1550,10 @@ public class HttpStatusServer implements AutoCloseable {
                       renderFundingDetail();
                     });
                     function setBusy(busy, action) {
-                      ['startButton', 'resumeButton', 'stopButton', 'flattenButton', 'saveRebalanceButton', 'startRebalanceButton', 'stopRebalanceButton', 'closeRebalanceCycleButton', 'reduceRebalanceCycleButton'].forEach(id => {
+                      ['startButton', 'resumeButton', 'stopButton', 'flattenButton', 'saveRebalanceButton', 'startRebalanceButton', 'stopRebalanceButton', 'closeRebalanceCycleButton', 'reduceRebalanceCycleButton', 'addRebalanceCycleButton'].forEach(id => {
                         const button = document.getElementById(id);
                         if (button) button.dataset.busy = busy ? 'true' : 'false';
-                        if (button && (id === 'saveRebalanceButton' || id === 'startRebalanceButton' || id === 'stopRebalanceButton' || id === 'closeRebalanceCycleButton' || id === 'reduceRebalanceCycleButton')) button.disabled = busy;
+                        if (button && (id === 'saveRebalanceButton' || id === 'startRebalanceButton' || id === 'stopRebalanceButton' || id === 'closeRebalanceCycleButton' || id === 'reduceRebalanceCycleButton' || id === 'addRebalanceCycleButton')) button.disabled = busy;
                       });
                       setRebalanceButtonText(busy ? action : null);
                       document.querySelectorAll('[data-action="cancel-order"]').forEach(button => button.disabled = busy);
@@ -1555,7 +1565,8 @@ public class HttpStatusServer implements AutoCloseable {
                         startRebalanceButton: action === 'start' ? '启动中...' : '启动再平衡',
                         stopRebalanceButton: action === 'stop' ? '停止中...' : '停止再平衡',
                         closeRebalanceCycleButton: action === 'close' ? '平仓请求中...' : '平仓并停止当前 Cycle',
-                        reduceRebalanceCycleButton: action === 'reduce' ? '减仓请求中...' : '手动减仓 10%'
+                        reduceRebalanceCycleButton: action === 'reduce' ? '减仓请求中...' : '手动减仓 10%',
+                        addRebalanceCycleButton: action === 'add' ? '加仓请求中...' : '手动加仓 10%'
                       };
                       Object.entries(labels).forEach(([id, text]) => {
                         const button = document.getElementById(id);
@@ -1606,15 +1617,20 @@ public class HttpStatusServer implements AutoCloseable {
                         fetch('/api/rebalance-monitors').then(r=>r.json())
                       ]);
                       const rebalanceCycleItems = rebalanceCycles && rebalanceCycles.items ? rebalanceCycles.items : [];
+                      const rawRuntimeState = rebalanceState && rebalanceState.state ? rebalanceState.state : null;
+                      const runtimeState = rawRuntimeState
+                        && Object.prototype.hasOwnProperty.call(rebalanceState, 'gridReferencePrice')
+                        ? {...rawRuntimeState, gridReferencePrice: rebalanceState.gridReferencePrice}
+                        : rawRuntimeState;
                       if (rebalanceConfig && rebalanceConfig.config) applyRebalanceConfig(rebalanceConfig.config);
                       renderRebalanceMonitors(rebalanceMonitors,
-                        rebalanceState && rebalanceState.state ? rebalanceState.state : null);
-                      renderRebalanceState(rebalanceState && rebalanceState.state ? rebalanceState.state : null, control);
+                        runtimeState);
+                      renderRebalanceState(runtimeState, control);
                       const activeRebalanceOrders = (rebalanceOrders || []).filter(isActiveOrder);
-                      renderRebalanceOrders(activeRebalanceOrders, rebalanceCurrentCycle);
+                      renderRebalanceOrders(activeRebalanceOrders, rebalanceCurrentCycle, runtimeState);
                       renderRebalanceCurrentCycle(
                         rebalanceCurrentCycle,
-                        rebalanceState && rebalanceState.state ? rebalanceState.state : null,
+                        runtimeState,
                         activeRebalanceOrders,
                         rebalanceRecentFills && rebalanceRecentFills.items ? rebalanceRecentFills.items : []
                       );
@@ -1644,7 +1660,14 @@ public class HttpStatusServer implements AutoCloseable {
                         .then(r => r.json());
                     }
                     function renderRebalanceFillsPage(page, offset) {
-                      const fills = page && page.items ? page.items.map(item => item.fill || item) : [];
+                      const fills = page && page.items ? page.items.map(item => {
+                        if (!item || !item.fill) return item;
+                        return {
+                          ...item.fill,
+                          cumulativeTurnover: item.cumulativeTurnover,
+                          previousTradingPrice: item.previousTradingPrice
+                        };
+                      }) : [];
                       renderSimpleFills('rebalanceFills', fills, true);
                       renderRebalancePager('rebalanceFillsPager', page, offset, 'rebalance-fills-page');
                     }
@@ -1755,6 +1778,7 @@ public class HttpStatusServer implements AutoCloseable {
                       if (!state) {
                         document.getElementById('closeRebalanceCycleButton').disabled = true;
                         document.getElementById('reduceRebalanceCycleButton').disabled = true;
+                        document.getElementById('addRebalanceCycleButton').disabled = true;
                         setText('rebalanceStatus', '-');
                         setText('rebalanceCycleLock', '-');
                         setText('rebalanceCurrentPrice', '-');
@@ -1773,6 +1797,9 @@ public class HttpStatusServer implements AutoCloseable {
                       const reduceButton = document.getElementById('reduceRebalanceCycleButton');
                       if (reduceButton) reduceButton.disabled = document.body.dataset.busy === 'true'
                         || !Boolean(control && control.rebalanceRunning) || state.status !== 'GRID_ACTIVE';
+                      const addButton = document.getElementById('addRebalanceCycleButton');
+                      if (addButton) addButton.disabled = document.body.dataset.busy === 'true'
+                        || !Boolean(control && control.rebalanceRunning) || state.status !== 'GRID_ACTIVE';
                       setText('rebalanceCycleLock', state.status === 'GRID_ACTIVE' ? '已锁定，禁止重复开单' : '未锁定');
                       setText('rebalanceCurrentPrice', formatNumber(state.lastPrice));
                       setText('rebalanceRatio', `${formatPercent(state.currentRatio)} / ${formatPercent(state.targetRatio)}`);
@@ -1781,14 +1808,14 @@ public class HttpStatusServer implements AutoCloseable {
                       setText('rebalanceNetQty', formatNumber(state.netBaseQty));
                       setText('rebalanceEquity', formatNumber(state.totalEquityUsdt));
                     }
-                    function renderRebalanceOrders(orders, cycle) {
+                    function renderRebalanceOrders(orders, cycle, state) {
                       const tbody = document.getElementById('rebalanceOrders');
                       if (!tbody) return;
                       if (!orders || orders.length === 0) {
                         tbody.innerHTML = '<tr><td colspan="11" class="muted">暂无再平衡挂单</td></tr>';
                         return;
                       }
-                      const latestFillPrice = Number(cycle && cycle.latestFillPrice);
+                      const latestFillPrice = gridReferencePrice(state, cycle);
                       tbody.innerHTML = orders.map(order => `
                         <tr>
                           <td>${esc(order.status)}</td>
@@ -1923,6 +1950,15 @@ public class HttpStatusServer implements AutoCloseable {
                       const rows = newestFirst ? fills : [...fills].reverse();
                       tbody.innerHTML = rows.slice(0, 200).map(f => {
                         const boost = fillSizingBoost(f);
+                        const hasServerPreviousPrice = Object.prototype.hasOwnProperty.call(f, 'previousTradingPrice');
+                        const serverPreviousPrice = hasServerPreviousPrice
+                          && f.previousTradingPrice !== null
+                          && f.previousTradingPrice !== undefined
+                          ? Number(f.previousTradingPrice)
+                          : null;
+                        const priceDiff = hasServerPreviousPrice
+                          ? (Number.isFinite(serverPreviousPrice) ? Number(f.price) - serverPreviousPrice : null)
+                          : priceDiffs.get(fillKey(f));
                         return `
                         <tr class="${boost ? 'boost-fill-row' : ''}">
                           <td>${formatTime(f.time)}</td>
@@ -1931,7 +1967,7 @@ public class HttpStatusServer implements AutoCloseable {
                           <td>${esc(formatNumber(f.qty))}</td>
                           <td>${sizingBoostBadge(boost)}</td>
                           <td>${esc(formatNumber(f.price))}</td>
-                          <td>${formatPriceDiff(priceDiffs.get(fillKey(f)))}</td>
+                          <td>${formatPriceDiff(priceDiff)}</td>
                           <td>${esc(formatNumber(f.value))}</td>
                           <td>${esc(formatNumber(f.fee))} ${esc(f.feeCurrency || '')}</td>
                           <td>${formatPnl(f.totalPnlAtFill)}</td>
@@ -2531,6 +2567,17 @@ public class HttpStatusServer implements AutoCloseable {
                     function fillKey(fill) {
                       return `${fill.executionId || fill.clientOrderId || ''}|${fill.time || ''}`;
                     }
+                    function isManualRebalanceFill(fill) {
+                      if (!fill || typeof fill.symbol !== 'string' || !fill.symbol.startsWith('RBAL:')) return false;
+                      if (typeof fill.clientOrderId === 'string' && fill.clientOrderId.startsWith('RBAL_MANUAL_')) return true;
+                      if (!fill.configJson) return false;
+                      try {
+                        const metadata = typeof fill.configJson === 'string' ? JSON.parse(fill.configJson) : fill.configJson;
+                        return Boolean(metadata && metadata.manualPositionAdjustment === true);
+                      } catch (ignored) {
+                        return false;
+                      }
+                    }
                     function cumulativeTurnoverMap(fills, initialTotal = 0) {
                       const sorted = [...(fills || [])]
                         .filter(f => f)
@@ -2548,7 +2595,9 @@ public class HttpStatusServer implements AutoCloseable {
                     }
                     function priceDiffMap(fills) {
                       const sorted = [...(fills || [])]
-                        .filter(f => f && (f.side === 'BUY' || f.side === 'SELL'))
+                        .filter(f => f
+                          && (f.side === 'BUY' || f.side === 'SELL')
+                          && !isManualRebalanceFill(f))
                         .sort((a, b) => Number(a.time || 0) - Number(b.time || 0));
                       const byKey = new Map();
                       sorted.forEach((fill, index) => {
@@ -2710,6 +2759,14 @@ public class HttpStatusServer implements AutoCloseable {
                       return String(cycle && cycle.entryDirection || '').toUpperCase() === 'SHORT'
                         || String(state && state.activeSide || '').toUpperCase() === 'SELL';
                     }
+                    function gridReferencePrice(state, cycle) {
+                      if (state && Object.prototype.hasOwnProperty.call(state, 'gridReferencePrice')) {
+                        const reference = Number(state.gridReferencePrice);
+                        return Number.isFinite(reference) && reference > 0 ? reference : NaN;
+                      }
+                      const fallback = Number(cycle && cycle.latestFillPrice);
+                      return Number.isFinite(fallback) && fallback > 0 ? fallback : NaN;
+                    }
                     function rebalanceScenarioLabel(cycle, state) {
                       return isShortRebalanceCycle(cycle, state)
                         ? '达到目标比例时预计 BTC 价格'
@@ -2739,7 +2796,7 @@ public class HttpStatusServer implements AutoCloseable {
                         order && order.side === 'BUY' && Number.isFinite(Number(order.price)) && Number(order.price) > 0
                       );
                       const projectedFeeRate = estimateProjectedFeeRate(cycle, recentFillItems);
-                      const latestFillPrice = Number(cycle && cycle.latestFillPrice);
+                      const latestFillPrice = gridReferencePrice(state, cycle);
                       let price = activeBuy
                         ? Number(activeBuy.price)
                         : (Number.isFinite(latestFillPrice) && latestFillPrice > 0 ? latestFillPrice * (1 - spacing) : NaN);
@@ -2808,7 +2865,7 @@ public class HttpStatusServer implements AutoCloseable {
                       const activeSell = (activeOrders || []).find(order =>
                         order && order.side === 'SELL' && Number.isFinite(Number(order.price)) && Number(order.price) > 0
                       );
-                      const latestFillPrice = Number(cycle && cycle.latestFillPrice);
+                      const latestFillPrice = gridReferencePrice(state, cycle);
                       let price = activeSell
                         ? Number(activeSell.price)
                         : (Number.isFinite(latestFillPrice) && latestFillPrice > 0 ? latestFillPrice * (1 + spacing) : NaN);

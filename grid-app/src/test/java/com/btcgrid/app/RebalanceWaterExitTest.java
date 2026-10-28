@@ -237,12 +237,188 @@ class RebalanceWaterExitTest {
         assertEquals("HALF", f.exit.phase());
     }
 
+    @Test void manualLongAdditionRoundsDownAndCanRepeatAfterConfirmedFill() throws Exception {
+        Fixture f = new Fixture(); f.qty = d("0.123"); f.value = d("12300"); f.price = d("99000"); f.poll();
+        assertEquals(0, d("0.012").compareTo(f.exit.requestManualAddition(f.market())));
+        assertTrue(f.exit.frozen());
+        assertThrows(IllegalStateException.class, () -> f.exit.requestManualAddition(f.market()));
+        assertThrows(IllegalStateException.class, () -> f.exit.requestManualReduction(f.market()));
+        f.poll(); OrderIntent order = f.submitted.get(0);
+        assertEquals(TradeSide.BUY, order.side()); assertEquals(OrderType.LIMIT, order.type());
+        assertFalse(order.reduceOnly()); assertEquals(0, d("0.012").compareTo(order.qty()));
+        assertEquals(0, d("0.123").compareTo(f.qty), "submission is not a fill");
+        f.finish(order); assertFalse(f.poll()); assertEquals("GRID", f.exit.phase());
+        assertEquals(0, d("0.135").compareTo(f.qty)); assertEquals(START, f.start);
+        assertEquals(0, d("0.013").compareTo(f.exit.requestManualAddition(f.market())));
+    }
+
+    @Test void manualShortAdditionSellsAndProfitableLongStillStaysPausedAfterAddition() throws Exception {
+        Fixture f = new Fixture(); f.qty = d("-0.1"); f.value = d("-10000"); f.entryDirection = "SHORT";
+        f.price = d("100500"); f.poll(); f.exit.requestManualAddition(f.market()); f.poll();
+        OrderIntent order = f.submitted.get(0);
+        assertEquals(TradeSide.SELL, order.side()); assertFalse(order.reduceOnly());
+        f.finish(order); assertFalse(f.poll()); assertEquals(0, d("-0.110").compareTo(f.qty));
+
+        Fixture paused = new Fixture(); paused.price = d("100500"); paused.poll();
+        assertEquals("PAUSED", paused.exit.phase());
+        paused.exit.requestManualAddition(paused.market()); paused.poll();
+        paused.finish(paused.submitted.get(0)); assertTrue(paused.poll());
+        assertEquals("PAUSED", paused.exit.phase()); assertFalse(paused.exit.complete());
+        assertEquals(1, paused.submitted.size()); assertEquals(0, d("0.110").compareTo(paused.qty));
+    }
+
+    @Test void manualAdditionWaitsForCancellationRaceAndKeepsClickTimeQuantityAcrossRestart() throws Exception {
+        Fixture f = new Fixture(); f.price = d("99000"); f.poll();
+        WorkingOrder grid = f.order("RBAL_old", TradeSide.BUY, OrderStatus.NEW, d("0.006"), d("98900"));
+        f.open.add(grid); f.registry.trackRemote(grid); f.exit.requestManualAddition(f.market());
+        f.recreate(); f.poll(); assertTrue(f.canceled.contains(grid.clientOrderId())); assertTrue(f.submitted.isEmpty());
+        f.open.clear(); f.poll(); assertTrue(f.submitted.isEmpty());
+        FillEvent late = f.fill(grid.clientOrderId(), grid.side(), grid.qty(), grid.price());
+        f.evidence.put(grid.clientOrderId(), new RebalanceProfitExit.Evidence(
+                grid.withStatus(OrderStatus.FILLED, Instant.now(), ""), grid.qty(), List.of()));
+        f.poll(); assertTrue(f.submitted.isEmpty(), "missing executions block addition");
+        f.evidence.put(grid.clientOrderId(), new RebalanceProfitExit.Evidence(
+                grid.withStatus(OrderStatus.FILLED, Instant.now(), ""), grid.qty(), List.of(late)));
+        f.poll(); assertEquals(0, d("0.106").compareTo(f.qty));
+        assertEquals(0, d("0.010").compareTo(f.submitted.get(0).qty()));
+        f.finish(f.submitted.get(0)); f.recreate(); assertFalse(f.poll());
+        assertEquals(0, d("0.116").compareTo(f.qty)); assertEquals(1, f.submitted.size());
+    }
+
+    @Test void manualAdditionPartialFillRequoteAndRestartNeverIncreaseLockedQuantity() throws Exception {
+        Fixture f = new Fixture(); f.price = d("99000"); f.poll(); f.exit.requestManualAddition(f.market()); f.poll();
+        OrderIntent order = f.submitted.get(0); f.partial(order, d("0.004"));
+        f.poll(); f.recreate(); f.poll(); assertEquals(1, f.submitted.size());
+        assertEquals(0, d("0.104").compareTo(f.qty));
+        f.price = d("99100"); f.poll(); assertTrue(f.canceled.contains(order.clientOrderId()));
+        assertEquals(1, f.submitted.size());
+        var ev = f.evidence.get(order.clientOrderId()); f.open.clear();
+        f.evidence.put(order.clientOrderId(), new RebalanceProfitExit.Evidence(
+                ev.order().withStatus(OrderStatus.CANCELED, Instant.now(), ""), ev.executedQty(), ev.fills()));
+        f.poll(); assertEquals(2, f.submitted.size()); assertEquals(0, d("0.006").compareTo(f.submitted.get(1).qty()));
+        f.finish(f.submitted.get(1)); assertFalse(f.poll());
+        assertEquals(0, d("0.110").compareTo(f.qty)); assertEquals("GRID", f.exit.phase());
+    }
+
+    @Test void manualAdditionUnknownSubmissionRemainsFrozenAfterRestart() throws Exception {
+        Fixture f = new Fixture(); f.price = d("99000"); f.poll(); f.exit.requestManualAddition(f.market());
+        f.failSubmit = true; assertThrows(IllegalStateException.class, f::poll);
+        assertEquals(1, f.submitted.size());
+        f.recreate(); f.poll(); f.poll();
+        assertEquals(1, f.submitted.size()); assertEquals("MANUAL_ADD", f.exit.phase());
+        assertTrue(f.exit.message().contains("未知")); assertEquals(0, d("0.1").compareTo(f.qty));
+    }
+
+    @Test void manualAdditionHonorsPerOrderAndInventoryLimits() throws Exception {
+        Fixture f = new Fixture(); f.maxOrderQty = d("0.004"); f.recreate(); f.price = d("99000"); f.poll();
+        f.exit.requestManualAddition(f.market()); f.poll();
+        for (int i = 0; i < 3; i++) {
+            assertEquals(i + 1, f.submitted.size()); OrderIntent order = f.submitted.get(i);
+            assertTrue(order.qty().compareTo(d("0.004")) <= 0);
+            f.finish(order); f.poll();
+        }
+        assertEquals(0, d("0.110").compareTo(f.qty)); assertEquals("GRID", f.exit.phase());
+        Fixture capped = new Fixture(); capped.maxInventoryQty = d("0.109"); capped.recreate();
+        assertThrows(IllegalStateException.class, () -> capped.exit.requestManualAddition(capped.market()));
+        assertFalse(capped.exit.frozen()); assertTrue(capped.submitted.isEmpty());
+    }
+
+    @Test void manualAdditionSplitsWithoutCreatingAnUntradableRemainder() throws Exception {
+        Fixture f = new Fixture(); f.qty = d("0.060"); f.value = d("6000");
+        f.maxOrderQty = d("0.005"); f.minNotionalValue = d("300"); f.recreate(); f.poll();
+        assertEquals(0, d("0.006").compareTo(f.exit.requestManualAddition(f.market()))); f.poll();
+        assertEquals(0, d("0.003").compareTo(f.submitted.get(0).qty()));
+        f.finish(f.submitted.get(0)); f.poll();
+        assertEquals(0, d("0.003").compareTo(f.submitted.get(1).qty()));
+        f.finish(f.submitted.get(1)); f.poll(); assertEquals(0, d("0.066").compareTo(f.qty));
+        Fixture impossible = new Fixture(); impossible.maxOrderQty = d("0.002");
+        impossible.minNotionalValue = d("300"); impossible.recreate();
+        assertThrows(IllegalStateException.class, () -> impossible.exit.requestManualAddition(impossible.market()));
+        assertFalse(impossible.exit.frozen());
+
+        Fixture balanced = new Fixture(); balanced.qty = d("0.120"); balanced.value = d("12000");
+        balanced.maxOrderQty = d("0.005"); balanced.minNotionalValue = d("400"); balanced.recreate();
+        balanced.poll(); assertEquals(0, d("0.012").compareTo(balanced.exit.requestManualAddition(balanced.market())));
+        balanced.poll(); assertEquals(0, d("0.004").compareTo(balanced.submitted.get(0).qty()));
+        balanced.finish(balanced.submitted.get(0)); balanced.poll();
+        assertEquals(0, d("0.004").compareTo(balanced.submitted.get(1).qty()));
+        balanced.finish(balanced.submitted.get(1)); balanced.poll();
+        assertEquals(0, d("0.004").compareTo(balanced.submitted.get(2).qty()));
+        balanced.finish(balanced.submitted.get(2)); balanced.poll();
+        assertEquals(0, d("0.132").compareTo(balanced.qty)); assertEquals("GRID", balanced.exit.phase());
+    }
+
+    @Test void manualAdditionRetainsOriginalAutomaticExitRulesAfterConfirmedFill() throws Exception {
+        Fixture f = new Fixture(); f.price = d("99000"); f.poll(); f.exit.requestManualAddition(f.market()); f.poll();
+        OrderIntent add = f.submitted.get(0);
+        f.price = d("105000"); f.poll(); assertEquals("MANUAL_ADD", f.exit.phase());
+        assertEquals(1, f.submitted.size());
+        f.finish(add); f.poll(); assertEquals("EXITING", f.exit.phase());
+        assertEquals(2, f.submitted.size()); assertEquals(TradeSide.SELL, f.submitted.get(1).side());
+        assertEquals(0, d("0.110").compareTo(f.submitted.get(1).qty()));
+    }
+
+    @Test void reachingRatioCancelsAdditionAndKeepsOnlyConfirmedInventory() throws Exception {
+        Fixture f = new Fixture(); f.price = d("99000"); f.poll(); f.exit.requestManualAddition(f.market()); f.poll();
+        OrderIntent add = f.submitted.get(0); f.partial(add, d("0.004"));
+        assertTrue(f.exit.poll(f.market(), f.start, true));
+        assertEquals("FINISH_KEEP", f.exit.phase()); assertTrue(f.canceled.contains(add.clientOrderId()));
+        assertFalse(f.exit.complete());
+        var ev = f.evidence.get(add.clientOrderId()); f.open.clear();
+        f.evidence.put(add.clientOrderId(), new RebalanceProfitExit.Evidence(
+                ev.order().withStatus(OrderStatus.CANCELED, Instant.now(), ""), ev.executedQty(), ev.fills()));
+        f.recreate(); f.poll(); assertTrue(f.exit.complete());
+        assertEquals(0, d("0.104").compareTo(f.qty)); assertEquals(1, f.submitted.size());
+        assertThrows(IllegalStateException.class, () -> f.exit.requestManualAddition(f.market()));
+    }
+
+    @Test void manualAdditionRejectsDustFlatAmbiguousDirectionAndOtherAdjustments() throws Exception {
+        Fixture f = new Fixture(); f.qty = d("0.009"); f.value = d("900"); f.price = d("99000"); f.poll();
+        assertThrows(IllegalStateException.class, () -> f.exit.requestManualAddition(f.market()));
+        assertEquals("GRID", f.exit.phase());
+        f.qty = BigDecimal.ZERO;
+        assertThrows(IllegalStateException.class, () -> f.exit.requestManualAddition(f.market()));
+        f.qty = d("0.1"); f.value = d("10000"); f.entryDirection = "UNKNOWN";
+        assertThrows(IllegalStateException.class, () -> f.exit.requestManualAddition(f.market()));
+        f.entryDirection = "LONG"; f.exit.requestManualReduction(f.market());
+        assertThrows(IllegalStateException.class, () -> f.exit.requestManualAddition(f.market()));
+        Fixture automatic = new Fixture(); automatic.price = d("101000"); automatic.poll();
+        assertThrows(IllegalStateException.class, () -> automatic.exit.requestManualAddition(automatic.market()));
+        assertEquals("HALF", automatic.exit.phase());
+    }
+
+    @Test void manualAdditionRejectsStaleMarketAndDirectionOrCapacityChangeDuringCancellation() throws Exception {
+        Fixture f = new Fixture(); f.price = d("99000"); f.poll();
+        MarketSnapshot stale = new MarketSnapshot("BTCUSDT", Instant.now().minusSeconds(60), f.price, f.price, null);
+        assertThrows(IllegalStateException.class, () -> f.exit.requestManualAddition(stale));
+        assertEquals("GRID", f.exit.phase());
+        f.exit.requestManualAddition(f.market());
+        assertThrows(IllegalStateException.class, () -> f.exit.poll(stale, f.start, false));
+        assertTrue(f.submitted.isEmpty());
+        f.qty = d("-0.1"); f.value = d("-10000");
+        assertThrows(IllegalStateException.class, f::poll); assertTrue(f.submitted.isEmpty());
+        assertEquals("MANUAL_ADD", f.exit.phase());
+        Fixture cap = new Fixture(); cap.maxInventoryQty = d("0.115"); cap.recreate(); cap.price = d("99000"); cap.poll();
+        cap.exit.requestManualAddition(cap.market()); cap.qty = d("0.110"); cap.value = d("11000");
+        assertThrows(IllegalStateException.class, cap::poll); assertTrue(cap.submitted.isEmpty());
+    }
+
+    @Test void manualAdditionCannotReopenCompletedCycleAndInvalidDurableStateFailsClosed() throws Exception {
+        Fixture f = new Fixture(); f.price = d("99500"); f.poll(); f.exit.finishExternalExit();
+        assertThrows(IllegalStateException.class, () -> f.exit.requestManualAddition(f.market()));
+        assertEquals("COMPLETE", f.exit.phase());
+        Files.writeString(f.path, "{\"cycleStartMillis\":1,\"phase\":\"MANUAL_ADD\"}");
+        assertThrows(IllegalStateException.class, f::recreate);
+    }
+
     static class Fixture {
         final Path path;
         Instant start = START;
         BigDecimal qty = d("0.1"), value = d("10000"), fees = BigDecimal.ZERO, price = d("100000");
         BigDecimal startPrice = d("100000");
         String entryDirection = "LONG";
+        BigDecimal maxOrderQty = d("0.1"), maxInventoryQty = d("5");
+        BigDecimal minNotionalValue = BigDecimal.ZERO;
         boolean failSubmit;
         final List<OrderIntent> submitted = new ArrayList<>();
         final List<String> canceled = new ArrayList<>();
@@ -255,8 +431,8 @@ class RebalanceWaterExitTest {
         void recreate() {
             RebalanceSettings settings = new RebalanceSettings(true, ProductCategory.LINEAR, "BTCUSDT", "UNIFIED", "BTC", "USDT",
                     List.of(new RebalanceBand(d("80000"), d("0.70"))), d("0.01"), d("0.001"), d("0.85"), d("0.005"),
-                    d("5"), d("0.1"), d("5"), d("0.001"), d("0.001"), Duration.ofMinutes(15), 1, "unused", "unused");
-            exit = new RebalanceWaterExit(path, settings, new InstrumentSpec("BTCUSDT", d("0.001"), d("0.001"), d("0.1"), d("0.1")),
+                    d("5"), maxOrderQty, maxInventoryQty, d("0.001"), d("0.001"), Duration.ofMinutes(15), 1, "unused", "unused");
+            exit = new RebalanceWaterExit(path, settings, new InstrumentSpec("BTCUSDT", d("0.001"), d("0.001"), d("0.1"), d("0.1"), minNotionalValue),
                     new RebalanceProfitExit.Exchange() {
                         public List<WorkingOrder> openOrders() { return List.copyOf(open); }
                         public RebalanceProfitExit.Evidence evidence(String id) { return evidence.get(id); }

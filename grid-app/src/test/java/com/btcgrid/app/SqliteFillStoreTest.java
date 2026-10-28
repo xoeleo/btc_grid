@@ -333,6 +333,120 @@ class SqliteFillStoreTest {
     }
 
     @Test
+    void rebalanceManualAdjustmentsDoNotAdvancePreviousGridPriceAcrossPagesOrFilters() {
+        Path dbPath = tempDir.resolve("rebalance-manual-price-reference.sqlite");
+        SqliteFillStore store = new SqliteFillStore(dbPath);
+        String symbol = "RBAL:BTCUSDT";
+        store.save(fillWithMetadata(
+                symbol,
+                Instant.ofEpochSecond(1000L),
+                "BUY",
+                new BigDecimal("0.1"),
+                new BigDecimal("100"),
+                new BigDecimal("0.1"),
+                "RBAL_BTCUSDT_I_manual-reference",
+                "rebalance-grid-initial",
+                null
+        ));
+        store.save(fillWithMetadata(
+                symbol,
+                Instant.ofEpochSecond(1001L),
+                "SELL",
+                new BigDecimal("0.02"),
+                new BigDecimal("90"),
+                new BigDecimal("0.2"),
+                "RBAL_MANUAL_REDUCE_test",
+                "rebalance-manual-reduce",
+                null
+        ));
+        store.save(fillWithMetadata(
+                symbol,
+                Instant.ofEpochSecond(1002L),
+                "BUY",
+                new BigDecimal("0.03"),
+                new BigDecimal("110"),
+                new BigDecimal("0.3"),
+                "RBAL_BTCUSDT_PS_manual-add",
+                "rebalance-manual-add",
+                "{\"manualPositionAdjustment\":true}"
+        ));
+        store.save(fillWithMetadata(
+                symbol,
+                Instant.ofEpochSecond(1003L),
+                "SELL",
+                new BigDecimal("0.04"),
+                new BigDecimal("120"),
+                new BigDecimal("0.4"),
+                "RBAL_BTCUSDT_PS_next-grid",
+                "rebalance-grid-next",
+                null
+        ));
+
+        CurrentCycleFillPage first = store.currentCycleFillsPage(symbol, 2, 0, null, null);
+        CurrentCycleFillPage second = store.currentCycleFillsPage(symbol, 2, 2, null, null);
+        CurrentCycleFillPage filtered = store.currentCycleFillsPage(
+                symbol,
+                2,
+                0,
+                new BigDecimal("120"),
+                new BigDecimal("121")
+        );
+
+        assertEquals("rebalance-grid-next", first.items().get(0).fill().executionId());
+        assertEquals(new BigDecimal("100"), first.items().get(0).previousTradingPrice());
+        assertEquals(null, first.items().get(1).previousTradingPrice());
+        assertEquals(0, first.items().get(0).cumulativeTurnover().compareTo(new BigDecimal("19.9")));
+        assertEquals(0, first.items().get(1).cumulativeTurnover().compareTo(new BigDecimal("15.1")));
+        assertEquals(0, first.items().get(0).fill().cumulativeQty().compareTo(new BigDecimal("0.07")));
+        assertEquals(0, first.items().get(0).fill().cumulativeFee().compareTo(new BigDecimal("1.0")));
+        assertEquals(null, second.items().get(0).previousTradingPrice());
+        assertEquals(null, second.items().get(1).previousTradingPrice());
+        assertEquals(0, second.items().get(0).cumulativeTurnover().compareTo(new BigDecimal("11.8")));
+        assertEquals(new BigDecimal("100"), filtered.items().get(0).previousTradingPrice());
+        assertEquals(0, filtered.items().get(0).cumulativeTurnover().compareTo(new BigDecimal("19.9")));
+
+        Path nonRebalanceDbPath = tempDir.resolve("non-rebalance-manual-price-reference.sqlite");
+        SqliteFillStore nonRebalanceStore = new SqliteFillStore(nonRebalanceDbPath);
+        nonRebalanceStore.save(fillWithMetadata(
+                "BTCUSDT",
+                Instant.ofEpochSecond(1000L),
+                "BUY",
+                new BigDecimal("0.1"),
+                new BigDecimal("100"),
+                BigDecimal.ZERO,
+                "GRID_BTCUSDT_INIT_non-rebalance",
+                "grid-initial",
+                null
+        ));
+        nonRebalanceStore.save(fillWithMetadata(
+                "BTCUSDT",
+                Instant.ofEpochSecond(1001L),
+                "SELL",
+                new BigDecimal("0.02"),
+                new BigDecimal("90"),
+                BigDecimal.ZERO,
+                "RBAL_MANUAL_REDUCE_non-rebalance",
+                "manual-non-rebalance",
+                "{\"manualPositionAdjustment\":true}"
+        ));
+        nonRebalanceStore.save(fillWithMetadata(
+                "BTCUSDT",
+                Instant.ofEpochSecond(1002L),
+                "BUY",
+                new BigDecimal("0.03"),
+                new BigDecimal("110"),
+                BigDecimal.ZERO,
+                "GRID_BTCUSDT_PB_non-rebalance",
+                "grid-next",
+                null
+        ));
+        CurrentCycleFillPage nonRebalance = nonRebalanceStore.currentCycleFillsPage(
+                "BTCUSDT", 3, 0, null, null
+        );
+        assertEquals(new BigDecimal("90"), nonRebalance.items().get(0).previousTradingPrice());
+    }
+
+    @Test
     void loadsRebalanceRecoveryCycleBeyondLegacyThousandRowLimit() {
         Path dbPath = tempDir.resolve("long-rebalance-cycle.sqlite");
         SqliteFillStore store = new SqliteFillStore(dbPath);
@@ -919,14 +1033,38 @@ class SqliteFillStoreTest {
             String executionId,
             String metadataJson
     ) {
+        return fillWithMetadata(
+                "BTCUSDT",
+                time,
+                side,
+                qty,
+                price,
+                BigDecimal.ZERO,
+                clientOrderId,
+                executionId,
+                metadataJson
+        );
+    }
+
+    private FillRecord fillWithMetadata(
+            String symbol,
+            Instant time,
+            String side,
+            BigDecimal qty,
+            BigDecimal price,
+            BigDecimal fee,
+            String clientOrderId,
+            String executionId,
+            String metadataJson
+    ) {
         return new FillRecord(
                 time,
-                "BTCUSDT",
+                symbol,
                 side,
                 qty,
                 price,
                 qty.multiply(price),
-                BigDecimal.ZERO,
+                fee,
                 "USDT",
                 BigDecimal.ZERO,
                 BigDecimal.ZERO,

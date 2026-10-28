@@ -701,13 +701,14 @@ public class SqliteFillStore implements FillStore {
             Map<Long, BigDecimal> previousPriceByRowId = new HashMap<>();
             Set<Long> requestedRowIds = rows.stream().map(PageRow::rowId).collect(java.util.stream.Collectors.toSet());
             String metricsSql = """
-                    select rowid as fill_rowid, side, price, value
+                    select rowid as fill_rowid, side, price, value, client_order_id, config_json
                       from fills
                      where side in ('BUY', 'SELL', 'FUNDING_FEE')
                        and symbol = ?
                        and (fill_time_millis > ? or (fill_time_millis = ? and rowid >= ?))
                      order by fill_time_millis asc, rowid asc
                     """;
+            boolean rebalanceSymbol = normalizedSymbol.startsWith("RBAL:");
             BigDecimal turnover = BigDecimal.ZERO;
             BigDecimal previousTradingPrice = null;
             try (PreparedStatement statement = connection.prepareStatement(metricsSql)) {
@@ -717,11 +718,20 @@ public class SqliteFillStore implements FillStore {
                         long rowId = rs.getLong("fill_rowid");
                         String side = rs.getString("side");
                         if ("BUY".equals(side) || "SELL".equals(side)) {
-                            if (requestedRowIds.contains(rowId) && previousTradingPrice != null) {
+                            boolean manualAdjustment = rebalanceSymbol
+                                    && RebalanceManualAdjustment.isManual(
+                                            rs.getString("client_order_id"),
+                                            rs.getString("config_json")
+                                    );
+                            if (!manualAdjustment
+                                    && requestedRowIds.contains(rowId)
+                                    && previousTradingPrice != null) {
                                 previousPriceByRowId.put(rowId, previousTradingPrice);
                             }
                             turnover = turnover.add(decimal(rs.getString("value")).abs());
-                            previousTradingPrice = decimal(rs.getString("price"));
+                            if (!manualAdjustment) {
+                                previousTradingPrice = decimal(rs.getString("price"));
+                            }
                         }
                         if (requestedRowIds.contains(rowId)) {
                             turnoverByRowId.put(rowId, turnover);

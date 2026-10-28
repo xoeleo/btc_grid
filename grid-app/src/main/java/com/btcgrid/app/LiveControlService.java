@@ -947,17 +947,23 @@ public class LiveControlService {
                     Instant.now(),
                     stoppedByUser ? savedState.message() : (runningState ? savedState.message() : "preview from wallet and position")
             );
-            return Map.of("ok", true, "state", state);
+            return rebalanceStatePayload(state);
         } catch (RuntimeException e) {
             eventLogger.warn("rebalance.state.preview.failed", Map.of("message", e.getMessage()));
         }
         return new FileRebalanceStateStore(PathResolver.absolutePath(baseProperties.rebalanceSettings().stateFilePath()))
                 .load()
-                .<Map<String, Object>>map(state -> Map.of("ok", true, "state", state))
-                .orElseGet(() -> Map.of(
-                        "ok", true,
-                        "state", RebalanceState.initial(baseProperties.rebalanceSettings().enabled(), baseProperties.rebalanceSettings().symbol())
-                ));
+                .map(this::rebalanceStatePayload)
+                .orElseGet(() -> rebalanceStatePayload(RebalanceState.initial(
+                        baseProperties.rebalanceSettings().enabled(), baseProperties.rebalanceSettings().symbol())));
+    }
+
+    private Map<String, Object> rebalanceStatePayload(RebalanceState state) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("ok", true);
+        result.put("state", state);
+        result.put("gridReferencePrice", activeRebalanceRunner == null ? null : activeRebalanceRunner.gridReferencePrice());
+        return result;
     }
 
     private BigDecimal rebalanceTargetRatio(RebalanceSettings settings, BigDecimal price) {
@@ -1331,6 +1337,18 @@ public class LiveControlService {
             BigDecimal qty = activeRebalanceRunner.requestManualReduction();
             return Map.of("ok", true, "message", "已锁定手动减仓 " + qty.toPlainString()
                     + " BTC；撤单并核对成交后按盘口限价下单，成交后继续当前 Cycle");
+        } catch (IllegalStateException e) {
+            return Map.of("ok", false, "message", e.getMessage());
+        }
+    }
+
+    public synchronized Map<String, Object> addRebalanceCycle() {
+        if (activeRebalanceRunner == null || !activeRebalanceRunner.isRunning())
+            return Map.of("ok", false, "message", "再平衡监控未运行，无法加仓当前 Cycle");
+        try {
+            BigDecimal qty = activeRebalanceRunner.requestManualAddition();
+            return Map.of("ok", true, "message", "已锁定手动加仓 " + qty.toPlainString()
+                    + " BTC；撤单并核对成交后按当前持仓方向限价下单，成交后继续按原动态水位规则管理当前 Cycle");
         } catch (IllegalStateException e) {
             return Map.of("ok", false, "message", e.getMessage());
         }
@@ -1768,6 +1786,10 @@ public class LiveControlService {
         String configJson = previous == null
                 ? rebalanceStartMetadataJson()
                 : rebalanceProfitSizingMetadataJson(fillEvent, currentCycleFills);
+        if (RebalanceManualAdjustment.isManualOrder(fillEvent.clientOrderId())
+                || (activeRebalanceRunner != null && activeRebalanceRunner.isManualAdjustmentOrder(fillEvent.clientOrderId()))) {
+            configJson = RebalanceManualAdjustment.markMetadata(configJson);
+        }
         fillStore.save(new FillRecord(
                 fillEvent.fillTime(),
                 ledgerSymbol,

@@ -230,6 +230,18 @@ public class RebalanceLiveRunner implements AutoCloseable, PrivateExecutionListe
         return rebalanceService.requestManualReduction();
     }
 
+    public java.math.BigDecimal requestManualAddition() {
+        return rebalanceService.requestManualAddition();
+    }
+
+    public boolean isManualAdjustmentOrder(String clientOrderId) {
+        return rebalanceService.isManualAdjustmentOrder(clientOrderId);
+    }
+
+    public java.math.BigDecimal gridReferencePrice() {
+        return rebalanceService.gridReferencePrice();
+    }
+
     public boolean resumeAfterManualCycleExit() {
         return rebalanceService.resumeAfterManualCycleExit();
     }
