@@ -1,0 +1,23 @@
+PASS two_year_5pp 1051200 source minute decisions + exported accounting
+PASS two_year_1pp 1051200 source minute decisions + exported accounting
+PASS two_year_hold 1051200 source minute decisions + exported accounting
+PASS year1_5pp 525600 source minute decisions + exported accounting
+PASS year1_1pp 525600 source minute decisions + exported accounting
+PASS year2_5pp 525600 source minute decisions + exported accounting
+PASS year2_1pp 525600 source minute decisions + exported accounting
+PASS two_year_5pp_fee2 1051200 source minute decisions + exported accounting
+PASS two_year_1pp_fee2 1051200 source minute decisions + exported accounting
+PASS two_year_5pp_borrow5 1051200 source minute decisions + exported accounting
+PASS two_year_1pp_borrow5 1051200 source minute decisions + exported accounting
+PASS two_year_5pp_borrow10 1051200 source minute decisions + exported accounting
+PASS two_year_1pp_borrow10 1051200 source minute decisions + exported accounting
+PASS two_year_5pp_allow_long 1051200 source minute decisions + exported accounting
+PASS two_year_1pp_allow_long 1051200 source minute decisions + exported accounting
+PASS two_year_2pp 1051200 source minute decisions + exported accounting
+PASS year1_2pp 525600 source minute decisions + exported accounting
+PASS year2_2pp 525600 source minute decisions + exported accounting
+PASS two_year_2pp_fee2 1051200 source minute decisions + exported accounting
+PASS two_year_2pp_borrow5 1051200 source minute decisions + exported accounting
+PASS two_year_2pp_borrow10 1051200 source minute decisions + exported accounting
+PASS two_year_2pp_allow_long 1051200 source minute decisions + exported accounting
+ALL 22 EXPORTED SCENARIOS VERIFIED

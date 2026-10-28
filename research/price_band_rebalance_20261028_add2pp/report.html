@@ -1,0 +1,984 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>固定价格带直接再平衡回测</title>
+<style>
+body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;max-width:1900px;margin:26px auto;padding:0 18px;color:#17202a}
+p{line-height:1.72}.lead{font-size:1.05rem}.warning{background:#fff4e5;border-left:4px solid #d97706;padding:9px 12px;margin:8px 0;line-height:1.5}
+.missing{color:#9a3412}.data-table{border-collapse:collapse;font-size:12px;margin:8px 0 18px;white-space:nowrap}
+.data-table td,.data-table th{border:1px solid #d7dde5;padding:6px 8px}.data-table th{background:#eef2f7;position:sticky;top:0}
+img{max-width:100%;height:auto;border:1px solid #e5e7eb}input{margin:12px 0;padding:10px;min-width:360px;border:1px solid #9ca3af;border-radius:4px}
+li{line-height:1.7}
+</style>
+</head><body>
+<h1>固定价格带：直接再平衡净 BTC 权重回测</h1>
+<p class="lead"><strong>规则：</strong>BTC 现货价格 60,000 美元对应 100% 净 BTC 权重，
+200,000 美元对应 0%，中间按价格线性映射并截断在 0%–100%。初始 50 万美元全部折算为既有现货 BTC，
+现货数量保持不变，不收现货建仓费；随后只用 Bybit USDT 永续合约调整净仓位。</p>
+<p>每分钟按<strong>仓位相对目标的偏差</strong>触发，比较 5、2、1 个百分点阈值；触发后以 Taker 直接调回目标，
+不是网格、不是按价格跌幅触发。初始合约调整和每次再平衡使用 Taker 0.035%，滑点 1bp，合约数量步长 0.001 BTC。
+资金费使用历史真实结算记录；基础场景的融资利率为 0。主组仅开空/平空；允许合约净多、手续费翻倍、负 USDT 年息 5%/10% 只作敏感性。</p>
+<p><strong>回测区间：</strong>2024-10-02–2026-10-02（UTC，主期；子区间各自从 50 万美元重置）。本页面由 build_report.py 读取 results.json、daily/trades/settlements 导出，
+成交、资金费和净值详见完整导出；独立核验结果见 audit.json。</p>
+
+
+<h2>固定价格到目标权重</h2>
+<p>目标净 BTC 权重 = clamp((200,000 − BTC 现货价格) / 140,000, 0, 1)。目标权重使用现货价格；
+永续标记价用于净资产与持仓标记。现货 BTC 是期初持仓，不在报告中伪造一笔现货买入或现货手续费。</p>
+<table class="dataframe data-table">
+  <thead>
+    <tr style="text-align: right;">
+      <th>BTC现货价格（美元）</th>
+      <th>目标净BTC权重</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>$60,000</td>
+      <td>100%</td>
+    </tr>
+    <tr>
+      <td>$80,000</td>
+      <td>86%</td>
+    </tr>
+    <tr>
+      <td>$100,000</td>
+      <td>71%</td>
+    </tr>
+    <tr>
+      <td>$120,000</td>
+      <td>57%</td>
+    </tr>
+    <tr>
+      <td>$140,000</td>
+      <td>43%</td>
+    </tr>
+    <tr>
+      <td>$160,000</td>
+      <td>29%</td>
+    </tr>
+    <tr>
+      <td>$180,000</td>
+      <td>14%</td>
+    </tr>
+    <tr>
+      <td>$200,000</td>
+      <td>0%</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>主期核心比较</h2>
+<table class="dataframe data-table" id="main-comparison">
+  <thead>
+    <tr style="text-align: right;">
+      <th>方案</th>
+      <th>场景ID</th>
+      <th>区间</th>
+      <th>合约方向</th>
+      <th>Taker费率</th>
+      <th>滑点</th>
+      <th>负USDT年息</th>
+      <th>期末净资产</th>
+      <th>累计收益</th>
+      <th>年化收益</th>
+      <th>最大回撤</th>
+      <th>手续费</th>
+      <th>资金费净额</th>
+      <th>负USDT利息</th>
+      <th>Taker成交笔数</th>
+      <th>期末净BTC权重</th>
+      <th>期末目标权重</th>
+      <th>短仓目标不可达</th>
+      <th>最大负USDT</th>
+      <th>低/高侧触发</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>主方案：价格带直接再平衡，偏差5点触发</td>
+      <td>two_year_5pp</td>
+      <td>2024-10-02–2026-10-02（UTC）</td>
+      <td>short-only</td>
+      <td>0.035%</td>
+      <td>1.00 bp</td>
+      <td>0.0%</td>
+      <td>$790,824.48</td>
+      <td>58.16%</td>
+      <td>25.78%</td>
+      <td>42.86%</td>
+      <td>$1,240.28</td>
+      <td>$20,776.21</td>
+      <td>$0.00</td>
+      <td>86</td>
+      <td>83.22%</td>
+      <td>82.23%</td>
+      <td>4,624.4 小时</td>
+      <td>$8,691.85</td>
+      <td>5.00/5.00 点</td>
+    </tr>
+    <tr>
+      <td>主方案：价格带直接再平衡，偏差2点触发</td>
+      <td>two_year_2pp</td>
+      <td>2024-10-02–2026-10-02（UTC）</td>
+      <td>short-only</td>
+      <td>0.035%</td>
+      <td>1.00 bp</td>
+      <td>0.0%</td>
+      <td>$785,030.17</td>
+      <td>57.01%</td>
+      <td>25.32%</td>
+      <td>43.14%</td>
+      <td>$2,850.99</td>
+      <td>$21,316.59</td>
+      <td>$0.00</td>
+      <td>482</td>
+      <td>82.46%</td>
+      <td>82.23%</td>
+      <td>4,121.9 小时</td>
+      <td>$23,817.56</td>
+      <td>2.00/2.00 点</td>
+    </tr>
+    <tr>
+      <td>主方案：价格带直接再平衡，偏差1点触发</td>
+      <td>two_year_1pp</td>
+      <td>2024-10-02–2026-10-02（UTC）</td>
+      <td>short-only</td>
+      <td>0.035%</td>
+      <td>1.00 bp</td>
+      <td>0.0%</td>
+      <td>$786,643.44</td>
+      <td>57.33%</td>
+      <td>25.45%</td>
+      <td>43.18%</td>
+      <td>$5,773.71</td>
+      <td>$21,211.73</td>
+      <td>$0.00</td>
+      <td>1898</td>
+      <td>82.11%</td>
+      <td>82.23%</td>
+      <td>4,278.2 小时</td>
+      <td>$30,731.96</td>
+      <td>1.00/1.00 点</td>
+    </tr>
+    <tr>
+      <td>对照：BTC现货持有</td>
+      <td>two_year_hold</td>
+      <td>2024-10-02–2026-10-02（UTC）</td>
+      <td>short-only</td>
+      <td>0.035%</td>
+      <td>1.00 bp</td>
+      <td>0.0%</td>
+      <td>$697,892.91</td>
+      <td>39.58%</td>
+      <td>18.16%</td>
+      <td>54.20%</td>
+      <td>$0.00</td>
+      <td>$0.00</td>
+      <td>$0.00</td>
+      <td>0</td>
+      <td>100.00%</td>
+      <td>82.23%</td>
+      <td>0.0 小时</td>
+      <td>$0.00</td>
+      <td>5.00/5.00 点</td>
+    </tr>
+  </tbody>
+</table>
+<img src="equity.png" alt="主期组合净资产曲线">
+<p>净资产图实际绘制的场景：two_year_5pp, two_year_2pp, two_year_1pp, two_year_hold。最大回撤来自导出结果；若引擎以分钟 OHLC 路径估计，
+它是保守的小时/分钟路径上界，不是逐笔 tick 精确回撤。</p>
+
+<h2>独立年度子区间</h2>
+<table class="dataframe data-table" id="annual-returns">
+  <thead>
+    <tr style="text-align: right;">
+      <th>场景</th>
+      <th>场景ID</th>
+      <th>区间</th>
+      <th>期末净资产</th>
+      <th>区间收益</th>
+      <th>年化收益</th>
+      <th>最大回撤</th>
+      <th>手续费</th>
+      <th>资金费净额</th>
+      <th>Taker成交笔数</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>价格带直接再平衡，偏差5点触发</td>
+      <td>year1_5pp</td>
+      <td>2024-10-02–2025-10-02（UTC）</td>
+      <td>$959,758.47</td>
+      <td>91.95%</td>
+      <td>92.04%</td>
+      <td>23.72%</td>
+      <td>$832.23</td>
+      <td>$18,141.59</td>
+      <td>60</td>
+    </tr>
+    <tr>
+      <td>价格带直接再平衡，偏差2点触发</td>
+      <td>year1_2pp</td>
+      <td>2024-10-02–2025-10-02（UTC）</td>
+      <td>$951,619.87</td>
+      <td>90.32%</td>
+      <td>90.41%</td>
+      <td>23.93%</td>
+      <td>$1,864.86</td>
+      <td>$18,547.75</td>
+      <td>321</td>
+    </tr>
+    <tr>
+      <td>价格带直接再平衡，偏差1点触发</td>
+      <td>year1_1pp</td>
+      <td>2024-10-02–2025-10-02（UTC）</td>
+      <td>$956,294.60</td>
+      <td>91.26%</td>
+      <td>91.34%</td>
+      <td>23.74%</td>
+      <td>$3,935.91</td>
+      <td>$18,487.34</td>
+      <td>1320</td>
+    </tr>
+    <tr>
+      <td>价格带直接再平衡，偏差5点触发</td>
+      <td>year2_5pp</td>
+      <td>2025-10-02–2026-10-02（UTC）</td>
+      <td>$411,844.79</td>
+      <td>-17.63%</td>
+      <td>-17.64%</td>
+      <td>42.59%</td>
+      <td>$285.03</td>
+      <td>$1,279.41</td>
+      <td>27</td>
+    </tr>
+    <tr>
+      <td>价格带直接再平衡，偏差2点触发</td>
+      <td>year2_2pp</td>
+      <td>2025-10-02–2026-10-02（UTC）</td>
+      <td>$409,796.29</td>
+      <td>-18.04%</td>
+      <td>-18.05%</td>
+      <td>43.00%</td>
+      <td>$531.19</td>
+      <td>$1,293.56</td>
+      <td>140</td>
+    </tr>
+    <tr>
+      <td>价格带直接再平衡，偏差1点触发</td>
+      <td>year2_1pp</td>
+      <td>2025-10-02–2026-10-02（UTC）</td>
+      <td>$409,995.70</td>
+      <td>-18.00%</td>
+      <td>-18.01%</td>
+      <td>42.97%</td>
+      <td>$983.22</td>
+      <td>$1,299.02</td>
+      <td>540</td>
+    </tr>
+  </tbody>
+</table>
+<p>year1/year2 场景各自以 50 万美元和期初现货折算重新开始，不能把第二段的期末资产当作第一段的复利本金。
+若主代理未提供独立年度结果，页面只会从两年日终曲线标注“估算”，不会冒充独立回测。</p>
+
+<h2>敏感性场景</h2>
+<table class="dataframe data-table" id="sensitivity">
+  <thead>
+    <tr style="text-align: right;">
+      <th>方案</th>
+      <th>场景ID</th>
+      <th>区间</th>
+      <th>合约方向</th>
+      <th>Taker费率</th>
+      <th>滑点</th>
+      <th>负USDT年息</th>
+      <th>期末净资产</th>
+      <th>累计收益</th>
+      <th>年化收益</th>
+      <th>最大回撤</th>
+      <th>手续费</th>
+      <th>资金费净额</th>
+      <th>负USDT利息</th>
+      <th>Taker成交笔数</th>
+      <th>期末净BTC权重</th>
+      <th>期末目标权重</th>
+      <th>短仓目标不可达</th>
+      <th>最大负USDT</th>
+      <th>低/高侧触发</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>手续费×2敏感性，偏差5点触发</td>
+      <td>two_year_5pp_fee2</td>
+      <td>2024-10-02–2026-10-02（UTC）</td>
+      <td>short-only</td>
+      <td>0.070%</td>
+      <td>1.00 bp</td>
+      <td>0.0%</td>
+      <td>$789,539.89</td>
+      <td>57.91%</td>
+      <td>25.68%</td>
+      <td>42.93%</td>
+      <td>$2,487.84</td>
+      <td>$20,810.19</td>
+      <td>$0.00</td>
+      <td>86</td>
+      <td>83.31%</td>
+      <td>82.23%</td>
+      <td>4,556.5 小时</td>
+      <td>$9,010.07</td>
+      <td>5.00/5.00 点</td>
+    </tr>
+    <tr>
+      <td>手续费×2敏感性，偏差2点触发</td>
+      <td>two_year_2pp_fee2</td>
+      <td>2024-10-02–2026-10-02（UTC）</td>
+      <td>short-only</td>
+      <td>0.070%</td>
+      <td>1.00 bp</td>
+      <td>0.0%</td>
+      <td>$785,344.08</td>
+      <td>57.07%</td>
+      <td>25.35%</td>
+      <td>43.25%</td>
+      <td>$5,800.81</td>
+      <td>$21,242.30</td>
+      <td>$0.00</td>
+      <td>491</td>
+      <td>82.47%</td>
+      <td>82.23%</td>
+      <td>4,169.3 小时</td>
+      <td>$23,709.12</td>
+      <td>2.00/2.00 点</td>
+    </tr>
+    <tr>
+      <td>手续费×2敏感性，偏差1点触发</td>
+      <td>two_year_1pp_fee2</td>
+      <td>2024-10-02–2026-10-02（UTC）</td>
+      <td>short-only</td>
+      <td>0.070%</td>
+      <td>1.00 bp</td>
+      <td>0.0%</td>
+      <td>$783,407.49</td>
+      <td>56.68%</td>
+      <td>25.19%</td>
+      <td>43.27%</td>
+      <td>$11,704.28</td>
+      <td>$21,322.92</td>
+      <td>$0.00</td>
+      <td>1930</td>
+      <td>82.59%</td>
+      <td>82.23%</td>
+      <td>4,067.3 小时</td>
+      <td>$31,811.29</td>
+      <td>1.00/1.00 点</td>
+    </tr>
+    <tr>
+      <td>负USDT年息5%敏感性，偏差5点触发</td>
+      <td>two_year_5pp_borrow5</td>
+      <td>2024-10-02–2026-10-02（UTC）</td>
+      <td>short-only</td>
+      <td>0.035%</td>
+      <td>1.00 bp</td>
+      <td>5.0%</td>
+      <td>$790,637.06</td>
+      <td>58.13%</td>
+      <td>25.77%</td>
+      <td>42.88%</td>
+      <td>$1,244.77</td>
+      <td>$20,784.84</td>
+      <td>$70.31</td>
+      <td>86</td>
+      <td>83.22%</td>
+      <td>82.23%</td>
+      <td>4,615.1 小时</td>
+      <td>$8,743.87</td>
+      <td>5.00/5.00 点</td>
+    </tr>
+    <tr>
+      <td>负USDT年息10%敏感性，偏差5点触发</td>
+      <td>two_year_5pp_borrow10</td>
+      <td>2024-10-02–2026-10-02（UTC）</td>
+      <td>short-only</td>
+      <td>0.035%</td>
+      <td>1.00 bp</td>
+      <td>10.0%</td>
+      <td>$790,625.05</td>
+      <td>58.13%</td>
+      <td>25.77%</td>
+      <td>42.87%</td>
+      <td>$1,239.70</td>
+      <td>$20,781.18</td>
+      <td>$141.36</td>
+      <td>86</td>
+      <td>83.22%</td>
+      <td>82.23%</td>
+      <td>4,614.6 小时</td>
+      <td>$8,794.58</td>
+      <td>5.00/5.00 点</td>
+    </tr>
+    <tr>
+      <td>负USDT年息5%敏感性，偏差2点触发</td>
+      <td>two_year_2pp_borrow5</td>
+      <td>2024-10-02–2026-10-02（UTC）</td>
+      <td>short-only</td>
+      <td>0.035%</td>
+      <td>1.00 bp</td>
+      <td>5.0%</td>
+      <td>$786,771.53</td>
+      <td>57.35%</td>
+      <td>25.46%</td>
+      <td>43.07%</td>
+      <td>$2,902.62</td>
+      <td>$21,210.75</td>
+      <td>$227.90</td>
+      <td>490</td>
+      <td>82.46%</td>
+      <td>82.23%</td>
+      <td>4,305.9 小时</td>
+      <td>$23,955.04</td>
+      <td>2.00/2.00 点</td>
+    </tr>
+    <tr>
+      <td>负USDT年息5%敏感性，偏差1点触发</td>
+      <td>two_year_1pp_borrow5</td>
+      <td>2024-10-02–2026-10-02（UTC）</td>
+      <td>short-only</td>
+      <td>0.035%</td>
+      <td>1.00 bp</td>
+      <td>5.0%</td>
+      <td>$787,022.39</td>
+      <td>57.40%</td>
+      <td>25.48%</td>
+      <td>43.13%</td>
+      <td>$5,825.76</td>
+      <td>$21,225.53</td>
+      <td>$378.34</td>
+      <td>1914</td>
+      <td>82.11%</td>
+      <td>82.23%</td>
+      <td>4,304.7 小时</td>
+      <td>$31,124.29</td>
+      <td>1.00/1.00 点</td>
+    </tr>
+    <tr>
+      <td>负USDT年息10%敏感性，偏差2点触发</td>
+      <td>two_year_2pp_borrow10</td>
+      <td>2024-10-02–2026-10-02（UTC）</td>
+      <td>short-only</td>
+      <td>0.035%</td>
+      <td>1.00 bp</td>
+      <td>10.0%</td>
+      <td>$784,201.31</td>
+      <td>56.84%</td>
+      <td>25.26%</td>
+      <td>43.18%</td>
+      <td>$2,836.23</td>
+      <td>$21,344.13</td>
+      <td>$521.13</td>
+      <td>479</td>
+      <td>82.46%</td>
+      <td>82.23%</td>
+      <td>4,085.8 小时</td>
+      <td>$24,137.48</td>
+      <td>2.00/2.00 点</td>
+    </tr>
+    <tr>
+      <td>负USDT年息10%敏感性，偏差1点触发</td>
+      <td>two_year_1pp_borrow10</td>
+      <td>2024-10-02–2026-10-02（UTC）</td>
+      <td>short-only</td>
+      <td>0.035%</td>
+      <td>1.00 bp</td>
+      <td>10.0%</td>
+      <td>$787,135.56</td>
+      <td>57.43%</td>
+      <td>25.49%</td>
+      <td>43.14%</td>
+      <td>$5,837.69</td>
+      <td>$21,215.85</td>
+      <td>$738.79</td>
+      <td>1914</td>
+      <td>82.11%</td>
+      <td>82.23%</td>
+      <td>4,312.3 小时</td>
+      <td>$31,247.88</td>
+      <td>1.00/1.00 点</td>
+    </tr>
+    <tr>
+      <td>允许合约净多对照，偏差5点触发</td>
+      <td>two_year_5pp_allow_long</td>
+      <td>2024-10-02–2026-10-02（UTC）</td>
+      <td>允许净多</td>
+      <td>0.035%</td>
+      <td>1.00 bp</td>
+      <td>0.0%</td>
+      <td>$808,014.70</td>
+      <td>61.60%</td>
+      <td>27.14%</td>
+      <td>43.21%</td>
+      <td>$1,364.18</td>
+      <td>$20,099.84</td>
+      <td>$0.00</td>
+      <td>96</td>
+      <td>83.17%</td>
+      <td>82.23%</td>
+      <td>0.0 小时</td>
+      <td>$8,691.85</td>
+      <td>5.00/5.00 点</td>
+    </tr>
+    <tr>
+      <td>允许合约净多对照，偏差2点触发</td>
+      <td>two_year_2pp_allow_long</td>
+      <td>2024-10-02–2026-10-02（UTC）</td>
+      <td>允许净多</td>
+      <td>0.035%</td>
+      <td>1.00 bp</td>
+      <td>0.0%</td>
+      <td>$804,581.67</td>
+      <td>60.92%</td>
+      <td>26.87%</td>
+      <td>43.19%</td>
+      <td>$3,163.97</td>
+      <td>$20,604.79</td>
+      <td>$0.00</td>
+      <td>546</td>
+      <td>83.26%</td>
+      <td>82.23%</td>
+      <td>0.0 小时</td>
+      <td>$23,817.56</td>
+      <td>2.00/2.00 点</td>
+    </tr>
+    <tr>
+      <td>允许合约净多对照，偏差1点触发</td>
+      <td>two_year_1pp_allow_long</td>
+      <td>2024-10-02–2026-10-02（UTC）</td>
+      <td>允许净多</td>
+      <td>0.035%</td>
+      <td>1.00 bp</td>
+      <td>0.0%</td>
+      <td>$807,816.53</td>
+      <td>61.56%</td>
+      <td>27.13%</td>
+      <td>43.27%</td>
+      <td>$6,449.42</td>
+      <td>$20,458.01</td>
+      <td>$0.00</td>
+      <td>2165</td>
+      <td>82.11%</td>
+      <td>82.23%</td>
+      <td>0.0 小时</td>
+      <td>$30,731.96</td>
+      <td>1.00/1.00 点</td>
+    </tr>
+  </tbody>
+</table>
+<p>allow_perp_long 只用于检验 short-only 的目标不可达约束；fee2、borrow5、borrow10 分别改变费用或负 USDT 利息假设。
+这些结果不改变主方案定义，也不表示账户已经获得借款或允许净多。</p>
+
+<h2>成本、资金费与成交次数</h2>
+<table class="dataframe data-table" id="cost-breakdown">
+  <thead>
+    <tr style="text-align: right;">
+      <th>scenario</th>
+      <th>场景ID</th>
+      <th>初始Taker笔数</th>
+      <th>再平衡Taker笔数</th>
+      <th>Taker手续费</th>
+      <th>其中初始合约调整费</th>
+      <th>资金费结算次数</th>
+      <th>资金费净额</th>
+      <th>借款利息结算次数</th>
+      <th>借款利息现金影响</th>
+      <th>期初现货BTC</th>
+      <th>期末现货BTC</th>
+      <th>现货数量最大变动</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>主方案：价格带直接再平衡，偏差5点触发</td>
+      <td>two_year_5pp</td>
+      <td>1</td>
+      <td>85</td>
+      <td>$1,240.28</td>
+      <td>$1.00</td>
+      <td>2189</td>
+      <td>$20,776.21</td>
+      <td>0</td>
+      <td>$-0.00</td>
+      <td>8.222 BTC</td>
+      <td>8.222 BTC</td>
+      <td>0.000 BTC</td>
+    </tr>
+    <tr>
+      <td>主方案：价格带直接再平衡，偏差2点触发</td>
+      <td>two_year_2pp</td>
+      <td>1</td>
+      <td>481</td>
+      <td>$2,850.99</td>
+      <td>$1.00</td>
+      <td>2189</td>
+      <td>$21,316.59</td>
+      <td>0</td>
+      <td>$-0.00</td>
+      <td>8.222 BTC</td>
+      <td>8.222 BTC</td>
+      <td>0.000 BTC</td>
+    </tr>
+    <tr>
+      <td>主方案：价格带直接再平衡，偏差1点触发</td>
+      <td>two_year_1pp</td>
+      <td>1</td>
+      <td>1897</td>
+      <td>$5,773.71</td>
+      <td>$1.00</td>
+      <td>2189</td>
+      <td>$21,211.73</td>
+      <td>0</td>
+      <td>$-0.00</td>
+      <td>8.222 BTC</td>
+      <td>8.222 BTC</td>
+      <td>0.000 BTC</td>
+    </tr>
+    <tr>
+      <td>对照：BTC现货持有</td>
+      <td>two_year_hold</td>
+      <td>0</td>
+      <td>0</td>
+      <td>$0.00</td>
+      <td>$0.00</td>
+      <td>2189</td>
+      <td>$0.00</td>
+      <td>0</td>
+      <td>$-0.00</td>
+      <td>8.222 BTC</td>
+      <td>8.222 BTC</td>
+      <td>0.000 BTC</td>
+    </tr>
+    <tr>
+      <td>价格带直接再平衡，偏差5点触发</td>
+      <td>year1_5pp</td>
+      <td>1</td>
+      <td>59</td>
+      <td>$832.23</td>
+      <td>$1.00</td>
+      <td>1094</td>
+      <td>$18,141.59</td>
+      <td>0</td>
+      <td>$-0.00</td>
+      <td>8.222 BTC</td>
+      <td>8.222 BTC</td>
+      <td>0.000 BTC</td>
+    </tr>
+    <tr>
+      <td>价格带直接再平衡，偏差2点触发</td>
+      <td>year1_2pp</td>
+      <td>1</td>
+      <td>320</td>
+      <td>$1,864.86</td>
+      <td>$1.00</td>
+      <td>1094</td>
+      <td>$18,547.75</td>
+      <td>0</td>
+      <td>$-0.00</td>
+      <td>8.222 BTC</td>
+      <td>8.222 BTC</td>
+      <td>0.000 BTC</td>
+    </tr>
+    <tr>
+      <td>价格带直接再平衡，偏差1点触发</td>
+      <td>year1_1pp</td>
+      <td>1</td>
+      <td>1319</td>
+      <td>$3,935.91</td>
+      <td>$1.00</td>
+      <td>1094</td>
+      <td>$18,487.34</td>
+      <td>0</td>
+      <td>$-0.00</td>
+      <td>8.222 BTC</td>
+      <td>8.222 BTC</td>
+      <td>0.000 BTC</td>
+    </tr>
+    <tr>
+      <td>价格带直接再平衡，偏差5点触发</td>
+      <td>year2_5pp</td>
+      <td>1</td>
+      <td>26</td>
+      <td>$285.03</td>
+      <td>$73.23</td>
+      <td>1094</td>
+      <td>$1,279.41</td>
+      <td>0</td>
+      <td>$-0.00</td>
+      <td>4.216 BTC</td>
+      <td>4.216 BTC</td>
+      <td>0.000 BTC</td>
+    </tr>
+    <tr>
+      <td>价格带直接再平衡，偏差2点触发</td>
+      <td>year2_2pp</td>
+      <td>1</td>
+      <td>139</td>
+      <td>$531.19</td>
+      <td>$73.23</td>
+      <td>1094</td>
+      <td>$1,293.56</td>
+      <td>0</td>
+      <td>$-0.00</td>
+      <td>4.216 BTC</td>
+      <td>4.216 BTC</td>
+      <td>0.000 BTC</td>
+    </tr>
+    <tr>
+      <td>价格带直接再平衡，偏差1点触发</td>
+      <td>year2_1pp</td>
+      <td>1</td>
+      <td>539</td>
+      <td>$983.22</td>
+      <td>$73.23</td>
+      <td>1094</td>
+      <td>$1,299.02</td>
+      <td>0</td>
+      <td>$-0.00</td>
+      <td>4.216 BTC</td>
+      <td>4.216 BTC</td>
+      <td>0.000 BTC</td>
+    </tr>
+    <tr>
+      <td>手续费×2敏感性，偏差5点触发</td>
+      <td>two_year_5pp_fee2</td>
+      <td>1</td>
+      <td>85</td>
+      <td>$2,487.84</td>
+      <td>$2.00</td>
+      <td>2189</td>
+      <td>$20,810.19</td>
+      <td>0</td>
+      <td>$-0.00</td>
+      <td>8.222 BTC</td>
+      <td>8.222 BTC</td>
+      <td>0.000 BTC</td>
+    </tr>
+    <tr>
+      <td>手续费×2敏感性，偏差2点触发</td>
+      <td>two_year_2pp_fee2</td>
+      <td>1</td>
+      <td>490</td>
+      <td>$5,800.81</td>
+      <td>$2.00</td>
+      <td>2189</td>
+      <td>$21,242.30</td>
+      <td>0</td>
+      <td>$-0.00</td>
+      <td>8.222 BTC</td>
+      <td>8.222 BTC</td>
+      <td>0.000 BTC</td>
+    </tr>
+    <tr>
+      <td>手续费×2敏感性，偏差1点触发</td>
+      <td>two_year_1pp_fee2</td>
+      <td>1</td>
+      <td>1929</td>
+      <td>$11,704.28</td>
+      <td>$2.00</td>
+      <td>2189</td>
+      <td>$21,322.92</td>
+      <td>0</td>
+      <td>$-0.00</td>
+      <td>8.222 BTC</td>
+      <td>8.222 BTC</td>
+      <td>0.000 BTC</td>
+    </tr>
+    <tr>
+      <td>负USDT年息5%敏感性，偏差5点触发</td>
+      <td>two_year_5pp_borrow5</td>
+      <td>1</td>
+      <td>85</td>
+      <td>$1,244.77</td>
+      <td>$1.00</td>
+      <td>2189</td>
+      <td>$20,784.84</td>
+      <td>2224</td>
+      <td>$-70.31</td>
+      <td>8.222 BTC</td>
+      <td>8.222 BTC</td>
+      <td>0.000 BTC</td>
+    </tr>
+    <tr>
+      <td>负USDT年息10%敏感性，偏差5点触发</td>
+      <td>two_year_5pp_borrow10</td>
+      <td>1</td>
+      <td>85</td>
+      <td>$1,239.70</td>
+      <td>$1.00</td>
+      <td>2189</td>
+      <td>$20,781.18</td>
+      <td>2224</td>
+      <td>$-141.36</td>
+      <td>8.222 BTC</td>
+      <td>8.222 BTC</td>
+      <td>0.000 BTC</td>
+    </tr>
+    <tr>
+      <td>负USDT年息5%敏感性，偏差2点触发</td>
+      <td>two_year_2pp_borrow5</td>
+      <td>1</td>
+      <td>489</td>
+      <td>$2,902.62</td>
+      <td>$1.00</td>
+      <td>2189</td>
+      <td>$21,210.75</td>
+      <td>3460</td>
+      <td>$-227.90</td>
+      <td>8.222 BTC</td>
+      <td>8.222 BTC</td>
+      <td>0.000 BTC</td>
+    </tr>
+    <tr>
+      <td>负USDT年息5%敏感性，偏差1点触发</td>
+      <td>two_year_1pp_borrow5</td>
+      <td>1</td>
+      <td>1913</td>
+      <td>$5,825.76</td>
+      <td>$1.00</td>
+      <td>2189</td>
+      <td>$21,225.53</td>
+      <td>4981</td>
+      <td>$-378.34</td>
+      <td>8.222 BTC</td>
+      <td>8.222 BTC</td>
+      <td>0.000 BTC</td>
+    </tr>
+    <tr>
+      <td>负USDT年息10%敏感性，偏差2点触发</td>
+      <td>two_year_2pp_borrow10</td>
+      <td>1</td>
+      <td>478</td>
+      <td>$2,836.23</td>
+      <td>$1.00</td>
+      <td>2189</td>
+      <td>$21,344.13</td>
+      <td>4281</td>
+      <td>$-521.13</td>
+      <td>8.222 BTC</td>
+      <td>8.222 BTC</td>
+      <td>0.000 BTC</td>
+    </tr>
+    <tr>
+      <td>负USDT年息10%敏感性，偏差1点触发</td>
+      <td>two_year_1pp_borrow10</td>
+      <td>1</td>
+      <td>1913</td>
+      <td>$5,837.69</td>
+      <td>$1.00</td>
+      <td>2189</td>
+      <td>$21,215.85</td>
+      <td>4960</td>
+      <td>$-738.79</td>
+      <td>8.222 BTC</td>
+      <td>8.222 BTC</td>
+      <td>0.000 BTC</td>
+    </tr>
+    <tr>
+      <td>允许合约净多对照，偏差5点触发</td>
+      <td>two_year_5pp_allow_long</td>
+      <td>1</td>
+      <td>95</td>
+      <td>$1,364.18</td>
+      <td>$1.00</td>
+      <td>2189</td>
+      <td>$20,099.84</td>
+      <td>0</td>
+      <td>$-0.00</td>
+      <td>8.222 BTC</td>
+      <td>8.222 BTC</td>
+      <td>0.000 BTC</td>
+    </tr>
+    <tr>
+      <td>允许合约净多对照，偏差2点触发</td>
+      <td>two_year_2pp_allow_long</td>
+      <td>1</td>
+      <td>545</td>
+      <td>$3,163.97</td>
+      <td>$1.00</td>
+      <td>2189</td>
+      <td>$20,604.79</td>
+      <td>0</td>
+      <td>$-0.00</td>
+      <td>8.222 BTC</td>
+      <td>8.222 BTC</td>
+      <td>0.000 BTC</td>
+    </tr>
+    <tr>
+      <td>允许合约净多对照，偏差1点触发</td>
+      <td>two_year_1pp_allow_long</td>
+      <td>1</td>
+      <td>2164</td>
+      <td>$6,449.42</td>
+      <td>$1.00</td>
+      <td>2189</td>
+      <td>$20,458.01</td>
+      <td>0</td>
+      <td>$-0.00</td>
+      <td>8.222 BTC</td>
+      <td>8.222 BTC</td>
+      <td>0.000 BTC</td>
+    </tr>
+  </tbody>
+</table>
+<p>初始现货不计建仓手续费；初始合约调仓计入 Taker 费。手续费、资金费和借款利息已经进入各场景净资产，
+不能再把它们重复加到收益。成交次数按 Taker 成交记录或结果字段展示；资金费结算次数来自 settlements.csv（如已导出）。
+现货数量起末值及最大变动用于检查“保留原 BTC 数量”约束。</p>
+
+<h2>结果边界与研究声明</h2>
+<ul>
+<li>这是历史样本事后参数研究，不是前瞻验证，也没有部署或交易。</li>
+<li>分钟 OHLC 只能给出保守路径假设；没有重建逐笔盘口、队列优先级、撤单竞态、真实滑点分布或强平路径。</li>
+<li>short-only 在目标要求超过期初现货可表达范围时会报告 short_only_target_unreachable_hours；不能把不可达时长当成策略成功。</li>
+<li>USDT 负余额利息情景是敏感性假设，不能替代账户历史借款、抵押折扣和风险档位的核实。</li>
+<li>外部复核未执行：当前工具无法确认 ChatGPT Pro Extra High 可用。</li>
+</ul>
+<p>审计与来源：<a href="results.json">results.json</a> · <a href="audit.json">audit.json</a> · <a href="source_manifest.json">source_manifest.json</a>。</p>
+<table class="dataframe data-table">
+  <thead>
+    <tr style="text-align: right;">
+      <th>字段</th>
+      <th>值</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>minute_rows</td>
+      <td>1051200</td>
+    </tr>
+    <tr>
+      <td>funding_rows</td>
+      <td>2190</td>
+    </tr>
+    <tr>
+      <td>audit.passed</td>
+      <td>True</td>
+    </tr>
+    <tr>
+      <td>audit.scenarios</td>
+      <td>22 条</td>
+    </tr>
+    <tr>
+      <td>audit.export_replay</td>
+      <td>22 条</td>
+    </tr>
+  </tbody>
+</table>
+<input id="search" placeholder="筛选表格中的场景、区间或成本">
+
+<script>
+document.getElementById('search').addEventListener('input', function () {
+  const needle = this.value.toLowerCase();
+  document.querySelectorAll('table tbody tr').forEach(function (row) {
+    row.hidden = !row.textContent.toLowerCase().includes(needle);
+  });
+});
+</script>
+</body></html>

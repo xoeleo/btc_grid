@@ -1,0 +1,31 @@
+STARTSTART two_year_5ppSTART two_year_1pp  two_year_hold 10512001051200
+ 1051200
+
+DONE two_year_hold equity 697892.91 CAGR 18.157 DD 54.196 rebalances 0 seconds 36.1
+START year1_5pp 525600
+DONE two_year_1pp equity 786643.44 CAGR 25.45 DD 43.184 rebalances 1897 seconds 40.8
+START year1_1pp 525600
+DONE two_year_5pp equity 790824.48 CAGR 25.783 DD 42.862 rebalances 85 seconds 42.6
+START year2_5pp 525600
+DONE year1_5pp equity 959758.47 CAGR 92.037 DD 23.723 rebalances 59 seconds 20.1
+START year2_1pp 525600
+DONE year1_1pp equity 956294.6 CAGR 91.344 DD 23.74 rebalances 1319 seconds 19.9
+START two_year_5pp_fee2 1051200
+DONE year2_5pp equity 411844.79 CAGR -17.642 DD 42.594 rebalances 26 seconds 21.8
+START two_year_1pp_fee2 1051200
+DONE year2_1pp equity 409995.7 CAGR -18.012 DD 42.971 rebalances 539 seconds 21.7
+START two_year_5pp_borrow5 1051200
+DONE two_year_5pp_fee2 equity 789539.89 CAGR 25.681 DD 42.926 rebalances 85 seconds 39.2
+START two_year_1pp_borrow5 1051200
+DONE two_year_1pp_fee2 equity 783407.49 CAGR 25.192 DD 43.274 rebalances 1929 seconds 42.7
+START two_year_5pp_borrow10 1051200
+DONE two_year_5pp_borrow5 equity 790637.06 CAGR 25.768 DD 42.876 rebalances 85 seconds 41.8
+START two_year_1pp_borrow10 1051200
+DONE two_year_1pp_borrow5 equity 787022.39 CAGR 25.48 DD 43.128 rebalances 1913 seconds 39.5
+START two_year_5pp_allow_long 1051200
+DONE two_year_5pp_borrow10 equity 790625.05 CAGR 25.768 DD 42.871 rebalances 85 seconds 41.2
+START two_year_1pp_allow_long 1051200
+DONE two_year_1pp_borrow10 equity 787135.56 CAGR 25.489 DD 43.143 rebalances 1913 seconds 42.0
+DONE two_year_5pp_allow_long equity 808014.7 CAGR 27.144 DD 43.208 rebalances 95 seconds 37.9
+DONE two_year_1pp_allow_long equity 807816.53 CAGR 27.128 DD 43.269 rebalances 2164 seconds 38.7
+ALL 15 SCENARIOS PASSED IN-MEMORY AUDIT
