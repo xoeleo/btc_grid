@@ -1,0 +1,36 @@
+{
+  "source": "Bybit public v5 market API; same venue spot/perpetual/mark/funding",
+  "source_manifest_path": "/mnt/f/home/btc_grid/research/reversible_grid_4555_5y_20261012/data/manifest.json",
+  "source_manifest_sha256": "3947c3a853b8c115c585c6a34acd16d0ef6c57fe169afc59f166fdfeb2371ebc",
+  "files": {
+    "bybit_1m.csv.gz": {
+      "path": "/mnt/f/home/btc_grid/research/reversible_grid_4555_5y_20261012/data/bybit_1m.csv.gz",
+      "sha256": "698419fcd4bedeb7833948221abbaad282ce3d98419df51c38f6181f8b66a775"
+    },
+    "funding.csv": {
+      "path": "/mnt/f/home/btc_grid/research/reversible_grid_4555_5y_20261012/data/funding.csv",
+      "sha256": "f281552200647e7d73692236a28f002bbebf910bfa6e2962744461c5bcb70f8e"
+    }
+  },
+  "start_ms": 1727827200000,
+  "end_exclusive_ms": 1790899200000,
+  "minute_rows": 1051200,
+  "gaps": 0,
+  "duplicates": 0,
+  "funding_rows": 2190,
+  "initial_spot_price": 60812.41,
+  "last_spot_price": 84881.1,
+  "minimum_spot_price": 57802.2,
+  "maximum_spot_price": 126195.5,
+  "lower_price": 60000,
+  "upper_price": 200000,
+  "lower_target": 1,
+  "upper_target": 0,
+  "thresholds_percentage_points": [
+    5,
+    2,
+    1
+  ],
+  "no_forward_fill": true,
+  "data_cutoff_note": "Frozen comparison ends 2026-10-02 00:00 UTC; not updated through the current date."
+}

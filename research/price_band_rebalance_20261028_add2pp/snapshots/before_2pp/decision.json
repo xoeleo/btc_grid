@@ -1,0 +1,16 @@
+{
+  "status": "RESEARCH_ONLY",
+  "live_deployed": false,
+  "thresholds_percentage_points": [
+    5,
+    1
+  ],
+  "short_only_1pp_minus_5pp_usdt": -4181.048152218456,
+  "allow_long_1pp_minus_5pp_usdt": -198.1723778701853,
+  "both_modes_1pp_return_lower": true,
+  "both_modes_1pp_drawdown_higher": true,
+  "independent_export_audit_passed": true,
+  "external_review": "NOT_EXECUTED: tools cannot verify ChatGPT Pro Extra High",
+  "data_cutoff_utc": "2026-10-02T00:00:00Z",
+  "not_current_to_2026_10_28": true
+}

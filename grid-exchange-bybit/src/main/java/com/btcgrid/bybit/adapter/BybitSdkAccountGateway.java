@@ -21,6 +21,7 @@ import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
@@ -98,17 +99,11 @@ public class BybitSdkAccountGateway implements BybitAccountGateway {
         if (accounts.isArray()) {
             for (JsonNode account : accounts) {
                 String type = account.path("accountType").asText("");
-                if ("UnifiedTradingAccount".equalsIgnoreCase(type) || "FundingAccount".equalsIgnoreCase(type)) {
-                    baseBalance = baseBalance.add(coinDetailBalance(account.path("coinDetail"), normalizedBaseCoin));
-                    quoteBalance = quoteBalance.add(coinDetailBalance(account.path("coinDetail"), normalizedQuoteCoin));
-                } else if ("Earn".equalsIgnoreCase(type)) {
-                    JsonNode categories = account.path("categories");
-                    if (categories.isArray()) {
-                        for (JsonNode category : categories) {
-                            baseBalance = baseBalance.add(coinDetailBalance(category.path("coinDetail"), normalizedBaseCoin));
-                            quoteBalance = quoteBalance.add(coinDetailBalance(category.path("coinDetail"), normalizedQuoteCoin));
-                        }
-                    }
+                if ("UnifiedTradingAccount".equalsIgnoreCase(type)
+                        || "FundingAccount".equalsIgnoreCase(type)
+                        || "Earn".equalsIgnoreCase(type)) {
+                    baseBalance = baseBalance.add(accountCoinBalance(account, normalizedBaseCoin));
+                    quoteBalance = quoteBalance.add(accountCoinBalance(account, normalizedQuoteCoin));
                 }
             }
         }
@@ -197,20 +192,37 @@ public class BybitSdkAccountGateway implements BybitAccountGateway {
         return snapshot;
     }
 
-    private BigDecimal coinDetailBalance(JsonNode coinDetails, String coinName) {
+    BigDecimal accountCoinBalance(JsonNode account, String coinName) {
+        Optional<BigDecimal> directBalance = coinDetailBalance(account.path("coinDetail"), coinName);
+        if (directBalance.isPresent()) {
+            return directBalance.get();
+        }
+        BigDecimal categoryBalance = BigDecimal.ZERO;
+        JsonNode categories = account.path("categories");
+        if (categories.isArray()) {
+            for (JsonNode category : categories) {
+                categoryBalance = categoryBalance.add(
+                        coinDetailBalance(category.path("coinDetail"), coinName).orElse(BigDecimal.ZERO)
+                );
+            }
+        }
+        return categoryBalance;
+    }
+
+    private Optional<BigDecimal> coinDetailBalance(JsonNode coinDetails, String coinName) {
         if (!coinDetails.isArray()) {
-            return BigDecimal.ZERO;
+            return Optional.empty();
         }
         for (JsonNode coin : coinDetails) {
             if (coinName.equalsIgnoreCase(coin.path("coin").asText(""))) {
-                return decimal(firstNonBlank(
+                return Optional.of(decimal(firstNonBlank(
                         coin.path("equity").asText(""),
                         coin.path("walletBalance").asText(""),
                         "0"
-                ));
+                )));
             }
         }
-        return BigDecimal.ZERO;
+        return Optional.empty();
     }
 
     private BigDecimal contractPositionQty(ProductCategory category, String symbol) {

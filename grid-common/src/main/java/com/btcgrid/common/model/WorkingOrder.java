@@ -15,8 +15,27 @@ public record WorkingOrder(
         OrderStatus status,
         Instant createdAt,
         Instant updatedAt,
-        String reason
+        String reason,
+        BigDecimal cumulativeExecutedQty,
+        boolean cancellationRequested
 ) {
+    public WorkingOrder(
+            String symbol, String clientOrderId, String exchangeOrderId,
+            TradeSide side, OrderType orderType, BigDecimal price, BigDecimal qty,
+            boolean reduceOnly, OrderStatus status, Instant createdAt, Instant updatedAt,
+            String reason, BigDecimal cumulativeExecutedQty) {
+        this(symbol, clientOrderId, exchangeOrderId, side, orderType, price, qty,
+                reduceOnly, status, createdAt, updatedAt, reason, cumulativeExecutedQty, false);
+    }
+
+    public WorkingOrder(
+            String symbol, String clientOrderId, String exchangeOrderId,
+            TradeSide side, OrderType orderType, BigDecimal price, BigDecimal qty,
+            boolean reduceOnly, OrderStatus status, Instant createdAt, Instant updatedAt, String reason) {
+        this(symbol, clientOrderId, exchangeOrderId, side, orderType, price, qty,
+                reduceOnly, status, createdAt, updatedAt, reason, null);
+    }
+
     public WorkingOrder(
             String symbol,
             String clientOrderId,
@@ -59,7 +78,9 @@ public record WorkingOrder(
                 nextStatus,
                 createdAt,
                 nextUpdatedAt,
-                reason
+                reason,
+                cumulativeExecutedQty,
+                nextStatus == OrderStatus.NEW && cancellationRequested
         );
     }
 }

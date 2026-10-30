@@ -80,7 +80,8 @@ cp "${ROOT_DIR}/grid-app/target/grid-app-0.1.0-SNAPSHOT.jar" "${DIST_DIR}/app/"
 cp "${ROOT_DIR}"/grid-{common,ledger,strategy-core,exchange-bybit,backtest}/target/*.jar "${DIST_DIR}/lib/"
 cp "${ROOT_DIR}"/grid-app/target/runtime-dependency/*.jar "${DIST_DIR}/lib/"
 cp "${ROOT_DIR}/scripts/start-grid-runtime.sh" "${DIST_DIR}/scripts/"
-chmod +x "${DIST_DIR}/scripts/start-grid-runtime.sh"
+cp "${ROOT_DIR}/scripts/sol-contract-boll-cycle-watch.py" "${DIST_DIR}/scripts/"
+chmod +x "${DIST_DIR}/scripts/start-grid-runtime.sh" "${DIST_DIR}/scripts/sol-contract-boll-cycle-watch.py"
 
 if [[ "${INCLUDE_MAINNET_RUNTIME}" -eq 1 ]]; then
   mkdir -p "${DIST_DIR}/runtime/mainnet"

@@ -31,6 +31,8 @@ import java.util.stream.Collectors;
 public class RebalanceLiveRunner implements AutoCloseable, PrivateExecutionListener, PrivateFundingFeeListener, PrivateOrderListener, PrivateStreamLifecycleListener {
 
     private static final Duration OPEN_ORDER_VISIBILITY_GRACE = Duration.ofSeconds(10);
+    private static final Duration FUNDING_FEE_QUERY_WINDOW = Duration.ofDays(7).minusMillis(1);
+    private static final Duration FUNDING_FEE_RECONCILE_OVERLAP = Duration.ofMinutes(1);
 
     private final RebalanceService rebalanceService;
     private final BybitPrivateStreamGateway privateStreamGateway;
@@ -45,6 +47,7 @@ public class RebalanceLiveRunner implements AutoCloseable, PrivateExecutionListe
     private final String symbol;
     private final Set<String> processedExecutionIds = ConcurrentHashMap.newKeySet();
     private final Set<String> processedFundingFeeIds = ConcurrentHashMap.newKeySet();
+    private final Map<String, Integer> missingOpenOrderObservations = new ConcurrentHashMap<>();
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread thread = new Thread(r, "rebalance-live-runner");
         thread.setDaemon(true);
@@ -55,6 +58,7 @@ public class RebalanceLiveRunner implements AutoCloseable, PrivateExecutionListe
     private final AtomicBoolean privateStreamConnected = new AtomicBoolean(false);
     private final AtomicInteger reconnectAttempts = new AtomicInteger(0);
     private final AtomicReference<Instant> lastPrivateStreamMessageAt = new AtomicReference<>(Instant.EPOCH);
+    private final AtomicReference<Instant> fundingFeeReconcileStart = new AtomicReference<>();
     private volatile ScheduledFuture<?> reconnectFuture;
 
     public RebalanceLiveRunner(
@@ -180,9 +184,18 @@ public class RebalanceLiveRunner implements AutoCloseable, PrivateExecutionListe
     @Override
     public void onSubscribed() {
         privateStreamConnected.set(true);
+        cancelPendingReconnect();
         reconnectAttempts.set(0);
         lastPrivateStreamMessageAt.set(Instant.now());
         eventLogger.info("rebalance.private-stream.subscribed", Map.of());
+    }
+
+    private void cancelPendingReconnect() {
+        ScheduledFuture<?> pending = reconnectFuture;
+        if (pending != null) {
+            pending.cancel(false);
+            reconnectFuture = null;
+        }
     }
 
     @Override
@@ -209,6 +222,30 @@ public class RebalanceLiveRunner implements AutoCloseable, PrivateExecutionListe
         }
     }
 
+    public void requestManualCycleExit() {
+        rebalanceService.requestManualCycleExit();
+    }
+
+    public java.math.BigDecimal requestManualReduction() {
+        return rebalanceService.requestManualReduction();
+    }
+
+    public java.math.BigDecimal requestManualAddition() {
+        return rebalanceService.requestManualAddition();
+    }
+
+    public boolean isManualAdjustmentOrder(String clientOrderId) {
+        return rebalanceService.isManualAdjustmentOrder(clientOrderId);
+    }
+
+    public java.math.BigDecimal gridReferencePrice() {
+        return rebalanceService.gridReferencePrice();
+    }
+
+    public boolean resumeAfterManualCycleExit() {
+        return rebalanceService.resumeAfterManualCycleExit();
+    }
+
     private boolean handleExecution(FillEvent fillEvent, String source) {
         if (fillEvent == null || !RebalanceService.isRebalanceClientOrder(fillEvent.clientOrderId())) {
             return false;
@@ -218,7 +255,7 @@ public class RebalanceLiveRunner implements AutoCloseable, PrivateExecutionListe
                 && !processedExecutionIds.add(fillEvent.executionId())) {
             return false;
         }
-        if (rebalanceService.onExecution(fillEvent, source)) {
+        if (rebalanceService.onExecution(fillEvent, source, () -> fillObserver.accept(fillEvent))) {
             if (source != null && source.startsWith("rebalance-rest-reconcile") && privateStreamConnected.get()) {
                 privateStreamConnected.set(false);
                 eventLogger.warn("rebalance.private-stream.missed-execution", Map.of(
@@ -228,7 +265,6 @@ public class RebalanceLiveRunner implements AutoCloseable, PrivateExecutionListe
                 ));
                 scheduleReconnect();
             }
-            fillObserver.accept(fillEvent);
             return true;
         }
         return false;
@@ -242,18 +278,19 @@ public class RebalanceLiveRunner implements AutoCloseable, PrivateExecutionListe
             return;
         }
         int attempt = reconnectAttempts.incrementAndGet();
-        if (attempt > 20) {
+        boolean slowRetry = attempt > 20;
+        if (attempt == 21) {
             alertService.warning(
                     "REBALANCE_PRIVATE_STREAM_RECONNECT_EXHAUSTED",
-                    "Rebalance private stream reconnect attempts exhausted",
+                    "Rebalance private stream fast reconnect attempts exhausted; continuing with slow retries",
                     Map.of("attempts", attempt)
             );
-            return;
         }
-        long delaySeconds = Math.min(30L, 5L * Math.min(attempt, 6));
+        long delaySeconds = slowRetry ? 300L : Math.min(30L, 5L * Math.min(attempt, 6));
         eventLogger.warn("rebalance.private-stream.reconnect.scheduled", Map.of(
                 "attempt", attempt,
-                "delaySeconds", delaySeconds
+                "delaySeconds", delaySeconds,
+                "mode", slowRetry ? "slow" : "fast"
         ));
         reconnectFuture = scheduler.schedule(() -> {
             try {
@@ -341,21 +378,55 @@ public class RebalanceLiveRunner implements AutoCloseable, PrivateExecutionListe
         if (fundingFeeQueryGateway == null) {
             return false;
         }
-        Instant start = rebalanceService.activeCycleStartedAt();
+        Instant cycleStart = rebalanceService.activeCycleStartedAt();
+        Instant start = fundingFeeReconcileStart.get();
+        if (start == null || (cycleStart != null && cycleStart.isAfter(start))) {
+            start = cycleStart;
+        }
         if (start == null) {
             return false;
         }
         boolean reconciled = false;
         Instant now = Instant.now();
         try {
-            for (FundingFeeEvent fundingFeeEvent : fundingFeeQueryGateway.fetchFundingFees(symbol, start, now)) {
-                reconciled = handleFundingFee(fundingFeeEvent, "rebalance-rest-reconcile") || reconciled;
+            for (FundingFeeQueryWindow window : fundingFeeQueryWindows(start, now)) {
+                for (FundingFeeEvent fundingFeeEvent : fundingFeeQueryGateway.fetchFundingFees(
+                        symbol,
+                        window.startInclusive(),
+                        window.endInclusive()
+                )) {
+                    reconciled = handleFundingFee(fundingFeeEvent, "rebalance-rest-reconcile") || reconciled;
+                }
             }
+            fundingFeeReconcileStart.set(now.minus(FUNDING_FEE_RECONCILE_OVERLAP));
         } catch (RuntimeException e) {
             eventLogger.error("rebalance.funding-fee.reconcile.failed", Map.of("at", Instant.now(), "message", e.getMessage()));
             alertService.warning("REBALANCE_FUNDING_FEE_RECONCILE_FAILED", "Rebalance funding fee reconciliation failed", Map.of("message", e.getMessage()));
         }
         return reconciled;
+    }
+
+    static List<FundingFeeQueryWindow> fundingFeeQueryWindows(Instant startInclusive, Instant endInclusive) {
+        if (startInclusive == null || endInclusive == null || startInclusive.isAfter(endInclusive)) {
+            return List.of();
+        }
+        List<FundingFeeQueryWindow> windows = new java.util.ArrayList<>();
+        Instant windowStart = startInclusive;
+        while (!windowStart.isAfter(endInclusive)) {
+            Instant windowEnd = windowStart.plus(FUNDING_FEE_QUERY_WINDOW);
+            if (windowEnd.isAfter(endInclusive)) {
+                windowEnd = endInclusive;
+            }
+            windows.add(new FundingFeeQueryWindow(windowStart, windowEnd));
+            if (windowEnd.equals(endInclusive)) {
+                break;
+            }
+            windowStart = windowEnd.plusMillis(1);
+        }
+        return List.copyOf(windows);
+    }
+
+    record FundingFeeQueryWindow(Instant startInclusive, Instant endInclusive) {
     }
 
     private OpenOrderReconciliation reconcileOpenOrders() {
@@ -371,6 +442,7 @@ public class RebalanceLiveRunner implements AutoCloseable, PrivateExecutionListe
             Set<String> remoteOpenClientOrderIds = remoteOpenOrders.stream()
                     .map(WorkingOrder::clientOrderId)
                     .collect(Collectors.toSet());
+            remoteOpenClientOrderIds.forEach(missingOpenOrderObservations::remove);
             remoteOpenOrders.forEach(workingOrderRegistry::trackRemote);
 
             Instant visibilityCutoff = Instant.now().minus(OPEN_ORDER_VISIBILITY_GRACE);
@@ -398,6 +470,7 @@ public class RebalanceLiveRunner implements AutoCloseable, PrivateExecutionListe
                 recoveredExecution = handleExecution(fillEvent, "rebalance-rest-reconcile-missing-open") || recoveredExecution;
             }
             if (!clientOrderIdsWithExecutions.isEmpty()) {
+                clientOrderIdsWithExecutions.forEach(missingOpenOrderObservations::remove);
                 eventLogger.warn("rebalance.open-orders.missing.execution-found", Map.of(
                         "symbol", symbol,
                         "executionCount", missingOrderExecutions.size(),
@@ -410,18 +483,43 @@ public class RebalanceLiveRunner implements AutoCloseable, PrivateExecutionListe
             if (missingWithoutExecutions.isEmpty()) {
                 return new OpenOrderReconciliation(false, true);
             }
+            Set<String> missingClientOrderIds = missingWithoutExecutions.stream()
+                    .map(WorkingOrder::clientOrderId)
+                    .collect(Collectors.toSet());
+            List<WorkingOrder> terminalOrders = orderQueryGateway.fetchRecentOrders(symbol, missingClientOrderIds).stream()
+                    .filter(order -> order.status() == OrderStatus.CANCELED || order.status() == OrderStatus.EXPIRED)
+                    .toList();
+            List<WorkingOrder> awaitingConfirmation = missingWithoutExecutions.stream()
+                    .filter(order -> terminalOrders.stream().noneMatch(terminal -> terminal.clientOrderId().equals(order.clientOrderId())))
+                    .toList();
+            if (!awaitingConfirmation.isEmpty()) {
+                awaitingConfirmation.forEach(order -> missingOpenOrderObservations.merge(order.clientOrderId(), 1, Integer::sum));
+                eventLogger.warn("rebalance.open-orders.missing.pending", Map.of(
+                        "symbol", symbol,
+                        "remoteOpenCount", remoteOpenOrders.size(),
+                        "clientOrderIds", awaitingConfirmation.stream().map(WorkingOrder::clientOrderId).toList(),
+                        "reason", "terminal-order-status-not-confirmed"
+                ));
+            }
+            if (terminalOrders.isEmpty()) {
+                return OpenOrderReconciliation.none();
+            }
             Instant now = Instant.now();
-            missingWithoutExecutions.forEach(order -> workingOrderRegistry.markCanceled(order.clientOrderId(), now));
+            terminalOrders.forEach(order -> {
+                workingOrderRegistry.markCanceled(order.clientOrderId(), now);
+                rebalanceService.onOrderUpdate(order.symbol(), order.clientOrderId(), order.status(), order.updatedAt());
+                missingOpenOrderObservations.remove(order.clientOrderId());
+            });
             eventLogger.warn("rebalance.open-orders.reconciled", Map.of(
                     "symbol", symbol,
                     "remoteOpenCount", remoteOpenOrders.size(),
-                    "locallyCanceledCount", missingWithoutExecutions.size(),
-                    "clientOrderIds", missingWithoutExecutions.stream().map(WorkingOrder::clientOrderId).toList()
+                    "locallyCanceledCount", terminalOrders.size(),
+                    "clientOrderIds", terminalOrders.stream().map(WorkingOrder::clientOrderId).toList()
             ));
             alertService.warning("REBALANCE_OPEN_ORDERS_RECONCILED", "Rebalance local open orders were missing remotely and marked canceled", Map.of(
                     "symbol", symbol,
                     "remoteOpenCount", remoteOpenOrders.size(),
-                    "locallyCanceledCount", missingWithoutExecutions.size()
+                    "locallyCanceledCount", terminalOrders.size()
             ));
             return new OpenOrderReconciliation(true, recoveredExecution);
         } catch (RuntimeException e) {
