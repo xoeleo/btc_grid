@@ -101,6 +101,17 @@ class RebalanceContinuationTest {
         f.service.onPoll();assertTrue(f.orders.isEmpty());
         f.service.verifyContinuationFunding(()->{});f.service.onPoll();assertFalse(f.orders.isEmpty());
     }
+    @Test void preexistingAccountPositionIsNotAddedToCycleAccounting() throws Exception {
+        Fixture f=new Fixture();f.position=n("0.2");
+        f.service.continueEndedCycle(List.of(initial()),end(),context(),()->{},()->{});
+        assertEquals(start,f.service.activeCycleStartedAt());
+        var field=RebalanceService.class.getDeclaredField("rebalanceLedger");field.setAccessible(true);
+        var ledger=(com.btcgrid.ledger.service.StrategyLedger)field.get(f.service);
+        assertEquals(0,n("0.1").compareTo(ledger.snapshot().netQty()));
+        assertTrue(f.orders.stream().filter(o->o.side()==TradeSide.SELL).allMatch(o->o.qty().compareTo(n("0.1"))<=0));
+        assertTrue(f.orders.stream().noneMatch(OrderIntent::isMarket));
+    }
+
     @Test void delayedExecutionDuringPendingFundingIsAccountedWithoutFollowupOrders(){
         Fixture f=new Fixture();
         assertThrows(IllegalStateException.class,()->f.service.continueEndedCycle(List.of(initial()),end(),context(),()->{},()->{throw new IllegalStateException("offline");}));

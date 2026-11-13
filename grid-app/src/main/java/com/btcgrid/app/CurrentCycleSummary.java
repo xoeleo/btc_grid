@@ -34,6 +34,10 @@ public record CurrentCycleSummary(
         BigDecimal marketPrice,
         String entryDirection,
         BigDecimal fillPricePnl,
-        BigDecimal markPricePnl
+        BigDecimal markPricePnl,
+        int buyCount24h,
+        int sellCount24h,
+        int buyCount72h,
+        int sellCount72h
 ) {
 }

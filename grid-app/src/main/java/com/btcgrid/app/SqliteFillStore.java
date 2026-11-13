@@ -1151,9 +1151,27 @@ public class SqliteFillStore implements FillStore {
         BigDecimal sellQty = BigDecimal.ZERO;
         int buyCount = 0;
         int sellCount = 0;
+        int buyCount24h = 0;
+        int sellCount24h = 0;
+        int buyCount72h = 0;
+        int sellCount72h = 0;
+        Instant since24h = now.minusSeconds(24 * 60 * 60);
+        Instant since72h = now.minusSeconds(72 * 60 * 60);
         FillRecord latest = null;
         for (FillRecord fill : fills) {
             latest = fill;
+            // Use the complete current-cycle ledger, not the paginated recent fills.
+            if (!fill.time().isAfter(now)) {
+                boolean within24h = !fill.time().isBefore(since24h);
+                boolean within72h = !fill.time().isBefore(since72h);
+                if ("BUY".equals(fill.side())) {
+                    if (within24h) buyCount24h++;
+                    if (within72h) buyCount72h++;
+                } else if ("SELL".equals(fill.side())) {
+                    if (within24h) sellCount24h++;
+                    if (within72h) sellCount72h++;
+                }
+            }
             BigDecimal qty = fill.qty() == null ? BigDecimal.ZERO : fill.qty();
             BigDecimal value = fill.value() == null || fill.value().signum() == 0
                     ? qty.multiply(fill.price(), MATH_CONTEXT)
@@ -1267,7 +1285,11 @@ public class SqliteFillStore implements FillStore {
                 marketPrice,
                 entryDirection,
                 fillPricePnl,
-                markPricePnl
+                markPricePnl,
+                buyCount24h,
+                sellCount24h,
+                buyCount72h,
+                sellCount72h
         );
     }
 

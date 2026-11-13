@@ -18,6 +18,58 @@ class SqliteFillStoreTest {
     Path tempDir;
 
     @Test
+    void currentCycleCountsRollingWindowsFromFullLedger() {
+        SqliteFillStore store = new SqliteFillStore(tempDir.resolve("rolling-counts.sqlite"));
+        Instant now = Instant.parse("2026-11-09T06:00:00Z");
+        store.save(fill(now.minusSeconds(4 * 86400), "BUY", BigDecimal.TEN, BigDecimal.TEN,
+                BigDecimal.ZERO, "GRID_BTCUSDT_INIT_window", "window-initial"));
+        long[] ages = {72 * 3600 + 1, 72 * 3600, 48 * 3600, 24 * 3600 + 1, 24 * 3600, 0, -1};
+        String[] sides = {"SELL", "BUY", "SELL", "BUY", "SELL", "BUY", "SELL"};
+        for (int i = 0; i < ages.length; i++) {
+            FillRecord record = fill(now.minusSeconds(ages[i]), sides[i], BigDecimal.ONE, BigDecimal.TEN,
+                    BigDecimal.ZERO, "GRID_TEST_" + i, "window-" + i);
+            store.save(record);
+            store.save(record); // Replayed executions must not inflate counts.
+        }
+        store.save(fill(now.minusSeconds(60), "FUNDING_FEE", BigDecimal.ZERO, BigDecimal.TEN,
+                BigDecimal.ONE, "FUNDING_FEE_window", "window-funding"));
+
+        CurrentCycleSummary summary = store.currentCycle("BTCUSDT", now, BigDecimal.TEN);
+
+        assertEquals(1, summary.buyCount24h());
+        assertEquals(1, summary.sellCount24h());
+        assertEquals(3, summary.buyCount72h());
+        assertEquals(2, summary.sellCount72h());
+        assertEquals(4, summary.buyCount());
+        assertEquals(4, summary.sellCount());
+
+        CurrentCycleSummary expired = store.currentCycle("BTCUSDT", now.plusSeconds(4 * 86400), BigDecimal.TEN);
+        assertEquals(0, expired.buyCount24h());
+        assertEquals(0, expired.sellCount24h());
+        assertEquals(0, expired.buyCount72h());
+        assertEquals(0, expired.sellCount72h());
+    }
+
+    @Test
+    void rollingCountsExcludeEarlierCyclesEvenWithinLastDay() {
+        SqliteFillStore store = new SqliteFillStore(tempDir.resolve("rolling-cycle-scope.sqlite"));
+        Instant now = Instant.parse("2026-11-09T06:00:00Z");
+        store.save(fill(now.minusSeconds(7200), "BUY", BigDecimal.TEN, BigDecimal.TEN,
+                BigDecimal.ZERO, "GRID_BTCUSDT_INIT_old", "old-window-initial"));
+        store.save(fill(now.minusSeconds(3600), "BUY", BigDecimal.TEN, BigDecimal.TEN,
+                BigDecimal.ZERO, "GRID_BTCUSDT_INIT_new", "new-window-initial"));
+        store.save(fill(now, "SELL", BigDecimal.ONE, BigDecimal.TEN,
+                BigDecimal.ZERO, "GRID_TEST", "new-window-sell"));
+
+        CurrentCycleSummary summary = store.currentCycle("BTCUSDT", now, BigDecimal.TEN);
+
+        assertEquals(1, summary.buyCount24h());
+        assertEquals(1, summary.sellCount24h());
+        assertEquals(1, summary.buyCount72h());
+        assertEquals(1, summary.sellCount72h());
+    }
+
+    @Test
     void persistsFillsAcrossStoreInstances() {
         Path dbPath = tempDir.resolve("fills.sqlite");
         FillRecord record = new FillRecord(

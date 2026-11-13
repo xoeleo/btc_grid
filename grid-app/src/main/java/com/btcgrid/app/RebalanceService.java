@@ -220,8 +220,11 @@ public class RebalanceService {
             throw new IllegalStateException("当前价格不在续跑区间内，未恢复、未下单");
         BigDecimal actual = settings.category() == ProductCategory.LINEAR
                 ? account.contractPositionQty() : account.baseWalletBalance();
-        if (actual.compareTo(end.cumulativeQty()) != 0)
-            throw new IllegalStateException("交易所实际仓位与原 Cycle 保留仓位不一致，请先人工核对");
+        // A Cycle owns only its own fills. Pre-existing account inventory is a
+        // separate reserve, so total exchange position need not equal Cycle qty.
+        if (actual.signum() != end.cumulativeQty().signum()
+                || actual.abs().compareTo(end.cumulativeQty().abs()) < 0)
+            throw new IllegalStateException("交易所实际仓位的方向或数量不足以承接原 Cycle，请先核对");
         if (profitExit != null && profitExit.armed())
             throw new IllegalStateException("仍有未解除的平仓指令，不能续跑");
         // Crash-safe order: durable ledger boundary first, then memory, then orders.

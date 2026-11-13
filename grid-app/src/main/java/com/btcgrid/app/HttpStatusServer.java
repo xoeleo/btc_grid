@@ -929,6 +929,7 @@ public class HttpStatusServer implements AutoCloseable {
                       <div class="metric metric-combined"><span>BTC 占比</span><div class="metric-lines">
                         <div class="metric-line"><span>启动比例</span><strong id="rebalanceCycleStartRatio">-</strong></div>
                         <div class="metric-line"><span>当前比例</span><strong id="rebalanceCycleCurrentRatio">-</strong></div>
+                        <div class="metric-line" title="按已保存的高低价格区间和当前价格计算，与页面上方理论 BTC 占比一致"><span>当前理论占比</span><strong id="rebalanceCycleTheoryRatio">-</strong></div>
                       </div></div>
                       <div class="metric metric-combined"><span>动态水位止盈</span><div class="metric-lines">
                         <div class="metric-line"><span>水位</span><strong id="rebalanceCycleWaterPrice">-</strong></div>
@@ -943,6 +944,8 @@ public class HttpStatusServer implements AutoCloseable {
                       <div class="metric metric-combined"><span>买入 / 卖出</span><div class="metric-lines">
                         <div class="metric-line"><span>数量</span><strong id="rebalanceCycleQty">-</strong></div>
                         <div class="metric-line"><span>次数</span><strong id="rebalanceCycleCounts">-</strong></div>
+                        <div class="metric-line" title="当前 Cycle 内最近 24 小时的买入 / 卖出成交次数，不含资金费"><span>近一日次数</span><strong id="rebalanceCycleCounts24h">-</strong></div>
+                        <div class="metric-line" title="当前 Cycle 内最近 72 小时的买入 / 卖出成交次数，不含资金费"><span>近三日次数</span><strong id="rebalanceCycleCounts72h">-</strong></div>
                       </div></div>
                       <div class="metric metric-combined"><span>固定单格网格理论 / 实际净增</span><div class="metric-lines">
                         <div class="metric-line"><span>数量</span><strong id="rebalanceCyclePlannedQty">-</strong></div>
@@ -1193,6 +1196,7 @@ public class HttpStatusServer implements AutoCloseable {
                       setText('rebalancePriceRange', config ? `${formatNumber(config.lowPrice)} — ${formatNumber(config.highPrice)}` : '-');
                       const ratio = config ? theoreticalRatio(price, Number(config.lowPrice), Number(config.highPrice)) : null;
                       setText('rebalanceTheoryRatio', ratio == null ? '-' : formatPercent(ratio));
+                      setText('rebalanceCycleTheoryRatio', ratio == null ? '-' : formatPercent(ratio));
                       if (priceRangeDirty) {
                         const low = Number(document.getElementById('rebalanceRangeLow').value);
                         const high = Number(document.getElementById('rebalanceRangeHigh').value);
@@ -1857,6 +1861,8 @@ public class HttpStatusServer implements AutoCloseable {
                         setText('rebalanceCycleExitPrice', '-');
                         setText('rebalanceCycleFullInventoryPrice', '-');
                         setText('rebalanceCycleCounts', '-');
+                        setText('rebalanceCycleCounts24h', '-');
+                        setText('rebalanceCycleCounts72h', '-');
                         setText('rebalanceCycleQty', '-');
                         setText('rebalanceCycleDuration', '-');
                         setText('rebalanceCycleCumQty', '-');
@@ -1904,6 +1910,13 @@ public class HttpStatusServer implements AutoCloseable {
                         setHtml('rebalanceCycleFullInventoryPrice', formatFullInventoryEstimate(fullInventoryEstimate));
                       }
                       setText('rebalanceCycleCounts', `${cycle.buyCount || 0} / ${cycle.sellCount || 0}，共 ${cycle.fillCount || 0}`);
+                      for (const hours of [24, 72]) {
+                        const buy = cycle[`buyCount${hours}h`];
+                        const sell = cycle[`sellCount${hours}h`];
+                        setText(`rebalanceCycleCounts${hours}h`, buy == null || sell == null
+                          ? '-'
+                          : `${buy} / ${sell}，共 ${buy + sell}`);
+                      }
                       setText('rebalanceCycleQty', `${formatNumber(cycle.buyQty)} / ${formatNumber(cycle.sellQty)}`);
                       setText('rebalanceCycleDuration', formatDuration(cycle.durationSeconds));
                       setText('rebalanceCycleCumQty', formatNumber(cycle.cumulativeQty));
