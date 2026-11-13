@@ -60,6 +60,11 @@ public class RebalanceLiveRunner implements AutoCloseable, PrivateExecutionListe
     private final AtomicReference<Instant> lastPrivateStreamMessageAt = new AtomicReference<>(Instant.EPOCH);
     private final AtomicReference<Instant> fundingFeeReconcileStart = new AtomicReference<>();
     private volatile ScheduledFuture<?> reconnectFuture;
+    private record TerminalRefresh(Instant createdAt, java.math.BigDecimal executedQty) { }
+    private final Map<String,TerminalRefresh> terminalRefreshes = new ConcurrentHashMap<>();
+    private final AtomicBoolean terminalRefreshQueued = new AtomicBoolean(false);
+    private final AtomicBoolean initialPollComplete = new AtomicBoolean(false);
+    private final AtomicInteger terminalRefreshRetries = new AtomicInteger();
 
     public RebalanceLiveRunner(
             RebalanceService rebalanceService,
@@ -119,6 +124,8 @@ public class RebalanceLiveRunner implements AutoCloseable, PrivateExecutionListe
         privateStreamGateway.connect(this, this, this, this);
         eventLogger.info("rebalance.live.start", Map.of("pollSeconds", pollInterval.toSeconds()));
         pollOnce();
+        initialPollComplete.set(true);
+        queueTerminalRefresh();
         scheduler.scheduleAtFixedRate(this::pollOnce, pollInterval.toSeconds(), pollInterval.toSeconds(), TimeUnit.SECONDS);
         scheduler.scheduleAtFixedRate(this::checkPrivateStreamFreshness, 30, 30, TimeUnit.SECONDS);
     }
@@ -139,9 +146,12 @@ public class RebalanceLiveRunner implements AutoCloseable, PrivateExecutionListe
 
     @Override
     public void onOrderUpdate(OrderUpdateEvent orderUpdateEvent) {
-        if (!RebalanceService.isRebalanceClientOrder(orderUpdateEvent.clientOrderId())) {
+        if (orderUpdateEvent == null || !symbol.equalsIgnoreCase(orderUpdateEvent.symbol())
+                || !RebalanceService.isRebalanceClientOrder(orderUpdateEvent.clientOrderId())) {
             return;
         }
+        WorkingOrder previous = workingOrderRegistry.snapshot().stream()
+                .filter(o -> o.clientOrderId().equals(orderUpdateEvent.clientOrderId())).findFirst().orElse(null);
         workingOrderRegistry.applyUpdate(orderUpdateEvent);
         rebalanceService.onOrderUpdate(
                 orderUpdateEvent.symbol(),
@@ -149,6 +159,78 @@ public class RebalanceLiveRunner implements AutoCloseable, PrivateExecutionListe
                 orderUpdateEvent.status(),
                 orderUpdateEvent.updatedAt()
         );
+        java.math.BigDecimal executed = orderUpdateEvent.cumExecQty() == null
+                ? java.math.BigDecimal.ZERO : orderUpdateEvent.cumExecQty();
+        boolean newEvidence = previous != null && (previous.status() == OrderStatus.NEW
+                || executed.compareTo(previous.cumulativeExecutedQty() == null
+                        ? java.math.BigDecimal.ZERO : previous.cumulativeExecutedQty()) > 0);
+        if (newEvidence && orderUpdateEvent.status() != OrderStatus.NEW && previous.createdAt() != null) {
+            terminalRefreshes.merge(orderUpdateEvent.clientOrderId(),new TerminalRefresh(previous.createdAt(),executed),
+                    (a,b) -> new TerminalRefresh(a.createdAt().isBefore(b.createdAt()) ? a.createdAt() : b.createdAt(),
+                            a.executedQty().max(b.executedQty())));
+            terminalRefreshRetries.set(0);
+            queueTerminalRefresh();
+        }
+    }
+
+    private void queueTerminalRefresh() {
+        if (!isRunning() || !initialPollComplete.get() || terminalRefreshes.isEmpty()
+                || !terminalRefreshQueued.compareAndSet(false,true)) return;
+        try { scheduler.execute(this::refreshAfterTerminalOrders); }
+        catch (java.util.concurrent.RejectedExecutionException e) {
+            terminalRefreshQueued.set(false);
+            if (!shutdown.get()) throw e;
+        }
+    }
+
+    private void refreshAfterTerminalOrders() {
+        Map<String,TerminalRefresh> batch = Map.copyOf(terminalRefreshes);
+        boolean completed = false;
+        try {
+            if (!isRunning() || batch.isEmpty() || !privateStreamConnected.get()) return;
+            if (orderQueryGateway == null) throw new IllegalStateException("missing execution query gateway");
+            Instant from = batch.values().stream().map(TerminalRefresh::createdAt).min(Instant::compareTo).orElseThrow().minusSeconds(1);
+            Set<String> ids = workingOrderRegistry.snapshot().stream()
+                    .filter(o -> symbol.equalsIgnoreCase(o.symbol()))
+                    .filter(o -> RebalanceService.isRebalanceClientOrder(o.clientOrderId()))
+                    .filter(o -> o.createdAt() != null && !o.createdAt().isBefore(from))
+                    .map(WorkingOrder::clientOrderId).collect(Collectors.toSet());
+            ids.addAll(batch.keySet());
+            List<FillEvent> executions = orderQueryGateway.fetchExecutions(symbol,ids,from,Instant.now());
+            for (Map.Entry<String,TerminalRefresh> target : batch.entrySet()) {
+                java.math.BigDecimal found = executions.stream()
+                        .filter(f -> target.getKey().equals(f.clientOrderId()))
+                        .collect(Collectors.toMap(FillEvent::executionId,FillEvent::fillQty,(a,b) -> a.max(b)))
+                        .values().stream().reduce(java.math.BigDecimal.ZERO,java.math.BigDecimal::add);
+                if (found.compareTo(target.getValue().executedQty()) < 0)
+                    throw new IllegalStateException("terminal order executions not yet visible: " + target.getKey());
+            }
+            executions.forEach(f -> handleExecution(f,"rebalance-terminal-reconcile"));
+            if (workingOrderRegistry.hasPendingCancellation()) return;
+            // A partial execution can precede the order's terminal callback. Never overlap its remainder.
+            for (WorkingOrder remote : orderQueryGateway.fetchOpenOrders(symbol)) {
+                if (remote.status() != OrderStatus.NEW || !ids.contains(remote.clientOrderId())) continue;
+                boolean terminalLocally = workingOrderRegistry.snapshot().stream().anyMatch(o ->
+                        o.clientOrderId().equals(remote.clientOrderId()) && o.status() != OrderStatus.NEW);
+                if (terminalLocally) return;
+            }
+            // Use the usual ratio/range/funding/exit gates, with fresh market and account snapshots.
+            rebalanceService.onPoll();
+            batch.forEach((id,target) -> terminalRefreshes.remove(id,target));
+            completed = true;
+            eventLogger.info("rebalance.terminal-refresh.complete",Map.of("orders",batch.size()));
+        } catch (RuntimeException e) {
+            eventLogger.warn("rebalance.terminal-refresh.deferred",Map.of("message",String.valueOf(e.getMessage())));
+        } finally {
+            terminalRefreshQueued.set(false);
+            // Coalesce duplicate callbacks; a callback arriving during work gets one later pass.
+            if (completed) {
+                terminalRefreshRetries.set(0);
+                queueTerminalRefresh();
+            } else if (isRunning() && !terminalRefreshes.isEmpty() && terminalRefreshRetries.incrementAndGet() <= 3) {
+                scheduler.schedule(this::queueTerminalRefresh,250,TimeUnit.MILLISECONDS);
+            }
+        }
     }
 
     @Override
@@ -218,7 +300,8 @@ public class RebalanceLiveRunner implements AutoCloseable, PrivateExecutionListe
             reconcileFundingFees();
             reconcileMissingExecutions();
             reconcileOpenOrders();
-            rebalanceService.onPoll();
+            if (terminalRefreshes.isEmpty()) rebalanceService.onPoll();
+            else { terminalRefreshRetries.set(0); queueTerminalRefresh(); }
         } catch (RuntimeException e) {
             eventLogger.error("rebalance.live.poll.failed", Map.of("message", e.getMessage()));
             alertService.warning("REBALANCE_LIVE_POLL_FAILED", "Rebalance live polling failed", Map.of("message", e.getMessage()));

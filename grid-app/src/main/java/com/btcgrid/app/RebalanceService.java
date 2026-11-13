@@ -573,6 +573,9 @@ public class RebalanceService {
         ensureCommandExecutor(entrySide, activeMonitorRule == null ? settings.maxInitialSteps() : activeMonitorRule.initialSteps());
         if (!tradingFills.isEmpty()) {
             rebalanceLedger.restore(snapshotFromFills(tradingFills, netQty));
+            FillRecord referenceOrder = tradingFills.stream().filter(f -> !RebalanceManualAdjustment.isManual(f))
+                    .reduce((a,b) -> b).orElse(null);
+            ((RebalanceStrategyLedger)rebalanceLedger).restoreReferenceOrder(referenceOrder == null ? null : referenceOrder.clientOrderId());
             activeCycleStartedAt = tradingFills.get(0).time();
             if (continuation != null && waterExit != null)
                 waterExit.resumeCompletedForContinuation(activeCycleStartedAt);
@@ -977,7 +980,7 @@ public class RebalanceService {
         GridStrategyConfig config = gridConfig(side, effectiveInitialSteps);
         if (rebalanceLedger == null || rebalanceEngine == null || rebalanceCommandExecutor == null
                 || rebalanceEngine.config().entryDirection() != config.entryDirection()) {
-            rebalanceLedger = new InMemoryStrategyLedger(settings.symbol());
+            rebalanceLedger = new RebalanceStrategyLedger(settings.symbol());
             rebalanceEngine = new GridStrategyEngine(
                     config,
                     instrumentSpec,
@@ -1358,7 +1361,14 @@ public class RebalanceService {
 
     private StrategyLedgerSnapshot snapshotFromFills(List<FillRecord> fills, BigDecimal netQty) {
         FillRecord last = fills.get(fills.size() - 1);
-        List<FillRecord> referenceFills = fills.stream().filter(fill -> !RebalanceManualAdjustment.isManual(fill)).toList();
+        List<FillRecord> referenceFills = new ArrayList<>();
+        for (FillRecord fill : fills) {
+            if (RebalanceManualAdjustment.isManual(fill)) continue;
+            int tail = referenceFills.size()-1;
+            if (tail >= 0 && fill.clientOrderId() != null
+                    && fill.clientOrderId().equals(referenceFills.get(tail).clientOrderId())) referenceFills.set(tail,fill);
+            else referenceFills.add(fill);
+        }
         FillRecord reference = referenceFills.isEmpty() ? null : referenceFills.get(referenceFills.size() - 1);
         FillRecord previous = referenceFills.size() < 2 ? null : referenceFills.get(referenceFills.size() - 2);
         BigDecimal avgEntryPrice = netQty.signum() == 0
