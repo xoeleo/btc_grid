@@ -76,6 +76,9 @@ public class RebalanceService {
     private RebalanceCycleContinuation continuation;
     private Consumer<RebalanceCycleContinuation> continuationWriter;
     private boolean continuationRecoveryFailed;
+    private final RebalanceRequoteStore requoteStore;
+    private RebalanceRequoteStore.Plan pendingRequote;
+    private String latestTradingExecutionId;
 
 
     public RebalanceService(
@@ -146,6 +149,8 @@ public class RebalanceService {
         this.tradeGateway = tradeGateway;
         this.workingOrderRegistry = workingOrderRegistry;
         this.stateStore = stateStore;
+        this.requoteStore = new RebalanceRequoteStore(settings.stateFilePath());
+        this.pendingRequote = requoteStore.load();
         this.eventLogger = eventLogger;
         this.alertService = alertService;
         this.fillNotifier = new RebalanceFillNotifier(
@@ -550,6 +555,7 @@ public class RebalanceService {
         if (tradingFills.isEmpty() && activeOrders.isEmpty()) {
             return;
         }
+        latestTradingExecutionId = tradingFills.isEmpty() ? null : tradingFills.get(tradingFills.size()-1).executionId();
         BigDecimal netQty = tradingFills.isEmpty()
                 ? BigDecimal.ZERO
                 : zero(tradingFills.get(tradingFills.size() - 1).cumulativeQty());
@@ -586,7 +592,7 @@ public class RebalanceService {
         ActiveOrderPair pair = activePairFromOrders(activeOrders);
         rebalanceEngine.restore(
                 new StrategyRuntimeState(pair == null ? GridState.WAITING_TRIGGER : GridState.GRID_ACTIVE, pair, Instant.now()),
-                null
+                pair == null ? null : restoredPairSpacing(pair)
         );
         save(new RebalanceState(
                 settings.enabled(),
@@ -667,6 +673,8 @@ public class RebalanceService {
             ));
             return false;
         }
+        latestTradingExecutionId = fillEvent.executionId();
+        discardPendingRequote();
         workingOrderRegistry.markFilled(fillEvent.clientOrderId(), fillEvent.fillTime() == null ? Instant.now() : fillEvent.fillTime());
         if (activeCycleStartedAt == null) {
             activeCycleStartedAt = fillEvent.fillTime() == null ? Instant.now() : fillEvent.fillTime();
@@ -1150,6 +1158,7 @@ public class RebalanceService {
         rebalanceCommandExecutor = null;
         activeCycleStartedAt = null;
         continuation = null;
+        discardPendingRequote();
         clearActiveMonitorRule();
     }
 
@@ -1205,7 +1214,10 @@ public class RebalanceService {
                     rebalanceEngine.runtimeState().lastTriggerTime()
             ));
         }
-        List<StrategyCommand> commands = rebalanceEngine.recoverPairFromLastFill(marketSnapshot, "rebalance-recover-pair");
+        boolean requote = validPendingRequote();
+        List<StrategyCommand> commands = rebalanceEngine.recoverPairFromLastFill(marketSnapshot,
+                requote ? "rebalance-timeout-requote" : "rebalance-recover-pair",
+                requote ? pendingRequote.spacing() : null);
         if (commands.isEmpty()) {
             return;
         }
@@ -1213,6 +1225,10 @@ public class RebalanceService {
         if (!failures.isEmpty()) {
             eventLogger.error("rebalance.grid.recover-pair.failed", Map.of("symbol", settings.symbol(), "message", failures.get(0)));
         } else {
+            if (requote) {
+                eventLogger.info("rebalance.grid.requote.applied", Map.of("spacing",pendingRequote.spacing(),"count",commands.size()));
+                discardPendingRequote();
+            }
             eventLogger.info("rebalance.grid.recover-pair", Map.of("symbol", settings.symbol(), "count", commands.size()));
         }
     }
@@ -1269,9 +1285,29 @@ public class RebalanceService {
         if (runtimeState != GridState.GRID_ACTIVE && runtimeState != GridState.REQUOTE) {
             return;
         }
+        // Once a timeout has been staged, do not shrink repeatedly while cancellation is pending.
+        if (validPendingRequote()) {
+            boolean oldOrdersRemain = activeRebalanceOrders().stream()
+                    .anyMatch(o -> pendingRequote.canceledOrderIds().contains(o.clientOrderId()));
+            if (!oldOrdersRemain) return;
+            List<StrategyCommand> retryCancels = activeRebalanceOrders().stream()
+                    .map(o -> StrategyCommand.cancel(o.symbol(),o.clientOrderId(),"pair-timeout")).toList();
+            rebalanceCommandExecutor.execute(retryCancels,rebalanceLedger.snapshot());
+            return;
+        }
         List<StrategyCommand> commands = rebalanceEngine.onMarket(marketSnapshot);
         if (commands.isEmpty()) {
             return;
+        }
+        List<String> oldIds = commands.stream().filter(c -> c.type() == com.btcgrid.common.model.StrategyCommandType.CANCEL)
+                .map(StrategyCommand::clientOrderId).toList();
+        if (!oldIds.isEmpty() && commands.stream().anyMatch(c -> "pair-timeout".equals(c.reason()))) {
+            RebalanceRequoteStore.Plan plan = new RebalanceRequoteStore.Plan(activeCycleStartedAt.toEpochMilli(),
+                    latestTradingExecutionId,rebalanceEngine.config().toString(),rebalanceEngine.activeSpacing(),oldIds);
+            requoteStore.save(plan); // Persist before the first cancellation request.
+            pendingRequote = plan;
+            commands = commands.stream().filter(c -> c.type() == com.btcgrid.common.model.StrategyCommandType.CANCEL).toList();
+            eventLogger.info("rebalance.grid.requote.pending", Map.of("spacing",plan.spacing(),"orderIds",oldIds));
         }
         List<String> failures = rebalanceCommandExecutor.execute(commands, rebalanceLedger.snapshot());
         if (!failures.isEmpty()) {
@@ -1282,6 +1318,41 @@ public class RebalanceService {
                     "count", commands.size(),
                     "shrinkFactor", settings.gridRequoteShrinkFactor()
             ));
+        }
+    }
+
+    private BigDecimal restoredPairSpacing(ActiveOrderPair pair) {
+        BigDecimal reference = rebalanceLedger.snapshot().lastFillPrice();
+        if ((pair.buyOrder() != null && pair.buyOrder().price() == null)
+                || (pair.sellOrder() != null && pair.sellOrder().price() == null)) return null;
+        if (pair.buyOrder() != null && pair.sellOrder() != null)
+            return pair.sellOrder().price().subtract(pair.buyOrder().price()).abs().divide(new BigDecimal("2"));
+        OrderIntent order = pair.buyOrder() != null ? pair.buyOrder() : pair.sellOrder();
+        return order.price().subtract(reference).abs();
+    }
+
+    private boolean validPendingRequote() {
+        if (pendingRequote == null) return false;
+        if (activeCycleStartedAt == null || pendingRequote.cycleStartMillis() != activeCycleStartedAt.toEpochMilli()
+                || !java.util.Objects.equals(pendingRequote.latestExecutionId(),latestTradingExecutionId)
+                || !pendingRequote.config().equals(rebalanceEngine.config().toString())) {
+            discardPendingRequote(); return false;
+        }
+        // A completed replacement found after restart must not be canceled as the old pair.
+        List<WorkingOrder> open = activeRebalanceOrders();
+        if (!open.isEmpty() && open.stream().noneMatch(o -> pendingRequote.canceledOrderIds().contains(o.clientOrderId()))) {
+            discardPendingRequote(); return false;
+        }
+        return true;
+    }
+
+    private void discardPendingRequote() {
+        if (pendingRequote == null) return;
+        pendingRequote = null;
+        try { requoteStore.clear(); }
+        catch (RuntimeException e) {
+            // Never prevent accounting of a real fill because cleanup failed. The execution binding invalidates stale files.
+            eventLogger.warn("rebalance.grid.requote.cleanup.failed",Map.of("message",String.valueOf(e.getMessage())));
         }
     }
 
@@ -1343,7 +1414,9 @@ public class RebalanceService {
         if (buy == null && sell == null) {
             return null;
         }
-        return new ActiveOrderPair("RBAL_RESTORED_" + Instant.now().toEpochMilli(), buy, sell, Instant.now());
+        Instant createdAt = activeOrders.stream().map(WorkingOrder::createdAt).filter(java.util.Objects::nonNull)
+                .max(Instant::compareTo).orElseGet(Instant::now);
+        return new ActiveOrderPair("RBAL_RESTORED_" + Instant.now().toEpochMilli(), buy, sell, createdAt);
     }
 
     private BigDecimal zero(BigDecimal value) {

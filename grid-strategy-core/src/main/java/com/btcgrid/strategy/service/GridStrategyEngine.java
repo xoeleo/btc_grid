@@ -320,6 +320,12 @@ public class GridStrategyEngine {
     }
 
     public List<StrategyCommand> recoverPairFromLastFill(MarketSnapshot marketSnapshot, String reason) {
+        return recoverPairFromLastFill(marketSnapshot, reason, null);
+    }
+
+    /** Recompute against fresh market/inventory while retaining a confirmed timeout spacing. */
+    public List<StrategyCommand> recoverPairFromLastFill(MarketSnapshot marketSnapshot, String reason,
+            BigDecimal requoteSpacing) {
         strategyLedger.markToMarket(marketSnapshot);
         StrategyLedgerSnapshot ledgerSnapshot = strategyLedger.snapshot();
         if (ledgerSnapshot.netQty().signum() == 0
@@ -335,7 +341,7 @@ public class GridStrategyEngine {
                 marketSnapshot,
                 ledgerSnapshot,
                 ledgerSnapshot.lastFillPrice(),
-                null,
+                requoteSpacing,
                 boostReduceSide,
                 reason
         );
@@ -349,7 +355,8 @@ public class GridStrategyEngine {
         }
         List<StrategyCommand> commands = new ArrayList<>();
         addPlaceCommands(commands, recoveryPlan);
-        activeSpacing = plannedSpacing(recoveryPlan, ledgerSnapshot.lastFillPrice());
+        activeSpacing = requoteSpacing == null
+                ? plannedSpacing(recoveryPlan, ledgerSnapshot.lastFillPrice()) : requoteSpacing;
         runtimeState = new StrategyRuntimeState(
                 GridState.GRID_ACTIVE,
                 new ActiveOrderPair(UUID.randomUUID().toString(), recoveryPlan.buyOrder(), recoveryPlan.sellOrder(), marketSnapshot.timestamp()),
