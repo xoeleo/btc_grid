@@ -225,12 +225,20 @@ public class RebalanceLiveRunner implements AutoCloseable, PrivateExecutionListe
         }
     }
 
+    public void assertContinuationReady() {
+        if (!isRunning()) throw new IllegalStateException("再平衡监控尚未运行，无法续跑");
+        if (orderQueryGateway == null || fundingFeeQueryGateway == null)
+            throw new IllegalStateException("缺少交易所订单或资金费查询入口，无法续跑");
+        if (!privateStreamConnected.get())
+            throw new IllegalStateException("私有成交流尚未订阅就绪，无法续跑");
+        Instant lastMessage = lastPrivateStreamMessageAt.get();
+        if (lastMessage == null || lastMessage.isBefore(Instant.now().minusSeconds(60)))
+            throw new IllegalStateException("私有成交流心跳超过 60 秒未更新，无法续跑");
+    }
+
     public void continueEndedCycle(List<FillRecord> fills, FillRecord end,
             RebalanceCycleContinuation continuation, Runnable commit) {
-        if (!isRunning() || !privateStreamConnected.get() || orderQueryGateway == null
-                || fundingFeeQueryGateway == null || lastPrivateStreamMessageAt.get() == null
-                || lastPrivateStreamMessageAt.get().isBefore(Instant.now().minusSeconds(60)))
-            throw new IllegalStateException("私有成交流或交易所查询尚未就绪，无法续跑");
+        assertContinuationReady();
         // Query all orders for this symbol, not only our locally tracked pair.
         if (!orderQueryGateway.fetchOpenOrders(symbol).isEmpty())
             throw new IllegalStateException("交易所仍有挂单，无法接回已结束 Cycle");

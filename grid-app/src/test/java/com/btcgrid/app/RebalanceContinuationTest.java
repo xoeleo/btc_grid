@@ -163,6 +163,7 @@ class RebalanceContinuationTest {
                 new AlertService(f.logger),new FileStateStore(dir.resolve("state.json")),x->{},new WorkingOrderRegistry(),store);
         RebalanceLiveRunner stub=new RebalanceLiveRunner(f.service,null,new WorkingOrderRegistry(),f.logger,new AlertService(f.logger),Duration.ofSeconds(15)){
             @Override public boolean isRunning(){return true;}
+            @Override public void assertContinuationReady(){}
             @Override public void continueEndedCycle(List<FillRecord> fills,FillRecord end,RebalanceCycleContinuation c,Runnable commit){
                 f.service.continueEndedCycle(fills,end,c,commit,()->{});
             }
@@ -186,6 +187,32 @@ class RebalanceContinuationTest {
         Map<String,Object> result=control.continueRebalanceCycle("ended",preview.get("confirmation").toString());
         assertEquals(true,result.get("ok"),result.toString());assertEquals(2,f.orders.size());assertTrue(store.latestContinuation(SYMBOL).ready());
         assertEquals(false,control.continueRebalanceCycle("ended",preview.get("confirmation").toString()).get("ok"));
+    }
+
+    @Test void idleStreamHeartbeatAllowsContinuationButDisconnectAndStaleHeartbeatBlock() throws Exception {
+        Fixture f=new Fixture();
+        BybitOrderQueryGateway query=new BybitOrderQueryGateway(){
+            public List<WorkingOrder> fetchOpenOrders(String symbol){return List.of();}
+            public List<FillEvent> fetchRecentExecutions(String symbol,Set<String> ids){return List.of();}
+        };
+        RebalanceLiveRunner runner=new RebalanceLiveRunner(f.service,null,query,(symbol,from,to)->List.of(),
+                new WorkingOrderRegistry(),f.logger,new AlertService(f.logger),Duration.ofSeconds(15),x->{},x->{});
+        var running=RebalanceLiveRunner.class.getDeclaredField("running");running.setAccessible(true);
+        ((AtomicBoolean)running.get(runner)).set(true);
+        assertThrows(IllegalStateException.class,runner::assertContinuationReady);
+        runner.onSubscribed();
+        var last=RebalanceLiveRunner.class.getDeclaredField("lastPrivateStreamMessageAt");last.setAccessible(true);
+        @SuppressWarnings("unchecked") var messageAt=(java.util.concurrent.atomic.AtomicReference<Instant>)last.get(runner);
+        messageAt.set(Instant.now().minusSeconds(61));
+        assertThrows(IllegalStateException.class,runner::assertContinuationReady);
+        runner.onMessageReceived("pong","");
+        assertDoesNotThrow(runner::assertContinuationReady);
+        // Fresh transport messages cannot undo a lost authenticated subscription.
+        var connected=RebalanceLiveRunner.class.getDeclaredField("privateStreamConnected");connected.setAccessible(true);
+        ((AtomicBoolean)connected.get(runner)).set(false);
+        runner.onMessageReceived("pong","");
+        assertThrows(IllegalStateException.class,runner::assertContinuationReady);
+        assertTrue(f.orders.isEmpty());
     }
 
     class Fixture {

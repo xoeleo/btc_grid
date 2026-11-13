@@ -110,6 +110,26 @@ class BybitSdkPrivateStreamGatewayTest {
         assertEquals(1, lifecycle.errors);
     }
 
+    @Test
+    void idleHeartbeatRepliesRefreshLivenessWithoutPretendingToSubscribeOrTrade() {
+        BybitSdkPrivateStreamGateway gateway = new BybitSdkPrivateStreamGateway(
+                new BybitSdkConfig("key", "secret", false, false, false, false, 5_000L));
+        RecordingWebSocket socket = new RecordingWebSocket();
+        RecordingLifecycle lifecycle = new RecordingLifecycle();
+        for (String reply : List.of(
+                "{\"op\":\"pong\",\"args\":[\"123\"]}",
+                "{\"op\":\"ping\",\"success\":true,\"ret_msg\":\"pong\"}")) {
+            gateway.handleMessage(reply, socket,
+                    fill -> { throw new AssertionError("heartbeat cannot execute a fill"); },
+                    fee -> { throw new AssertionError("heartbeat cannot apply funding"); },
+                    order -> { throw new AssertionError("heartbeat cannot update orders"); }, lifecycle);
+        }
+        assertEquals(List.of("pong", "ping"), lifecycle.messages);
+        assertEquals(0, lifecycle.subscribed);
+        assertEquals(0, lifecycle.errors);
+        assertEquals(0, socket.messages.size());
+    }
+
     private static String jsonField(String json, String field) {
         try {
             return new com.fasterxml.jackson.databind.ObjectMapper().readTree(json).path(field).asText();
@@ -121,6 +141,12 @@ class BybitSdkPrivateStreamGatewayTest {
     private static final class RecordingLifecycle implements PrivateStreamLifecycleListener {
         private int subscribed;
         private int errors;
+        private final List<String> messages = new ArrayList<>();
+
+        @Override
+        public void onMessageReceived(String op, String topic) {
+            messages.add(op);
+        }
 
         @Override
         public void onConnected() {

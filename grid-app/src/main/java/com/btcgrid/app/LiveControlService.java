@@ -1385,6 +1385,7 @@ public class LiveControlService {
             RebalanceState state = currentRebalanceState();
             if (activeRebalanceRunner == null || !activeRebalanceRunner.isRunning())
                 throw new IllegalStateException("请先启动再平衡监控，续跑操作不会另开初始仓位");
+            activeRebalanceRunner.assertContinuationReady();
             if (state.lastPrice() == null || state.updatedAt() == null
                     || state.updatedAt().isBefore(Instant.now().minusSeconds(30)))
                 throw new IllegalStateException("当前行情尚未就绪，请等待新快照");

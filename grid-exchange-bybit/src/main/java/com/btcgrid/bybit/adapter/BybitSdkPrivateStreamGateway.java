@@ -179,10 +179,11 @@ public class BybitSdkPrivateStreamGateway implements BybitPrivateStreamGateway {
             String op = root.path("op").asText("");
             String topic = root.path("topic").asText("");
             if (!op.isBlank()) {
+                // Heartbeat replies prove transport liveness even when no orders trade.
+                lifecycleListener.onMessageReceived(op, "");
                 if ("pong".equalsIgnoreCase(op)) {
                     return;
                 }
-                lifecycleListener.onMessageReceived(op, "");
                 boolean success = root.path("success").asBoolean(root.path("retCode").asInt(-1) == 0);
                 handleOperationAck(op, success, message, lifecycleListener);
                 if ("auth".equalsIgnoreCase(op) && success) {
