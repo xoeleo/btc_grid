@@ -1079,6 +1079,14 @@ public class LiveControlService {
                 rebalanceGridOrderPlanner(settings)
         );
         service.configureMonitorStore(rebalanceMonitorStore);
+        List<FillRecord> openFills = fillStore.currentCycleFills(rebalanceLedgerSymbol(settings.symbol()));
+        RebalanceCycleContinuation context = fillStore.latestContinuation(rebalanceLedgerSymbol(settings.symbol()));
+        if (context != null && (openFills.isEmpty() || !context.cycleStartedAt().equals(openFills.get(0).time()))) context = null;
+        service.configureContinuation(context, value -> {
+            if (value.ready()) fillStore.markContinuationReady(value.endExecutionId());
+            if (value.targetRearmed()) fillStore.rearmContinuationTarget(value.endExecutionId());
+        });
+
         service.configureProfitExit(
                 new RebalanceExitExchange(clientFactory, settings.symbol()),
                 price -> fillStore.currentCycle(rebalanceLedgerSymbol(settings.symbol()), Instant.now(), price),
@@ -1317,6 +1325,113 @@ public class LiveControlService {
         stopRebalanceRunner();
         markRebalanceStoppedByUser();
         return Map.of("ok", true, "message", "再平衡监控已停止，状态已标记为手动停止");
+    }
+
+    private FillRecord continuableCycleEnd(String executionId) {
+        String symbol = rebalanceLedgerSymbol(currentRebalanceSettings().symbol());
+        List<FillRecord> latest = fillStore.recentCycles(symbol,1);
+        if (executionId == null || latest.isEmpty() || !latest.get(0).executionId().equals(executionId))
+            throw new IllegalStateException("仅允许继续最近一笔尚未续跑的 Cycle");
+        FillRecord end = latest.get(0);
+        Object reason = metadataValue(end,"endReason");
+        if (!("target ratio reached; rebalance grid stopped".equals(reason)
+                || "目标资产比例达到，撤单完成，Cycle 结束并保留仓位".equals(reason))
+                || end.cumulativeQty() == null || end.cumulativeQty().signum() == 0)
+            throw new IllegalStateException("仅支持因目标比例达到而结束、且仍保留仓位的 Cycle");
+        if (!fillStore.currentCycleFills(symbol).isEmpty())
+            throw new IllegalStateException("已有新的或正在运行的 Cycle，无法接回旧 Cycle");
+        return end;
+    }
+
+    private RebalancePriceRangeStore.Range continuationRange(FillRecord end) throws IOException {
+        Object saved = metadataValue(end,"continuationRange");
+        if (saved != null) return OBJECT_MAPPER.convertValue(saved,RebalancePriceRangeStore.Range.class);
+        // Legacy ends did not capture a price range. Require an explicitly saved
+        // range and disclose that fallback in the confirmation; never invent one.
+        Path path = continuationRangePath();
+        if (!Files.isRegularFile(path)) throw new IllegalStateException("缺少已保存的波段价格区间，请先保存高低价");
+        return new RebalancePriceRangeStore(path).load();
+    }
+
+    private Path continuationRangePath() {
+        String configured = System.getProperty("btcgrid.priceRangeConfigFile", "");
+        return configured.isBlank()
+                ? PathResolver.absolutePath(currentRebalanceSettings().configFilePath()).getParent().resolve("rebalance-price-range.properties")
+                : PathResolver.absolutePath(configured);
+    }
+
+    private com.fasterxml.jackson.databind.JsonNode continuationSettings() {
+        com.fasterxml.jackson.databind.node.ObjectNode value = OBJECT_MAPPER.valueToTree(currentRebalanceConfig());
+        value.remove(List.of("enabled","configFilePath","stateFilePath"));
+        return value;
+    }
+
+    private String continuationConfirmation(String executionId,RebalancePriceRangeStore.Range range) {
+        try {
+            String material=executionId+"|"+range.lowPrice().stripTrailingZeros().toPlainString()+"|"
+                    +range.highPrice().stripTrailingZeros().toPlainString()+"|"+continuationSettings();
+            return java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(material.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        } catch (java.security.NoSuchAlgorithmException e) { throw new IllegalStateException(e); }
+    }
+
+    public synchronized Map<String,Object> previewRebalanceContinuation(String executionId) {
+        try {
+            FillRecord end = continuableCycleEnd(executionId);
+            RebalancePriceRangeStore.Range range = continuationRange(end);
+            Object savedSettings = metadataValue(end,"continuationSettings");
+            if (savedSettings != null && !OBJECT_MAPPER.readTree(OBJECT_MAPPER.writeValueAsString(savedSettings)).equals(OBJECT_MAPPER.readTree(continuationSettings().toString())))
+                throw new IllegalStateException("网格参数与结束时快照不同，请先恢复原参数");
+            RebalanceState state = currentRebalanceState();
+            if (activeRebalanceRunner == null || !activeRebalanceRunner.isRunning())
+                throw new IllegalStateException("请先启动再平衡监控，续跑操作不会另开初始仓位");
+            if (state.lastPrice() == null || state.updatedAt() == null
+                    || state.updatedAt().isBefore(Instant.now().minusSeconds(30)))
+                throw new IllegalStateException("当前行情尚未就绪，请等待新快照");
+            Map<String,Object> result = new LinkedHashMap<>();
+            result.put("ok",true); result.put("executionId",end.executionId());
+            result.put("referencePrice",end.price()); result.put("currentPrice",state.lastPrice());
+            result.put("priceDifference",state.lastPrice().subtract(end.price()));
+            result.put("confirmation",continuationConfirmation(executionId,range));
+            result.put("range",range); result.put("canContinue",range.lowPrice().compareTo(state.lastPrice())<=0
+                    && range.highPrice().compareTo(state.lastPrice())>=0);
+            result.put("message",Boolean.TRUE.equals(result.get("canContinue"))
+                    ? "将以结束价为参考，按当前价差恢复挂单；原成交、费用、盈亏继续累计"
+                    : "当前价格不在续跑区间内，未恢复、未下单");
+            result.put("rangeSource",metadataValue(end,"continuationRange")==null
+                    ? "旧记录未保存区间，使用当前已保存波段区间" : "Cycle 结束时保存的区间");
+            result.put("settingsSource",savedSettings==null
+                    ? "旧记录未保存参数，使用当前已保存网格参数" : "与 Cycle 结束时的网格参数一致");
+            return result;
+        } catch (RuntimeException | IOException e) {
+            return Map.of("ok",false,"canContinue",false,"message",String.valueOf(e.getMessage()));
+        }
+    }
+
+    public synchronized Map<String,Object> continueRebalanceCycle(String executionId,String confirmation) {
+        Map<String,Object> preview = previewRebalanceContinuation(executionId);
+        if (!Boolean.TRUE.equals(preview.get("ok"))) return preview;
+        if (!Boolean.TRUE.equals(preview.get("canContinue"))) {
+            Map<String,Object> rejected = new LinkedHashMap<>(preview); rejected.put("ok",false); return rejected;
+        }
+        if (confirmation == null || !confirmation.equals(preview.get("confirmation")))
+            return Map.of("ok",false,"message","续跑区间或网格参数已变化，请重新预览并确认");
+        try {
+            FillRecord end = continuableCycleEnd(executionId);
+            List<FillRecord> fills = fillStore.cycleFills(executionId);
+            if (fills.isEmpty()) throw new IllegalStateException("原 Cycle 成交记录不完整");
+            RebalancePriceRangeStore.Range range = (RebalancePriceRangeStore.Range)preview.get("range");
+            Object target = metadataValue(end,"targetRatio");
+            if (target == null) throw new IllegalStateException("缺少原 Cycle 目标比例");
+            RebalanceCycleContinuation context = new RebalanceCycleContinuation(executionId,end.symbol(),
+                    fills.get(0).time(),end.time(),Instant.now(),end.price(),new BigDecimal(target.toString()),
+                    range.lowPrice(),range.highPrice(),false,false);
+            activeRebalanceRunner.continueEndedCycle(fills,end,context,() -> fillStore.continueCycle(context));
+            return Map.of("ok",true,"message","已接回原 Cycle；以结束价为参考恢复网格，成交以交易所回报为准",
+                    "executionId",executionId,"referencePrice",end.price());
+        } catch (RuntimeException e) {
+            return Map.of("ok",false,"message",String.valueOf(e.getMessage()));
+        }
     }
 
     public synchronized Map<String, Object> closeRebalanceCycle() {
@@ -1967,6 +2082,10 @@ public class LiveControlService {
             row.put("fillCount", tradingFillCount(fills));
             row.put("endReasonLabel", derivedEndReasonLabel(row, fills));
         }
+        boolean canContinue = false;
+        try { continuableCycleEnd(cycleEnd.executionId()); canContinue = true; }
+        catch (RuntimeException ignored) { }
+        row.put("canContinue",canContinue);
         return row;
     }
 
@@ -2011,6 +2130,14 @@ public class LiveControlService {
         meta.put("durationSeconds", first.time() == null ? 0 : Duration.between(first.time(), endedAt).toSeconds());
         meta.put("endReason", reason == null ? "" : reason);
         meta.put("endReasonLabel", endReasonLabel(reason));
+        meta.put("continuationSettings",continuationSettings());
+        try {
+            Path rangePath = continuationRangePath();
+            if (Files.isRegularFile(rangePath)) meta.put("continuationRange",new RebalancePriceRangeStore(rangePath).load());
+        } catch (IOException e) {
+            eventLogger.warn("rebalance.cycle.range-unavailable",Map.of("message",String.valueOf(e.getMessage())));
+        }
+
         meta.put("targetRatio", endingState.targetRatio());
         meta.put("endRatio", endingState.currentRatio());
         meta.put("buyCount", countSide(fills, "BUY"));

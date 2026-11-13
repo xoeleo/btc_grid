@@ -63,6 +63,14 @@ public final class RebalanceWaterExit {
             } catch (Exception e) { throw new IllegalStateException("Cannot load dynamic water control; refuse to trade", e); }
         }
     }
+    public void resumeCompletedForContinuation(Instant cycleStart) {
+        if (control == null || !complete()) return;
+        if (cycleStart == null || control.cycleStartMillis != cycleStart.toEpochMilli())
+            throw new IllegalStateException("动态水位完成记录与续跑 Cycle 不匹配");
+        control.phase = "GRID"; control.pendingOrderId = null; control.targetAbsQty = null;
+        control.trackedOrderIds.clear(); persist();
+    }
+
     public boolean frozen() { return control != null && !Set.of("GRID", "COMPLETE").contains(control.phase); }
     public boolean complete() { return control != null && "COMPLETE".equals(control.phase); }
     public String message() { return message; }

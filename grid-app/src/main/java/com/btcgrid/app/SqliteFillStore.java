@@ -216,6 +216,7 @@ public class SqliteFillStore implements FillStore {
                        total_pnl_at_fill, client_order_id, config_json
                   from fills
                  where side = 'CYCLE_END'
+                   and execution_id not in (select end_execution_id from cycle_continuations)
                  order by fill_time_millis desc, rowid desc
                  limit ?
                 """;
@@ -239,6 +240,7 @@ public class SqliteFillStore implements FillStore {
                        total_pnl_at_fill, client_order_id, config_json
                   from fills
                  where side = 'CYCLE_END'
+                   and execution_id not in (select end_execution_id from cycle_continuations)
                    and symbol = ?
                  order by fill_time_millis desc, rowid desc
                  limit ?
@@ -259,6 +261,98 @@ public class SqliteFillStore implements FillStore {
             throw new IllegalStateException("Failed to read cycle records", e);
         }
         return records;
+    }
+
+    @Override
+    public synchronized void continueCycle(RebalanceCycleContinuation c) {
+        if (c == null || c.endExecutionId() == null || c.symbol() == null || !c.symbol().startsWith("RBAL:")
+                || c.referencePrice() == null || c.referencePrice().signum() <= 0
+                || c.lowPrice() == null || c.highPrice() == null
+                || c.lowPrice().signum() <= 0 || c.highPrice().compareTo(c.lowPrice()) <= 0)
+            throw new IllegalArgumentException("续跑参数无效");
+        // BEGIN IMMEDIATE reserves the writer before validating the current tail.
+        // A new fill/end/resumption cannot slip between the checks and the audit insert.
+        try (Connection connection = connect(); Statement tx = connection.createStatement()) {
+            tx.execute("BEGIN IMMEDIATE");
+            try {
+                try (PreparedStatement check = connection.prepareStatement("""
+                        select execution_id, price, cumulative_qty, fill_time_millis, rowid from fills
+                         where symbol = ? and side = 'CYCLE_END'
+                         order by fill_time_millis desc, rowid desc limit 1
+                        """)) {
+                    check.setString(1, c.symbol());
+                    try (ResultSet rs = check.executeQuery()) {
+                        if (!rs.next() || !c.endExecutionId().equals(rs.getString(1))
+                                || new BigDecimal(rs.getString(2)).compareTo(c.referencePrice()) != 0
+                                || new BigDecimal(rs.getString(3)).signum() == 0)
+                            throw new IllegalStateException("仅允许继续最近一笔保留仓位的 Cycle");
+                        long endRowId = rs.getLong(5);
+                        try (PreparedStatement later = connection.prepareStatement("""
+                                select count(*) from fills where symbol = ? and side in ('BUY','SELL')
+                                  and rowid > ?
+                                """)) {
+                            later.setString(1, c.symbol()); later.setLong(2, endRowId);
+                            try (ResultSet rows = later.executeQuery()) {
+                                if (rows.next() && rows.getLong(1) != 0)
+                                    throw new IllegalStateException("Cycle 结束后已有交易，禁止接回旧仓位");
+                            }
+                        }
+                    }
+                }
+                try (PreparedStatement insert = connection.prepareStatement("""
+                        insert into cycle_continuations(end_execution_id,symbol,cycle_started_millis,
+                          paused_millis,resumed_millis,reference_price,target_ratio,low_price,high_price,target_rearmed,ready)
+                        values(?,?,?,?,?,?,?,?,?,0,0)
+                        """)) {
+                    insert.setString(1,c.endExecutionId()); insert.setString(2,c.symbol());
+                    insert.setLong(3,c.cycleStartedAt().toEpochMilli()); insert.setLong(4,c.pausedAt().toEpochMilli()); insert.setLong(5,c.resumedAt().toEpochMilli());
+                    insert.setString(6,c.referencePrice().toPlainString()); insert.setString(7,c.targetRatio().toPlainString());
+                    insert.setString(8,c.lowPrice().toPlainString()); insert.setString(9,c.highPrice().toPlainString());
+                    insert.executeUpdate();
+                }
+                tx.execute("COMMIT");
+            } catch (RuntimeException | SQLException e) {
+                tx.execute("ROLLBACK"); throw e;
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("登记 Cycle 续跑失败，可能已续跑；请刷新核对", e);
+        }
+    }
+
+    @Override
+    public synchronized RebalanceCycleContinuation latestContinuation(String symbol) {
+        try (Connection c = connect(); PreparedStatement s = c.prepareStatement("""
+                select * from cycle_continuations where symbol = ? order by resumed_millis desc, rowid desc limit 1
+                """)) {
+            s.setString(1, symbol);
+            try (ResultSet r = s.executeQuery()) {
+                if (!r.next()) return null;
+                return new RebalanceCycleContinuation(r.getString("end_execution_id"), r.getString("symbol"),
+                        Instant.ofEpochMilli(r.getLong("cycle_started_millis")),
+                        Instant.ofEpochMilli(r.getLong("paused_millis")), Instant.ofEpochMilli(r.getLong("resumed_millis")),
+                        new BigDecimal(r.getString("reference_price")),new BigDecimal(r.getString("target_ratio")),
+                        new BigDecimal(r.getString("low_price")),new BigDecimal(r.getString("high_price")),
+                        r.getInt("target_rearmed") != 0, r.getInt("ready") != 0);
+            }
+        } catch (SQLException e) { throw new IllegalStateException("读取 Cycle 续跑记录失败",e); }
+    }
+
+    @Override
+    public synchronized void markContinuationReady(String executionId) {
+        try (Connection c = connect(); PreparedStatement s = c.prepareStatement(
+                "update cycle_continuations set ready=1 where end_execution_id=?")) {
+            s.setString(1,executionId);
+            if (s.executeUpdate()!=1) throw new IllegalStateException("续跑记录不存在");
+        } catch (SQLException e) { throw new IllegalStateException("保存续跑核对状态失败",e); }
+    }
+
+    @Override
+    public synchronized void rearmContinuationTarget(String executionId) {
+        try (Connection c = connect(); PreparedStatement s = c.prepareStatement(
+                "update cycle_continuations set target_rearmed=1 where end_execution_id=?")) {
+            s.setString(1,executionId);
+            if (s.executeUpdate()!=1) throw new IllegalStateException("续跑记录不存在");
+        } catch (SQLException e) { throw new IllegalStateException("保存续跑目标状态失败",e); }
     }
 
     @Override
@@ -448,6 +542,7 @@ public class SqliteFillStore implements FillStore {
                            from fills
                           where symbol = ?
                             and side = 'CYCLE_END'
+                            and execution_id not in (select end_execution_id from cycle_continuations)
                        ), 0)
                  order by fill_time_millis desc, rowid desc
                 """;
@@ -772,6 +867,7 @@ public class SqliteFillStore implements FillStore {
                            from fills
                           where symbol = ?
                             and side = 'CYCLE_END'
+                            and execution_id not in (select end_execution_id from cycle_continuations)
                        ), 0)
                  order by fill_time_millis desc, rowid desc
                 """;
@@ -1266,6 +1362,15 @@ public class SqliteFillStore implements FillStore {
         try (Connection connection = connect();
              Statement statement = connection.createStatement()) {
             statement.execute(sql);
+            statement.execute("""
+                    create table if not exists cycle_continuations (
+                      end_execution_id text primary key, symbol text not null,
+                      cycle_started_millis integer not null, paused_millis integer not null, resumed_millis integer not null,
+                      reference_price text not null, target_ratio text not null,
+                      low_price text not null, high_price text not null,
+                      target_rearmed integer not null default 0, ready integer not null default 0
+                    )
+                    """);
             ensureColumn(connection, "value", "text not null default '0'");
             ensureColumn(connection, "fee", "text not null default '0'");
             ensureColumn(connection, "fee_currency", "text not null default 'USDT'");

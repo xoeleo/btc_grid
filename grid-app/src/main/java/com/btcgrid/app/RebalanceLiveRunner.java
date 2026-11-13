@@ -212,6 +212,9 @@ public class RebalanceLiveRunner implements AutoCloseable, PrivateExecutionListe
             return;
         }
         try {
+            RebalanceCycleContinuation context = rebalanceService.continuation();
+            if (context != null && !context.ready())
+                rebalanceService.verifyContinuationFunding(() -> reconcileContinuationFunding(context));
             reconcileFundingFees();
             reconcileMissingExecutions();
             reconcileOpenOrders();
@@ -220,6 +223,31 @@ public class RebalanceLiveRunner implements AutoCloseable, PrivateExecutionListe
             eventLogger.error("rebalance.live.poll.failed", Map.of("message", e.getMessage()));
             alertService.warning("REBALANCE_LIVE_POLL_FAILED", "Rebalance live polling failed", Map.of("message", e.getMessage()));
         }
+    }
+
+    public void continueEndedCycle(List<FillRecord> fills, FillRecord end,
+            RebalanceCycleContinuation continuation, Runnable commit) {
+        if (!isRunning() || !privateStreamConnected.get() || orderQueryGateway == null
+                || fundingFeeQueryGateway == null || lastPrivateStreamMessageAt.get() == null
+                || lastPrivateStreamMessageAt.get().isBefore(Instant.now().minusSeconds(60)))
+            throw new IllegalStateException("私有成交流或交易所查询尚未就绪，无法续跑");
+        // Query all orders for this symbol, not only our locally tracked pair.
+        if (!orderQueryGateway.fetchOpenOrders(symbol).isEmpty())
+            throw new IllegalStateException("交易所仍有挂单，无法接回已结束 Cycle");
+        rebalanceService.continueEndedCycle(fills,end,continuation,commit,
+                () -> reconcileContinuationFunding(continuation));
+    }
+
+    private void reconcileContinuationFunding(RebalanceCycleContinuation context) {
+        if (fundingFeeQueryGateway == null) throw new IllegalStateException("缺少资金费核对入口");
+        processedFundingFeeIds.clear();
+        Instant now = Instant.now();
+        for (FundingFeeQueryWindow window : fundingFeeQueryWindows(context.pausedAt(),now)) {
+            for (FundingFeeEvent fee : fundingFeeQueryGateway.fetchFundingFees(symbol,
+                    window.startInclusive(),window.endInclusive()))
+                handleFundingFee(fee,"rebalance-continuation-reconcile");
+        }
+        fundingFeeReconcileStart.set(now.minus(FUNDING_FEE_RECONCILE_OVERLAP));
     }
 
     public void requestManualCycleExit() {

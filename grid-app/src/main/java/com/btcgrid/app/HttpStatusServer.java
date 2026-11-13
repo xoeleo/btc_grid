@@ -209,6 +209,16 @@ public class HttpStatusServer implements AutoCloseable {
                 requirePost(exchange);
                 writeJson(exchange, liveControlService.stopRebalance());
             });
+            createProtectedContext("/api/rebalance-continue-cycle", exchange -> {
+                if ("GET".equalsIgnoreCase(exchange.getRequestMethod())) {
+                    writeJson(exchange,liveControlService.previewRebalanceContinuation(queryParam(exchange,"executionId")));
+                    return;
+                }
+                requirePost(exchange);
+                JsonNode body = objectMapper.readTree(exchange.getRequestBody());
+                String executionId = body.path("executionId").asText("");
+                writeJson(exchange,liveControlService.continueRebalanceCycle(executionId,body.path("confirmation").asText("")));
+            });
             createProtectedContext("/api/rebalance-close-cycle", exchange -> {
                 requirePost(exchange);
                 writeJson(exchange, liveControlService.closeRebalanceCycle());
@@ -2053,6 +2063,26 @@ public class HttpStatusServer implements AutoCloseable {
                       `;
                       }).join('');
                     }
+                    let continuationBusy = false;
+                    async function continueEndedRebalanceCycle(executionId, button) {
+                      if (continuationBusy) return;
+                      continuationBusy = true; button.disabled = true;
+                      try {
+                        const preview = await fetch(`/api/rebalance-continue-cycle?executionId=${encodeURIComponent(executionId)}`).then(r=>r.json());
+                        if (!preview.ok || !preview.canContinue) { alert(preview.message || '当前无法续跑'); return; }
+                        const prompt = `继续原 Cycle？\n结束参考价：${formatNumber(preview.referencePrice)}\n当前价：${formatNumber(preview.currentPrice)}；价差：${formatNumber(preview.priceDifference)}\n续跑区间：${formatNumber(preview.range.lowPrice)} — ${formatNumber(preview.range.highPrice)}\n${preview.rangeSource}\n${preview.settingsSource}\n原成交、费用和盈亏继续累计。确认后可能立即提交实盘限价委托；恢复结果以交易所回报为准。`;
+                        if (!confirm(prompt)) return;
+                        const response = await fetch('/api/rebalance-continue-cycle', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({executionId,confirmation:preview.confirmation})});
+                        const result = await response.json();
+                        alert(result.message || (result.ok ? '续跑已登记' : '续跑未完成，请刷新核对'));
+                      } catch (error) {
+                        alert('续跑请求结果待核对，请刷新状态；不会自动重发：' + (error.message || error));
+                      } finally { continuationBusy = false; button.disabled = false; await refreshRebalance(); }
+                    }
+                    document.addEventListener('click', event => {
+                      const button = event.target.closest('[data-action="rebalance-cycle-continue"]');
+                      if (button) continueEndedRebalanceCycle(button.dataset.executionId,button);
+                    });
                     function renderRebalanceCycles(cycles, summary) {
                       const tbody = document.getElementById('rebalanceCycles');
                       if (!tbody) return;
@@ -2095,7 +2125,8 @@ public class HttpStatusServer implements AutoCloseable {
                           <td>${formatPnl(c.totalPnlAtFill)}</td>
                           <td>${esc(c.clientOrderId)}</td>
                           <td>${esc(c.executionId)}</td>
-                          <td><button class="compact" data-action="rebalance-cycle-detail" data-execution-id="${esc(c.executionId)}">明细</button></td>
+                          <td><button class="compact" data-action="rebalance-cycle-detail" data-execution-id="${esc(c.executionId)}">明细</button>
+                          ${c.canContinue ? `<button class="compact start" data-action="rebalance-cycle-continue" data-execution-id="${esc(c.executionId)}" ${continuationBusy?'disabled':''}>继续运行</button>` : ''}</td>
                         </tr>
                       `).join('');
                       tbody.innerHTML = summaryRow + emptyRow + cycleRows;

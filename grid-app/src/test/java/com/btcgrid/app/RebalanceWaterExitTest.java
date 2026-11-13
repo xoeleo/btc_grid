@@ -411,6 +411,15 @@ class RebalanceWaterExitTest {
         assertThrows(IllegalStateException.class, f::recreate);
     }
 
+    @Test void continuedTargetEndReleasesCompleteWaterControlForTheSameCycleOnly() throws Exception {
+        Fixture f=new Fixture();
+        assertTrue(f.exit.poll(f.market(),f.start,true));assertTrue(f.exit.complete());
+        assertThrows(IllegalStateException.class,()->f.exit.resumeCompletedForContinuation(f.start.plusSeconds(1)));
+        assertTrue(f.exit.complete());
+        f.exit.resumeCompletedForContinuation(f.start);assertEquals("GRID",f.exit.phase());
+        f.price=d("99000");assertFalse(f.poll());assertTrue(f.submitted.isEmpty());
+    }
+
     static class Fixture {
         final Path path;
         Instant start = START;

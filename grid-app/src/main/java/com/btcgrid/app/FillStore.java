@@ -26,6 +26,20 @@ public interface FillStore {
 
     List<FillRecord> recentCycles(String symbol, int limit, int offset);
 
+    default void continueCycle(RebalanceCycleContinuation continuation) {
+        throw new UnsupportedOperationException("Cycle continuation is not supported by this store");
+    }
+
+    default RebalanceCycleContinuation latestContinuation(String symbol) { return null; }
+
+    default void markContinuationReady(String executionId) {
+        throw new UnsupportedOperationException("Cycle continuation is not supported by this store");
+    }
+
+    default void rearmContinuationTarget(String executionId) {
+        throw new UnsupportedOperationException("Cycle continuation is not supported by this store");
+    }
+
     List<FillRecord> cycleFills(String cycleExecutionId);
 
     CycleFillPage cycleFillsPage(String cycleExecutionId, int limit, int offset);
