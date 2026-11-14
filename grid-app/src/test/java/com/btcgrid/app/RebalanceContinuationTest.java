@@ -155,6 +155,8 @@ class RebalanceContinuationTest {
 
     @Test void controllerPreviewBindsRangeAndParametersBeforeOpeningTheLedger() throws Exception {
         Fixture f=new Fixture();SqliteFillStore store=closedStore();
+        store.save(fill(endTime.plusSeconds(1),"BUY","other-init","RBAL_BTCUSDT_I_other","0.03","0.03","3"));
+        store.save(fill(endTime.plusSeconds(2),"CYCLE_END","other-end","CYCLE_END_other","0","0.03","3"));
         RuntimeSettings runtime=new RuntimeSettings(Duration.ofSeconds(15),false,dir.resolve("state.json").toString(),
                 dir.resolve("events.log").toString(),dir.resolve("status.json").toString(),dir.resolve("fills.sqlite").toString(),
                 false,"127.0.0.1",0,1,1);
@@ -186,6 +188,8 @@ class RebalanceContinuationTest {
         range.save(new RebalancePriceRangeStore.Range(n("80"),n("200")));
         Map<String,Object> result=control.continueRebalanceCycle("ended",preview.get("confirmation").toString());
         assertEquals(true,result.get("ok"),result.toString());assertEquals(2,f.orders.size());assertTrue(store.latestContinuation(SYMBOL).ready());
+        assertEquals(1,store.cycleFills("other-end").size());
+        assertTrue(store.currentCycleFills(SYMBOL).stream().noneMatch(fill->fill.executionId().equals("other-init")));
         assertEquals(false,control.continueRebalanceCycle("ended",preview.get("confirmation").toString()).get("ok"));
     }
 

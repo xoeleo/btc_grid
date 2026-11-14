@@ -646,6 +646,37 @@ public class RebalanceService {
         return state.targetRatio();
     }
 
+    public synchronized Map<String,Object> previewEndedCycle(List<FillRecord> fills,FillRecord end) {
+        if(settings.category()!=ProductCategory.LINEAR)throw new IllegalStateException("历史 Cycle 续跑预览当前仅支持 USDT 合约");
+        MarketSnapshot market=marketDataGateway.latestSnapshot(settings.symbol());
+        AccountAssetSnapshot account=accountGateway.walletSnapshot(settings.accountType(),settings.baseCoin(),settings.quoteCoin(),settings.category(),settings.symbol());
+        if(!fresh(market.timestamp(),Instant.now()) || !fresh(account.timestamp(),Instant.now()))
+            throw new IllegalStateException("行情或账户快照过期，请等待更新");
+        if(account.contractPositionQty().signum()!=end.cumulativeQty().signum()
+                || account.contractPositionQty().abs().compareTo(end.cumulativeQty().abs())<0)
+            throw new IllegalStateException("实际合约仓位不足以承接所选 Cycle");
+        StrategyLedgerSnapshot old=snapshotFromFills(fills,end.cumulativeQty(),true);
+        StrategyLedgerSnapshot ledger=new StrategyLedgerSnapshot(old.symbol(),old.netQty(),old.avgEntryPrice(),old.realizedPnl(),old.floatingPnl(),
+                old.previousFillPrice(),end.price(),old.lastFillSide(),old.lastFillZone(),old.consecutiveBuyFills(),old.consecutiveSellFills(),old.inventoryMode(),old.updatedAt());
+        BigDecimal buyCarry=BigDecimal.ZERO,sellCarry=BigDecimal.ZERO;
+        for(FillRecord f:fills)try{
+            JsonNode metadata=OBJECT_MAPPER.readTree(f.configJson()==null?"{}":f.configJson());
+            if(metadata.hasNonNull("buyGridRoundingCarryQty"))buyCarry=new BigDecimal(metadata.get("buyGridRoundingCarryQty").asText());
+            if(metadata.hasNonNull("sellGridRoundingCarryQty"))sellCarry=new BigDecimal(metadata.get("sellGridRoundingCarryQty").asText());
+        }catch(java.io.IOException e){throw new IllegalStateException("原 Cycle 参数记录无法解析",e);}
+        var rounding=new com.btcgrid.strategy.model.QuantityRoundingState(buyCarry,sellCarry);
+        GridOrderPlanner planner=new GridOrderPlanner(new ClientOrderIdFactory("PREVIEW"),BigDecimal.ONE,
+                (m,l,p,q)->false,(m,l,p,q)->false,s->com.btcgrid.strategy.model.ProfitSizingState.empty(),s->rounding);
+        var pair=planner.planPairedOrders(gridConfig(end.cumulativeQty().signum()>0?TradeSide.BUY:TradeSide.SELL,settings.maxInitialSteps()),
+                instrumentSpec,market,ledger,end.price(),null,false,"continuation-preview");
+        List<OrderIntent> orders=new ArrayList<>();
+        if(pair!=null){if(pair.buyOrder()!=null)orders.add(pair.buyOrder());if(pair.sellOrder()!=null)orders.add(pair.sellOrder());}
+        if(orders.isEmpty())throw new IllegalStateException("当前参数无法生成有效委托，请核对数量限制");
+        return Map.of("currentPrice",market.lastPrice(),"orders",orders);
+    }
+
+    public synchronized void ignoreHistoricalExecutions(Set<String> executionIds) { processedExecutionIds.addAll(executionIds); }
+
     public synchronized boolean onExecution(FillEvent fillEvent, String source) {
         return onExecution(fillEvent, source, () -> {
         });
@@ -1360,6 +1391,10 @@ public class RebalanceService {
     }
 
     private StrategyLedgerSnapshot snapshotFromFills(List<FillRecord> fills, BigDecimal netQty) {
+        return snapshotFromFills(fills,netQty,continuation != null);
+    }
+
+    private StrategyLedgerSnapshot snapshotFromFills(List<FillRecord> fills, BigDecimal netQty,boolean preserveSequence) {
         FillRecord last = fills.get(fills.size() - 1);
         List<FillRecord> referenceFills = new ArrayList<>();
         for (FillRecord fill : fills) {
@@ -1375,7 +1410,7 @@ public class RebalanceService {
                 ? BigDecimal.ZERO
                 : zero(last.cumulativeValue()).divide(netQty, java.math.MathContext.DECIMAL64).abs();
         int continuedBuys=0,continuedSells=0;
-        if (continuation != null && reference != null) {
+        if (preserveSequence && reference != null) {
             int consecutive=0;
             for (int i=referenceFills.size()-1;i>=0;i--) {
                 if (!reference.side().equals(referenceFills.get(i).side())) break;

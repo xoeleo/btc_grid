@@ -308,6 +308,18 @@ public class RebalanceLiveRunner implements AutoCloseable, PrivateExecutionListe
         }
     }
 
+    public Map<String,Object> previewEndedCycle(List<FillRecord> fills,FillRecord end) {
+        assertContinuationReady();
+        if(orderQueryGateway!=null && !orderQueryGateway.fetchOpenOrders(symbol).isEmpty())
+            throw new IllegalStateException("交易所仍有挂单，暂不能续跑历史 Cycle");
+        return rebalanceService.previewEndedCycle(fills,end);
+    }
+
+    public void ignoreHistoricalExecutions(Set<String> executionIds) {
+        processedExecutionIds.addAll(executionIds);
+        rebalanceService.ignoreHistoricalExecutions(executionIds);
+    }
+
     public void assertContinuationReady() {
         if (!isRunning()) throw new IllegalStateException("再平衡监控尚未运行，无法续跑");
         if (orderQueryGateway == null || fundingFeeQueryGateway == null)

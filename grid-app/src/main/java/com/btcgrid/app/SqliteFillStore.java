@@ -65,6 +65,11 @@ public class SqliteFillStore implements FillStore {
                 """;
         try (Connection connection = connect();
              PreparedStatement statement = connection.prepareStatement(sql)) {
+            connection.setAutoCommit(false);
+            boolean existed;
+            try (PreparedStatement check = connection.prepareStatement("select 1 from fills where execution_id=?")) {
+                check.setString(1,executionId(record));try(ResultSet r=check.executeQuery()){existed=r.next();}
+            }
             statement.setString(1, executionId(record));
             statement.setLong(2, toMillis(record.time()));
             statement.setString(3, record.symbol());
@@ -86,7 +91,19 @@ public class SqliteFillStore implements FillStore {
             statement.setString(19, record.configJson());
             statement.executeUpdate();
             fillMissingConfigJson(connection, executionId(record), record.configJson());
+            String owner = activeOwner(connection,record.symbol());
+            if (!existed && owner != null) {
+                if (("BUY".equals(record.side()) || "SELL".equals(record.side())) && isCycleInitial(record))
+                    throw new IllegalStateException("指定历史 Cycle 仍在运行，禁止新建初始仓位");
+                assignOwner(connection,executionId(record),owner);
+                if ("CYCLE_END".equals(record.side())) {
+                    try(PreparedStatement clear=connection.prepareStatement("delete from active_cycle_owners where symbol=?")){
+                        clear.setString(1,record.symbol());clear.executeUpdate();
+                    }
+                }
+            }
             backfillDerivedColumns(connection, record.symbol());
+            connection.commit();
         } catch (SQLException e) {
             throw new IllegalStateException("Failed to save fill record", e);
         }
@@ -275,29 +292,38 @@ public class SqliteFillStore implements FillStore {
         try (Connection connection = connect(); Statement tx = connection.createStatement()) {
             tx.execute("BEGIN IMMEDIATE");
             try {
-                try (PreparedStatement check = connection.prepareStatement("""
-                        select execution_id, price, cumulative_qty, fill_time_millis, rowid from fills
-                         where symbol = ? and side = 'CYCLE_END'
-                         order by fill_time_millis desc, rowid desc limit 1
-                        """)) {
-                    check.setString(1, c.symbol());
-                    try (ResultSet rs = check.executeQuery()) {
-                        if (!rs.next() || !c.endExecutionId().equals(rs.getString(1))
-                                || new BigDecimal(rs.getString(2)).compareTo(c.referencePrice()) != 0
-                                || new BigDecimal(rs.getString(3)).signum() == 0)
-                            throw new IllegalStateException("仅允许继续最近一笔保留仓位的 Cycle");
-                        long endRowId = rs.getLong(5);
-                        try (PreparedStatement later = connection.prepareStatement("""
-                                select count(*) from fills where symbol = ? and side in ('BUY','SELL')
-                                  and rowid > ?
-                                """)) {
-                            later.setString(1, c.symbol()); later.setLong(2, endRowId);
-                            try (ResultSet rows = later.executeQuery()) {
-                                if (rows.next() && rows.getLong(1) != 0)
-                                    throw new IllegalStateException("Cycle 结束后已有交易，禁止接回旧仓位");
-                            }
-                        }
-                    }
+                if (activeOwner(connection,c.symbol()) != null || !currentCycleFills(c.symbol()).isEmpty())
+                    throw new IllegalStateException("已有正在运行的 Cycle");
+                FillRecord selected = cycleEnd(c.endExecutionId());
+                if (selected == null || !c.symbol().equals(selected.symbol()) || selected.price().compareTo(c.referencePrice()) != 0
+                        || selected.cumulativeQty().signum()==0 || continuationUsed(c.endExecutionId()))
+                    throw new IllegalStateException("所选 Cycle 不存在、已续跑或没有保留仓位");
+                try(PreparedStatement tail=connection.prepareStatement("select count(*) from fills where symbol=? and side in ('BUY','SELL') and rowid > coalesce((select max(rowid) from fills where symbol=? and side='CYCLE_END'),0)")) {
+                    tail.setString(1,c.symbol());tail.setString(2,c.symbol());
+                    try(ResultSet r=tail.executeQuery()){if(r.next() && r.getLong(1)>0)throw new IllegalStateException("仍有未归档的新成交，无法续跑历史 Cycle");}
+                }
+                List<FillRecord> selectedFills=cycleFills(c.endExecutionId());
+                if(selectedFills.isEmpty() || selectedFills.get(0).time().toEpochMilli()!=c.cycleStartedAt().toEpochMilli())
+                    throw new IllegalStateException("原 Cycle 起点不匹配");
+                String root=ownerOf(connection,c.endExecutionId());
+                if(root==null)root=selectedFills.get(0).executionId();
+                try(PreparedStatement newer=connection.prepareStatement("select execution_id from fills where symbol=? and side='CYCLE_END' and fill_time_millis>?")){
+                    newer.setString(1,c.symbol());newer.setLong(2,selected.time().toEpochMilli());
+                    try(ResultSet r=newer.executeQuery()){while(r.next()){
+                        List<FillRecord> other=cycleFills(r.getString(1));
+                        if(!other.isEmpty() && other.get(0).executionId().equals(selectedFills.get(0).executionId()))
+                            throw new IllegalStateException("该 Cycle 有更新的结束记录，请选择该 Cycle 最近一次结束");
+                    }}
+                }
+                for(FillRecord f:selectedFills)assignOwner(connection,f.executionId(),root);
+                assignOwner(connection,c.endExecutionId(),root);
+                // Earlier resumed checkpoints of the same original Cycle keep their own historical cutoffs.
+                try(PreparedStatement checkpoints=connection.prepareStatement("select end_execution_id from cycle_continuations where symbol=? and cycle_started_millis=?")){
+                    checkpoints.setString(1,c.symbol());checkpoints.setLong(2,c.cycleStartedAt().toEpochMilli());
+                    try(ResultSet r=checkpoints.executeQuery()){while(r.next())assignOwner(connection,r.getString(1),root);}
+                }
+                try(PreparedStatement active=connection.prepareStatement("insert into active_cycle_owners(symbol,root_id) values(?,?)")){
+                    active.setString(1,c.symbol());active.setString(2,root);active.executeUpdate();
                 }
                 try (PreparedStatement insert = connection.prepareStatement("""
                         insert into cycle_continuations(end_execution_id,symbol,cycle_started_millis,
@@ -355,6 +381,90 @@ public class SqliteFillStore implements FillStore {
         } catch (SQLException e) { throw new IllegalStateException("保存续跑目标状态失败",e); }
     }
 
+    @Override public synchronized FillRecord cycleEndRecord(String id) { return id == null ? null : cycleEnd(id); }
+    @Override public synchronized boolean continuationUsed(String id) {
+        try(Connection c=connect();PreparedStatement s=c.prepareStatement("select 1 from cycle_continuations where end_execution_id=?")){
+            s.setString(1,id);try(ResultSet r=s.executeQuery()){return r.next();}
+        }catch(SQLException e){throw new IllegalStateException("读取续跑状态失败",e);}
+    }
+    @Override public synchronized String continuationRevision(String symbol) {
+        try(Connection c=connect();PreparedStatement s=c.prepareStatement("select coalesce(max(rowid),0),count(*) from fills where symbol=?")){
+            s.setString(1,symbol);try(ResultSet r=s.executeQuery()){r.next();return r.getLong(1)+":"+r.getLong(2)+":"+activeOwner(c,symbol);}
+        }catch(SQLException e){throw new IllegalStateException("读取账本版本失败",e);}
+    }
+    @Override public synchronized Set<String> excludedCycleExecutions(String symbol) {
+        try(Connection c=connect()){
+            String root=activeOwner(c,symbol);if(root==null)return Set.of();
+            Set<String> out=new HashSet<>();
+            try(PreparedStatement s=c.prepareStatement("select execution_id from fills where symbol=? and side in ('BUY','SELL') and execution_id not in (select execution_id from cycle_fill_owners where root_id=?)")){
+                s.setString(1,symbol);s.setString(2,root);try(ResultSet r=s.executeQuery()){while(r.next())out.add(r.getString(1));}
+            }return out;
+        }catch(SQLException e){throw new IllegalStateException("读取独立 Cycle 成交归属失败",e);}
+    }
+    private String activeOwner(Connection c,String symbol)throws SQLException {
+        try(PreparedStatement s=c.prepareStatement("select root_id from active_cycle_owners where symbol=?")){
+            s.setString(1,symbol.trim().toUpperCase());try(ResultSet r=s.executeQuery()){return r.next()?r.getString(1):null;}
+        }
+    }
+    private String ownerOf(Connection c,String id)throws SQLException {
+        try(PreparedStatement s=c.prepareStatement("select root_id from cycle_fill_owners where execution_id=?")){
+            s.setString(1,id);try(ResultSet r=s.executeQuery()){return r.next()?r.getString(1):null;}
+        }
+    }
+    private void assignOwner(Connection c,String id,String root)throws SQLException {
+        String existing=ownerOf(c,id);if(existing!=null && !existing.equals(root))throw new IllegalStateException("成交已属于其他 Cycle");
+        try(PreparedStatement s=c.prepareStatement("insert or ignore into cycle_fill_owners(execution_id,root_id) values(?,?)")){
+            s.setString(1,id);s.setString(2,root);s.executeUpdate();
+        }
+    }
+    private List<FillRecord> ownedFills(Connection c,String root,Instant cutoff)throws SQLException {
+        List<FillRecord> out=new ArrayList<>();
+        try(PreparedStatement s=c.prepareStatement("select f.* from fills f join cycle_fill_owners o on o.execution_id=f.execution_id where o.root_id=? and f.side in ('BUY','SELL','FUNDING_FEE') and f.fill_time_millis<? order by f.fill_time_millis,f.rowid")){
+            s.setString(1,root);s.setLong(2,cutoff==null?Long.MAX_VALUE:cutoff.toEpochMilli());
+            try(ResultSet r=s.executeQuery()){while(r.next())out.add(record(r));}
+        }return out;
+    }
+    private List<FillRecord> activeOwnedFills(String symbol) {
+        try(Connection c=connect()){String root=activeOwner(c,symbol);return root==null?null:ownedFills(c,root,null);}
+        catch(SQLException e){throw new IllegalStateException("读取当前指定 Cycle 失败",e);}
+    }
+    private List<FillRecord> ownedEndFills(FillRecord end) {
+        try(Connection c=connect()){String root=ownerOf(c,end.executionId());return root==null?null:ownedFills(c,root,end.time());}
+        catch(SQLException e){throw new IllegalStateException("读取历史指定 Cycle 失败",e);}
+    }
+    private static boolean trading(FillRecord f){return "BUY".equals(f.side()) || "SELL".equals(f.side());}
+    private static <T> List<T> slice(List<T> rows,int limit,int offset){
+        int from=Math.min(offset,rows.size());int to=(int)Math.min(rows.size(),(long)from+limit);return List.copyOf(rows.subList(from,to));
+    }
+    private CycleFillPage ownedCyclePage(List<FillRecord> rows,int limit,int offset){
+        BigDecimal turnover=rows.subList(0,Math.min(rows.size(),offset)).stream().filter(SqliteFillStore::trading)
+                .map(f->f.value().abs()).reduce(BigDecimal.ZERO,BigDecimal::add);
+        List<FillRecord> items=slice(rows,limit,offset);return new CycleFillPage(items,limit,offset,(long)offset+items.size()<rows.size(),rows.size(),turnover);
+    }
+    private FundingFeePage ownedFundingPage(List<FillRecord> rows,int limit,int offset){
+        List<FundingFeeItem> all=new ArrayList<>();BigDecimal cumulative=BigDecimal.ZERO;
+        for(FillRecord f:rows)if("FUNDING_FEE".equals(f.side())){cumulative=cumulative.add(f.fee(),MATH_CONTEXT);all.add(new FundingFeeItem(f,cumulative));}
+        Collections.reverse(all);List<FundingFeeItem> page=slice(all,limit,offset);
+        return new FundingFeePage(page,limit,offset,(long)offset+page.size()<all.size(),all.size());
+    }
+    private CurrentCycleFillPage ownedCurrentPage(List<FillRecord> rows,int limit,int offset,BigDecimal low,BigDecimal high,boolean exclusive){
+        List<CurrentCycleFillItem> all=new ArrayList<>();BigDecimal turnover=BigDecimal.ZERO,previous=null;
+        long buysSells=0,funding=0;
+        for(FillRecord f:rows){
+            BigDecimal prior=null;
+            if(trading(f)){
+                boolean manual=RebalanceManualAdjustment.isManual(f);
+                if(!manual)prior=previous;
+                turnover=turnover.add(f.value().abs());if(!manual)previous=f.price();
+            }
+            if((low!=null && f.price().compareTo(low)<0) || (high!=null && (exclusive?f.price().compareTo(high)>=0:f.price().compareTo(high)>0)))continue;
+            if(trading(f))buysSells++;else funding++;
+            all.add(new CurrentCycleFillItem(f,turnover,prior));
+        }
+        Collections.reverse(all);List<CurrentCycleFillItem> page=slice(all,limit,offset);
+        return new CurrentCycleFillPage(page,limit,offset,(long)offset+page.size()<all.size(),all.size(),buysSells,funding);
+    }
+
     @Override
     public synchronized List<FillRecord> cycleFills(String cycleExecutionId) {
         CycleFillPage page = cycleFillsPage(cycleExecutionId, Integer.MAX_VALUE, 0);
@@ -372,6 +482,8 @@ public class SqliteFillStore implements FillStore {
         if (cycleEnd == null) {
             return CycleFillPage.empty(normalizedLimit, normalizedOffset);
         }
+        List<FillRecord> owned = ownedEndFills(cycleEnd);
+        if (owned != null) return ownedCyclePage(owned,normalizedLimit,normalizedOffset);
         String pageSql = """
                 select execution_id, fill_time_millis, symbol, side, qty, price,
                        value, fee, fee_currency, cumulative_qty, cumulative_value, cumulative_fee,
@@ -529,6 +641,8 @@ public class SqliteFillStore implements FillStore {
         if (symbol == null || symbol.isBlank()) {
             return List.of();
         }
+        List<FillRecord> owned = activeOwnedFills(symbol);
+        if (owned != null) return owned;
         String sql = """
                 select execution_id, fill_time_millis, symbol, side, qty, price,
                        value, fee, fee_currency, cumulative_qty, cumulative_value, cumulative_fee,
@@ -582,6 +696,8 @@ public class SqliteFillStore implements FillStore {
         if (symbol == null || symbol.isBlank()) {
             return FundingFeePage.empty(normalizedLimit, normalizedOffset);
         }
+        List<FillRecord> owned = activeOwnedFills(symbol);
+        if (owned != null) return ownedFundingPage(owned,normalizedLimit,normalizedOffset);
         String normalizedSymbol = symbol.trim().toUpperCase();
         try (Connection connection = connect()) {
             CycleWindow window = currentCycleWindow(connection, normalizedSymbol);
@@ -724,6 +840,8 @@ public class SqliteFillStore implements FillStore {
         if (symbol == null || symbol.isBlank()) {
             return CurrentCycleFillPage.empty(normalizedLimit, normalizedOffset);
         }
+        List<FillRecord> owned = activeOwnedFills(symbol);
+        if (owned != null) return ownedCurrentPage(owned,normalizedLimit,normalizedOffset,minPrice,maxPrice,maxPriceExclusive);
         String normalizedSymbol = symbol.trim().toUpperCase();
         try (Connection connection = connect()) {
             CycleWindow window = currentCycleWindow(connection, normalizedSymbol);
@@ -1393,6 +1511,9 @@ public class SqliteFillStore implements FillStore {
                       target_rearmed integer not null default 0, ready integer not null default 0
                     )
                     """);
+            statement.execute("create table if not exists cycle_fill_owners(execution_id text primary key, root_id text not null)");
+            statement.execute("create index if not exists idx_cycle_fill_owner on cycle_fill_owners(root_id)");
+            statement.execute("create table if not exists active_cycle_owners(symbol text primary key, root_id text not null)");
             ensureColumn(connection, "value", "text not null default '0'");
             ensureColumn(connection, "fee", "text not null default '0'");
             ensureColumn(connection, "fee_currency", "text not null default 'USDT'");
@@ -1434,7 +1555,8 @@ public class SqliteFillStore implements FillStore {
 
     private void backfillDerivedColumns(Connection connection, String targetSymbol) throws SQLException {
         String selectSql = """
-                select rowid, symbol, side, qty, price, fee, fee_currency, client_order_id, config_json
+                select rowid, symbol, side, qty, price, fee, fee_currency, client_order_id, config_json,
+                       (select root_id from cycle_fill_owners o where o.execution_id=fills.execution_id) as owner_root
                   from fills
                  %s
                  order by symbol asc, fill_time_millis asc, rowid asc
@@ -1450,6 +1572,8 @@ public class SqliteFillStore implements FillStore {
         BigDecimal cumulativeFee = BigDecimal.ZERO;
         String currentSymbol = null;
         String currentInitialClientOrderId = null;
+        Map<String,BigDecimal[]> ownerTotals = new HashMap<>();
+        Map<String,String> ownerInitials = new HashMap<>();
         try (PreparedStatement select = connection.prepareStatement(selectSql);
              PreparedStatement update = connection.prepareStatement(updateSql)) {
             if (targetSymbol != null && !targetSymbol.isBlank()) {
@@ -1465,6 +1589,10 @@ public class SqliteFillStore implements FillStore {
                     cumulativeFee = BigDecimal.ZERO;
                     currentInitialClientOrderId = null;
                 }
+                String ownerKey=symbol+"|"+rs.getString("owner_root");
+                BigDecimal[] totals=ownerTotals.getOrDefault(ownerKey,new BigDecimal[]{BigDecimal.ZERO,BigDecimal.ZERO,BigDecimal.ZERO});
+                cumulativeQty=totals[0];cumulativeValue=totals[1];cumulativeFee=totals[2];
+                currentInitialClientOrderId=ownerInitials.get(ownerKey);
                 String side = rs.getString("side");
                 String clientOrderId = rs.getString("client_order_id");
                 if (isCycleInitial(clientOrderId, rs.getString("config_json"))
@@ -1491,6 +1619,8 @@ public class SqliteFillStore implements FillStore {
                 } else if ("FUNDING_FEE".equals(side)) {
                     cumulativeFee = cumulativeFee.subtract(fee);
                 }
+                ownerTotals.put(ownerKey,new BigDecimal[]{cumulativeQty,cumulativeValue,cumulativeFee});
+                ownerInitials.put(ownerKey,currentInitialClientOrderId);
                 BigDecimal profit = cumulativeQty.multiply(price).subtract(cumulativeValue).subtract(cumulativeFee);
                 update.setString(1, text(value));
                 update.setString(2, text(cumulativeQty));

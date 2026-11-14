@@ -937,6 +937,7 @@ public class HttpStatusServer implements AutoCloseable {
                         <div class="metric-line"><span>1% 减半</span><strong id="rebalanceCycleHalfPrice">-</strong></div>
                         <div class="metric-line"><span>2% 清仓</span><strong id="rebalanceCycleExitPrice">-</strong></div>
                       </div><small class="muted">自动触发同时要求：做多现价高于本 Cycle 开单价，做空现价低于开单价；相等不触发。</small></div>
+                      <div id="rebalanceHistoricalSource" class="notice" style="grid-column:1 / -1" hidden></div>
                       <div class="cycle-price-scenario-row">
                         <div class="metric"><span>启动 / 当前 / 成本价格</span><strong id="rebalanceCyclePriceSummary" class="cycle-price-summary">-</strong></div>
                         <div class="metric metric-scenario"><span id="rebalanceCycleScenarioLabel"></span><strong id="rebalanceCycleFullInventoryPrice">-</strong></div>
@@ -1081,6 +1082,16 @@ public class HttpStatusServer implements AutoCloseable {
                     </div>
                   </div>
                 """.concat("""
+                  <dialog id="rebalanceContinuationDialog" style="width:min(640px,94vw);max-height:90vh;overflow:auto;border:1px solid #dfd3bd;border-radius:12px;padding:24px;background:#fffaf0;color:#222">
+                    <h3>继续指定历史 Cycle</h3>
+                    <div id="rebalanceContinuationDetails"></div>
+                    <p id="rebalanceContinuationMessage" role="status"></p>
+                    <p class="muted">原成交、费用和盈亏继续累计；之后其他 Cycle 的交易保持独立。首轮委托为当前行情预估，实际按确认时行情复核，可能立即成交。</p>
+                    <div style="display:flex;justify-content:flex-end;gap:12px;margin-top:20px">
+                      <button id="rebalanceContinuationCancel">取消</button>
+                      <button id="rebalanceContinuationConfirm" class="start" disabled>确认续跑此 Cycle</button>
+                    </div>
+                  </dialog>
                   <script>
                     const pageMode = location.pathname === '/rebalance' ? 'rebalance' : 'grid';
                     function applyPageMode() {
@@ -1634,7 +1645,7 @@ public class HttpStatusServer implements AutoCloseable {
                       const rawRuntimeState = rebalanceState && rebalanceState.state ? rebalanceState.state : null;
                       const runtimeState = rawRuntimeState
                         && Object.prototype.hasOwnProperty.call(rebalanceState, 'gridReferencePrice')
-                        ? {...rawRuntimeState, gridReferencePrice: rebalanceState.gridReferencePrice}
+                        ? {...rawRuntimeState, gridReferencePrice: rebalanceState.gridReferencePrice, continuation: rebalanceState.continuation}
                         : rawRuntimeState;
                       if (rebalanceConfig && rebalanceConfig.config) applyRebalanceConfig(rebalanceConfig.config);
                       renderRebalanceMonitors(rebalanceMonitors,
@@ -1848,6 +1859,10 @@ public class HttpStatusServer implements AutoCloseable {
                     }
                 """).concat("""
                     function renderRebalanceCurrentCycle(cycle, state, activeOrders, recentFillItems) {
+                      const resumeLabel = document.getElementById('rebalanceHistoricalSource');
+                      const historical = cycle && cycle.startedAt && state && state.continuation;
+                      resumeLabel.hidden = !historical;
+                      resumeLabel.textContent = historical ? `历史 Cycle 续跑中 · 上次结束于 ${formatTime(state.continuation.endedAt)}` : '';
                       if (!cycle || !cycle.startedAt) {
                         setText('rebalanceCycleScenarioLabel', rebalanceScenarioLabel(null, state));
                         setText('rebalanceCyclePnl', '-');
@@ -2076,15 +2091,40 @@ public class HttpStatusServer implements AutoCloseable {
                       `;
                       }).join('');
                     }
+                """).concat("""
                     let continuationBusy = false;
+                    function confirmHistoricalContinuation(preview, button) {
+                      const dialog = document.getElementById('rebalanceContinuationDialog');
+                      const confirmButton = document.getElementById('rebalanceContinuationConfirm');
+                      const details = document.getElementById('rebalanceContinuationDetails');
+                      const rows = [
+                        ['选中的 Cycle', preview.endTime ? formatTime(preview.endTime) + ' 结束' : button.dataset.endLabel + ' 结束'],
+                        ['原始开始时间', preview.startedAt ? formatTime(preview.startedAt) : '—'],
+                        ['保留仓位', preview.retainedQty == null ? '—' : formatNumber(preview.retainedQty) + ' BTC'],
+                        ['续跑参考价', preview.referencePrice == null ? '—' : formatNumber(preview.referencePrice) + ' USDT'],
+                        ['当前行情', preview.currentPrice == null ? '—' : formatNumber(preview.currentPrice) + ' USDT'],
+                        ['相对参考价', preview.priceDifference == null ? '—' : formatNumber(preview.priceDifference) + ' USDT / ' + formatPercent(Number(preview.priceDifference) / Number(preview.referencePrice))],
+                        ['允许价格区间', preview.range ? formatNumber(preview.range.lowPrice) + ' — ' + formatNumber(preview.range.highPrice) : '—']
+                      ];
+                      details.innerHTML = '<table><tbody>' + rows.map(([key,value]) => `<tr><th>${esc(key)}</th><td>${esc(value)}</td></tr>`).join('') + '</tbody></table>'
+                        + '<h4>首轮预计委托</h4><table><thead><tr><th>方向</th><th>限价（USDT）</th><th>数量（BTC）</th></tr></thead><tbody>'
+                        + (preview.orders || []).map(order => `<tr><td>${order.side === 'BUY' ? (Number(preview.retainedQty) < 0 ? '买入减仓' : '买入加仓') : (Number(preview.retainedQty) < 0 ? '卖出加仓' : '卖出减仓')}</td><td>${esc(formatNumber(order.price))}</td><td>${esc(formatNumber(order.qty))}</td></tr>`).join('') + '</tbody></table>';
+                      document.getElementById('rebalanceContinuationMessage').textContent = [preview.message,preview.rangeSource,preview.settingsSource].filter(Boolean).join('；');
+                      confirmButton.disabled = !(preview.ok && preview.canContinue && preview.confirmation && preview.orders && preview.orders.length);
+                      return new Promise(resolve => {
+                        let accepted = false;
+                        confirmButton.onclick = () => { if (confirmButton.disabled) return; accepted = true; confirmButton.disabled = true; dialog.close(); };
+                        document.getElementById('rebalanceContinuationCancel').onclick = () => dialog.close();
+                        dialog.onclose = () => { confirmButton.onclick = null; dialog.onclose = null; resolve(accepted); };
+                        dialog.showModal();
+                      });
+                    }
                     async function continueEndedRebalanceCycle(executionId, button) {
                       if (continuationBusy) return;
                       continuationBusy = true; button.disabled = true;
                       try {
                         const preview = await fetch(`/api/rebalance-continue-cycle?executionId=${encodeURIComponent(executionId)}`).then(r=>r.json());
-                        if (!preview.ok || !preview.canContinue) { alert(preview.message || '当前无法续跑'); return; }
-                        const prompt = `继续原 Cycle？\n结束参考价：${formatNumber(preview.referencePrice)}\n当前价：${formatNumber(preview.currentPrice)}；价差：${formatNumber(preview.priceDifference)}\n续跑区间：${formatNumber(preview.range.lowPrice)} — ${formatNumber(preview.range.highPrice)}\n${preview.rangeSource}\n${preview.settingsSource}\n原成交、费用和盈亏继续累计。确认后可能立即提交实盘限价委托；恢复结果以交易所回报为准。`;
-                        if (!confirm(prompt)) return;
+                        if (!await confirmHistoricalContinuation(preview, button)) return;
                         const response = await fetch('/api/rebalance-continue-cycle', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({executionId,confirmation:preview.confirmation})});
                         const result = await response.json();
                         alert(result.message || (result.ok ? '续跑已登记' : '续跑未完成，请刷新核对'));
@@ -2139,7 +2179,7 @@ public class HttpStatusServer implements AutoCloseable {
                           <td>${esc(c.clientOrderId)}</td>
                           <td>${esc(c.executionId)}</td>
                           <td><button class="compact" data-action="rebalance-cycle-detail" data-execution-id="${esc(c.executionId)}">明细</button>
-                          ${c.canContinue ? `<button class="compact start" data-action="rebalance-cycle-continue" data-execution-id="${esc(c.executionId)}" ${continuationBusy?'disabled':''}>继续运行</button>` : ''}</td>
+                          ${c.canContinue ? `<button class="compact start" data-action="rebalance-cycle-continue" data-execution-id="${esc(c.executionId)}" data-end-label="${esc(formatTime(c.time))}" ${continuationBusy?'disabled':''}>继续运行</button>` : ''}</td>
                         </tr>
                       `).join('');
                       tbody.innerHTML = summaryRow + emptyRow + cycleRows;

@@ -40,6 +40,13 @@ public interface FillStore {
         throw new UnsupportedOperationException("Cycle continuation is not supported by this store");
     }
 
+    default FillRecord cycleEndRecord(String executionId) {
+        return recentCycles("RBAL:BTCUSDT",Integer.MAX_VALUE).stream().filter(f->f.executionId().equals(executionId)).findFirst().orElse(null);
+    }
+    default boolean continuationUsed(String executionId) { return false; }
+    default String continuationRevision(String symbol) { return "legacy"; }
+    default Set<String> excludedCycleExecutions(String symbol) { return Set.of(); }
+
     List<FillRecord> cycleFills(String cycleExecutionId);
 
     CycleFillPage cycleFillsPage(String cycleExecutionId, int limit, int offset);
