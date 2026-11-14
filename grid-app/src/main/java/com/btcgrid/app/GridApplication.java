@@ -20,6 +20,7 @@ import com.btcgrid.ledger.service.InMemoryStrategyLedger;
 import com.btcgrid.ledger.service.StrategyLedger;
 import com.btcgrid.strategy.model.StrategyRuntimeState;
 import com.btcgrid.strategy.model.StrategyStateSnapshot;
+import com.btcgrid.strategy.model.GridSafetyState;
 import com.btcgrid.strategy.service.ClientOrderIdFactory;
 import com.btcgrid.strategy.service.GridOrderPlanner;
 import com.btcgrid.strategy.service.GridStrategyEngine;
@@ -64,6 +65,8 @@ public class GridApplication {
         InstrumentSpec instrumentSpec = marketDataGateway.loadInstrumentSpec(config.symbol());
         MarketSnapshot snapshot = marketDataGateway.latestSnapshot(config.symbol());
         StrategyLedger strategyLedger = new InMemoryStrategyLedger(config.symbol());
+        BigDecimal profitSizingFeeRate = profitSizingEstimatedFeeRate(properties);
+        BigDecimal lossAddTriggerRate = lossAddTriggerRate(properties);
         GridStrategyEngine engine = new GridStrategyEngine(
                 config,
                 instrumentSpec,
@@ -72,7 +75,20 @@ public class GridApplication {
                 new GridOrderPlanner(
                         new ClientOrderIdFactory(),
                         profitableReduceSideMultiplier(properties),
-                        (market, ledger, orderPrice) -> currentCycleMarketPnl(fillStore, market, orderPrice).signum() > 0
+                        (market, ledger, orderPrice, orderQty) -> afterEstimatedOrderFee(
+                                currentCycleMarketPnl(fillStore, market, orderPrice),
+                                orderPrice,
+                                orderQty,
+                                profitSizingFeeRate
+                        ).signum() > 0,
+                        (market, ledger, orderPrice, orderQty) -> currentCycleLossRateAfterEstimatedFee(
+                                fillStore,
+                                market,
+                                orderPrice,
+                                orderQty,
+                                profitSizingFeeRate
+                        ).compareTo(lossAddTriggerRate.negate()) < 0,
+                        fillStore::profitSizingState
                 ),
                 true
         );
@@ -110,7 +126,6 @@ public class GridApplication {
                 eventLogger,
                 alertService
         );
-        repairFilledWorkingOrders(config.symbol(), fillStore, workingOrderRegistry);
         RuntimeConsistencyResult consistencyResult = new ActivePairConsistencyService()
                 .reconcile(engine.runtimeState(), workingOrderRegistry.snapshot());
         if (consistencyResult.corrected()) {
@@ -131,7 +146,9 @@ public class GridApplication {
                 engine.activeSpacing(),
                 Set.copyOf(processedExecutionIds),
                 List.copyOf(workingOrderRegistry.snapshot()),
-                config
+                config,
+                stateStore.load().filter(saved -> saved.ledgerSnapshot().netQty().compareTo(strategyLedger.snapshot().netQty()) == 0)
+                        .map(StrategyStateSnapshot::safetyState).orElse(null)
         ));
         eventLogger.info("startup.ready", java.util.Map.of(
                 "symbol", config.symbol(),
@@ -168,6 +185,15 @@ public class GridApplication {
                 workingOrderRegistry,
                 fillStore
         );
+        // A persisted UI stop lock also interlocks the direct auto-start path.
+        if (Boolean.TRUE.equals(liveControlService.controlState().get("flattenStopLocked"))) {
+            StrategyStateSnapshot saved = stateStore.load().orElseThrow();
+            GridSafetyState old = saved.safetyState();
+            stateStore.save(new StrategyStateSnapshot(saved.ledgerSnapshot(), saved.runtimeState(), saved.activeSpacing(),
+                    saved.processedExecutionIds(), saved.trackedWorkingOrders(), saved.cycleConfig(),
+                    new GridSafetyState(true, old == null ? null : old.flattenClientOrderId(), old == null ? null : old.executionsThrough(),
+                            old != null && old.ledgerTrusted(), old == null ? java.util.Map.of() : old.accountedExecutionQty())));
+        }
         new RuntimeStatusPublisher(
                 config.symbol(),
                 engine,
@@ -207,7 +233,8 @@ public class GridApplication {
                     new BybitSdkPrivateStreamGateway(properties.bybitSdkConfig()),
                     engine,
                     strategyLedger,
-                    new LiveCommandExecutor(tradeGateway, workingOrderRegistry, new RiskGuardService(config), eventLogger, alertService),
+                    new LiveCommandExecutor(tradeGateway, workingOrderRegistry, new RiskGuardService(config), eventLogger, alertService,
+                            config.category(), new BybitSdkAccountGateway(sdkClientFactory)),
                     new BybitSdkOrderQueryGateway(sdkClientFactory, config.category()),
                     new BybitSdkFundingFeeQueryGateway(sdkClientFactory, config.category()),
                     stateStore,
@@ -485,6 +512,74 @@ public class GridApplication {
         return new BigDecimal(properties.rawProperties().getProperty("grid.profitable-reduce-side-multiplier", "1.10").trim());
     }
 
+    private static BigDecimal profitSizingEstimatedFeeRate(GridProperties properties) {
+        return new BigDecimal(properties.rawProperties()
+                .getProperty("grid.profit-sizing-estimated-fee-rate", "0.0002")
+                .trim());
+    }
+
+    private static BigDecimal lossAddTriggerRate(GridProperties properties) {
+        return new BigDecimal(properties.rawProperties()
+                .getProperty("grid.loss-add-trigger-rate", "0.01")
+                .trim()).max(BigDecimal.ZERO);
+    }
+
+    static BigDecimal afterEstimatedOrderFee(
+            BigDecimal cyclePnl,
+            BigDecimal orderPrice,
+            BigDecimal orderQty,
+            BigDecimal feeRate
+    ) {
+        BigDecimal pnl = cyclePnl == null ? BigDecimal.ZERO : cyclePnl;
+        if (orderPrice == null || orderQty == null || feeRate == null
+                || orderPrice.signum() <= 0 || orderQty.signum() <= 0 || feeRate.signum() <= 0) {
+            return pnl;
+        }
+        return pnl.subtract(orderPrice.multiply(orderQty).multiply(feeRate));
+    }
+
+    static BigDecimal lossRateAfterEstimatedOrderFee(
+            BigDecimal cyclePnl,
+            BigDecimal cumulativeValue,
+            BigDecimal orderPrice,
+            BigDecimal orderQty,
+            BigDecimal feeRate
+    ) {
+        if (cumulativeValue == null || cumulativeValue.signum() == 0) {
+            return BigDecimal.ZERO;
+        }
+        return afterEstimatedOrderFee(cyclePnl, orderPrice, orderQty, feeRate)
+                .divide(cumulativeValue.abs(), 8, java.math.RoundingMode.HALF_UP);
+    }
+
+    static BigDecimal currentCycleLossRateAfterEstimatedFee(
+            FillStore fillStore,
+            MarketSnapshot marketSnapshot,
+            BigDecimal price,
+            BigDecimal orderQty,
+            BigDecimal feeRate
+    ) {
+        if (fillStore == null || marketSnapshot == null) {
+            return BigDecimal.ZERO;
+        }
+        BigDecimal pnlPrice = price == null || price.signum() <= 0 ? marketSnapshot.markPrice() : price;
+        CurrentCycleSummary cycle = fillStore.currentCycle(
+                marketSnapshot.symbol(),
+                Instant.now(),
+                pnlPrice
+        );
+        if (cycle == null) {
+            return BigDecimal.ZERO;
+        }
+        return lossRateAfterEstimatedOrderFee(
+                cycle.markPricePnl(),
+                cycle.cumulativeValue(),
+                pnlPrice,
+                orderQty,
+                feeRate
+        );
+    }
+
     private static BigDecimal currentCycleMarketPnl(FillStore fillStore, MarketSnapshot marketSnapshot, BigDecimal price) {
         if (fillStore == null || marketSnapshot == null) {
             return BigDecimal.ZERO;
@@ -494,16 +589,4 @@ public class GridApplication {
         return cycle == null || cycle.markPricePnl() == null ? BigDecimal.ZERO : cycle.markPricePnl();
     }
 
-    private static void repairFilledWorkingOrders(String symbol, FillStore fillStore, WorkingOrderRegistry workingOrderRegistry) {
-        Collection<String> openClientOrderIds = workingOrderRegistry.snapshot().stream()
-                .filter(order -> order.status() == com.btcgrid.common.model.OrderStatus.NEW)
-                .map(order -> order.clientOrderId())
-                .collect(Collectors.toSet());
-        Set<String> filledClientOrderIds = fillStore.filledClientOrderIds(symbol, openClientOrderIds);
-        if (filledClientOrderIds.isEmpty()) {
-            return;
-        }
-        Instant now = Instant.now();
-        filledClientOrderIds.forEach(clientOrderId -> workingOrderRegistry.markFilled(clientOrderId, now));
-    }
 }

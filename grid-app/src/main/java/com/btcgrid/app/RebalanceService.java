@@ -27,6 +27,8 @@ import com.btcgrid.strategy.service.ClientOrderIdFactory;
 import com.btcgrid.strategy.service.GridOrderPlanner;
 import com.btcgrid.strategy.service.GridStrategyEngine;
 import com.btcgrid.strategy.service.GridTriggerEvaluator;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Duration;
@@ -38,12 +40,14 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
 public class RebalanceService {
 
     public static final String CLIENT_ORDER_PREFIX = "RBAL_";
     private static final BigDecimal ABNORMAL_ASSET_CHANGE_THRESHOLD = new BigDecimal("0.20");
     private static final BigDecimal MIN_COMPARE_VALUE = new BigDecimal("0.00000001");
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     private final RebalanceSettings settings;
     private final BybitSdkMarketDataGateway marketDataGateway;
@@ -55,6 +59,8 @@ public class RebalanceService {
     private final AlertService alertService;
     private final InstrumentSpec instrumentSpec;
     private final Consumer<String> cycleEndObserver;
+    private final GridOrderPlanner orderPlanner;
+    private final RebalanceFillNotifier fillNotifier;
 
     private RebalanceState state;
     private GridStrategyEngine rebalanceEngine;
@@ -62,6 +68,18 @@ public class RebalanceService {
     private LiveCommandExecutor rebalanceCommandExecutor;
     private final Set<String> processedExecutionIds = ConcurrentHashMap.newKeySet();
     private Instant activeCycleStartedAt;
+    private RebalanceProfitExit profitExit;
+    private Function<BigDecimal, CurrentCycleSummary> cycleSummary;
+    private RebalanceWaterExit waterExit;
+    private RebalanceMonitorStore monitorStore;
+    private RebalanceMonitorRule activeMonitorRule;
+    private RebalanceCycleContinuation continuation;
+    private Consumer<RebalanceCycleContinuation> continuationWriter;
+    private boolean continuationRecoveryFailed;
+    private final RebalanceRequoteStore requoteStore;
+    private RebalanceRequoteStore.Plan pendingRequote;
+    private String latestTradingExecutionId;
+
 
     public RebalanceService(
             RebalanceSettings settings,
@@ -83,7 +101,8 @@ public class RebalanceService {
                 eventLogger,
                 alertService,
                 reason -> {
-                }
+                },
+                null
         );
     }
 
@@ -98,16 +117,47 @@ public class RebalanceService {
             AlertService alertService,
             Consumer<String> cycleEndObserver
     ) {
+        this(
+                settings,
+                marketDataGateway,
+                accountGateway,
+                tradeGateway,
+                workingOrderRegistry,
+                stateStore,
+                eventLogger,
+                alertService,
+                cycleEndObserver,
+                null
+        );
+    }
+
+    public RebalanceService(
+            RebalanceSettings settings,
+            BybitSdkMarketDataGateway marketDataGateway,
+            BybitAccountGateway accountGateway,
+            BybitTradeGateway tradeGateway,
+            WorkingOrderRegistry workingOrderRegistry,
+            FileRebalanceStateStore stateStore,
+            EventLogger eventLogger,
+            AlertService alertService,
+            Consumer<String> cycleEndObserver,
+            GridOrderPlanner orderPlanner
+    ) {
         this.settings = settings;
         this.marketDataGateway = marketDataGateway;
         this.accountGateway = accountGateway;
         this.tradeGateway = tradeGateway;
         this.workingOrderRegistry = workingOrderRegistry;
         this.stateStore = stateStore;
+        this.requoteStore = new RebalanceRequoteStore(settings.stateFilePath());
+        this.pendingRequote = requoteStore.load();
         this.eventLogger = eventLogger;
         this.alertService = alertService;
+        this.fillNotifier = new RebalanceFillNotifier(
+                FeishuNotifier.fromEnvironment(System.getenv(), eventLogger)::send);
         this.cycleEndObserver = cycleEndObserver == null ? reason -> {
         } : cycleEndObserver;
+        this.orderPlanner = orderPlanner;
         this.instrumentSpec = settings.enabled() ? marketDataGateway.loadInstrumentSpec(settings.symbol()) : null;
         this.state = stateStore.load().orElseGet(() -> RebalanceState.initial(settings.enabled(), settings.symbol()));
         if (state.activeOrder() != null && isRebalanceClientOrder(state.activeOrder().clientOrderId())) {
@@ -115,9 +165,151 @@ public class RebalanceService {
         }
     }
 
+    public synchronized void configureProfitExit(
+            RebalanceProfitExit.Exchange exchange,
+            java.util.function.Function<BigDecimal, CurrentCycleSummary> summary,
+            Consumer<FillEvent> persistenceObserver) {
+        cycleSummary = summary;
+        java.nio.file.Path controlPath = PathResolver.absolutePath(settings.stateFilePath() + ".profit-exit.json");
+        profitExit = new RebalanceProfitExit(controlPath, settings, instrumentSpec, exchange,
+                tradeGateway, workingOrderRegistry, summary, fill -> {
+                    if (!processedExecutionIds.contains(fill.executionId())) {
+                        onExecution(fill, "profit-exit-reconcile", () -> persistenceObserver.accept(fill));
+                    }
+                }, eventLogger);
+        if (profitExit.armed() && settings.category() != ProductCategory.LINEAR) {
+            throw new IllegalStateException("Profit exit currently supports linear cycle accounting only");
+        }
+        if (settings.category() == ProductCategory.LINEAR) {
+            waterExit = new RebalanceWaterExit(PathResolver.absolutePath(settings.stateFilePath() + ".water-exit.json"),
+                    settings, instrumentSpec, exchange, tradeGateway, workingOrderRegistry, summary, fill -> {
+                        if (!processedExecutionIds.contains(fill.executionId()))
+                            onExecution(fill, "water-exit-reconcile", () -> persistenceObserver.accept(fill));
+                    });
+        }
+    }
+
+    public synchronized void configureMonitorStore(RebalanceMonitorStore store) {
+        this.monitorStore = store;
+        this.activeMonitorRule = store.active().orElse(null);
+    }
+
+    public synchronized void configureContinuation(RebalanceCycleContinuation value,
+            Consumer<RebalanceCycleContinuation> writer) {
+        continuation = value;
+        continuationWriter = writer;
+    }
+
+    public synchronized RebalanceCycleContinuation continuation() { return continuation; }
+
+    /** No initial-position order: restore the original ledger and recover its pair. */
+    public synchronized void continueEndedCycle(List<FillRecord> fills, FillRecord end,
+            RebalanceCycleContinuation context, Runnable commit, Runnable reconcileFunding) {
+        if (!settings.enabled() || rebalanceCycleActive() || workingOrderRegistry.hasPendingCancellation()
+                || !activeRebalanceOrders().isEmpty())
+            throw new IllegalStateException("当前 Cycle 或委托尚未空闲，无法续跑");
+        if (fills == null || fills.isEmpty() || end == null || end.cumulativeQty() == null
+                || end.cumulativeQty().signum() == 0 || !end.symbol().equals(context.symbol())
+                || !end.symbol().equals("RBAL:"+settings.symbol())
+                || !fills.get(0).time().equals(context.cycleStartedAt())
+                || end.price().compareTo(context.referencePrice()) != 0)
+            throw new IllegalStateException("原 Cycle 的持仓或结束价证据不完整");
+        MarketSnapshot market = marketDataGateway.latestSnapshot(settings.symbol());
+        AccountAssetSnapshot account = accountGateway.walletSnapshot(settings.accountType(), settings.baseCoin(),
+                settings.quoteCoin(), settings.category(), settings.symbol());
+        Instant now = Instant.now();
+        if (!fresh(market.timestamp(),now) || !fresh(account.timestamp(),now)
+                || account.totalEquityUsdt().signum() <= 0)
+            throw new IllegalStateException("行情或账户快照过期，无法续跑");
+        if (!context.contains(market.lastPrice()))
+            throw new IllegalStateException("当前价格不在续跑区间内，未恢复、未下单");
+        BigDecimal actual = settings.category() == ProductCategory.LINEAR
+                ? account.contractPositionQty() : account.baseWalletBalance();
+        // A Cycle owns only its own fills. Pre-existing account inventory is a
+        // separate reserve, so total exchange position need not equal Cycle qty.
+        if (actual.signum() != end.cumulativeQty().signum()
+                || actual.abs().compareTo(end.cumulativeQty().abs()) < 0)
+            throw new IllegalStateException("交易所实际仓位的方向或数量不足以承接原 Cycle，请先核对");
+        if (profitExit != null && profitExit.armed())
+            throw new IllegalStateException("仍有未解除的平仓指令，不能续跑");
+        // Crash-safe order: durable ledger boundary first, then memory, then orders.
+        // A failure after commit leaves the old Cycle open for normal startup recovery.
+        commit.run();
+        continuation = context;
+        try {
+            restoreActiveCycle(fills,List.of());
+            verifyContinuationFunding(reconcileFunding);
+            onPoll();
+            eventLogger.info("rebalance.cycle.continued", Map.of("endExecutionId",end.executionId(),
+                    "referencePrice",context.referencePrice(),"currentPrice",market.lastPrice(),
+                    "cycleStartedAt",context.cycleStartedAt().toString()));
+        } catch (RuntimeException e) {
+            continuationRecoveryFailed = true;
+            save(stateWith("GRID_ACTIVE","续跑已登记，恢复待核对："+e.getMessage()));
+            throw new IllegalStateException("续跑已登记，恢复尚未完成；请核对状态，勿重复下单",e);
+        }
+    }
+
+    public synchronized void verifyContinuationFunding(Runnable reconcileFunding) {
+        if (continuation == null || continuation.ready()) return;
+        reconcileFunding.run();
+        RebalanceCycleContinuation verified = continuation.verified();
+        continuationWriter.accept(verified); continuation = verified;
+        continuationRecoveryFailed = false;
+    }
+
+    private static boolean fresh(Instant at, Instant now) {
+        return at != null && !at.isAfter(now.plusSeconds(5)) && !at.isBefore(now.minusSeconds(30));
+    }
+
+    public synchronized void requestManualCycleExit() {
+        if (profitExit == null || !rebalanceCycleActive() || activeCycleStartedAt == null)
+            throw new IllegalStateException("No active rebalance cycle to close");
+        profitExit.armManual(activeCycleStartedAt);
+    }
+
+    public synchronized BigDecimal requestManualReduction() {
+        if (waterExit == null || !rebalanceCycleActive() || activeCycleStartedAt == null)
+            throw new IllegalStateException("没有运行中的 Cycle");
+        if (profitExit != null && profitExit.armed())
+            throw new IllegalStateException("当前 Cycle 已有平仓指令，请等待完成");
+        BigDecimal qty = waterExit.requestManualReduction(marketDataGateway.latestSnapshot(settings.symbol()));
+        eventLogger.info("rebalance.water.manual-reduce", Map.of("qty", qty, "cycleStartedAt", activeCycleStartedAt.toString()));
+        save(stateWith("GRID_ACTIVE", waterExit.message()));
+        return qty;
+    }
+
+    public synchronized boolean resumeAfterManualCycleExit() {
+        return profitExit != null && profitExit.releaseCompletedManual();
+    }
+
+    public synchronized BigDecimal requestManualAddition() {
+        if (waterExit == null || !rebalanceCycleActive() || activeCycleStartedAt == null)
+            throw new IllegalStateException("没有运行中的 Cycle");
+        if (profitExit != null && profitExit.armed())
+            throw new IllegalStateException("当前 Cycle 已有平仓指令，请等待完成");
+        BigDecimal qty = waterExit.requestManualAddition(marketDataGateway.latestSnapshot(settings.symbol()));
+        eventLogger.info("rebalance.water.manual-add", Map.of("qty", qty, "cycleStartedAt", activeCycleStartedAt.toString()));
+        save(stateWith("GRID_ACTIVE", waterExit.message()));
+        return qty;
+    }
+
+    public synchronized boolean isManualAdjustmentOrder(String clientOrderId) {
+        return RebalanceManualAdjustment.isManualOrder(clientOrderId)
+                || (waterExit != null && waterExit.isManualAdjustmentOrder(clientOrderId));
+    }
+
+    public synchronized BigDecimal gridReferencePrice() {
+        return rebalanceLedger == null ? null : rebalanceLedger.snapshot().lastFillPrice();
+    }
+
     public synchronized void onPoll() {
         if (!settings.enabled()) {
             save(stateWith("DISABLED", "rebalance disabled"));
+            return;
+        }
+        if (continuationRecoveryFailed || (continuation != null && !continuation.ready())) {
+            save(stateWith("GRID_ACTIVE","续跑恢复待核对，自动下单保持阻断"));
             return;
         }
         try {
@@ -129,6 +321,30 @@ public class RebalanceService {
                     settings.category(),
                     settings.symbol()
             );
+            if (continuation != null && (!fresh(marketSnapshot.timestamp(),Instant.now())
+                    || !fresh(accountSnapshot.timestamp(),Instant.now()))) {
+                save(stateWith("GRID_ACTIVE","续跑行情或账户快照过期，暂停挂单")); return;
+            }
+            if (continuation != null && rebalanceCycleActive() && !continuation.contains(marketSnapshot.lastPrice())) {
+                cancelActiveOrder("continuation price outside saved range");
+                save(stateForSnapshot("GRID_ACTIVE",marketSnapshot,accountSnapshot,state.targetRatio(),
+                        state.currentRatio(),state.ratioSamples(),"续跑价格超出保存区间，暂停挂单"));
+                return;
+            }
+            if (profitExit != null && profitExit.poll(marketSnapshot, activeCycleStartedAt)) {
+                if (profitExit.complete() && rebalanceCycleActive()) {
+                    if (waterExit != null) waterExit.finishExternalExit();
+                    cycleEndObserver.accept(profitExit.message());
+                    rebalanceEngine = null;
+                    rebalanceLedger = null;
+                    rebalanceCommandExecutor = null;
+                    activeCycleStartedAt = null;
+                    clearActiveMonitorRule();
+                }
+                if (profitExit.complete() && activeMonitorRule != null) clearActiveMonitorRule();
+                save(stateWith(profitExit.complete() || !rebalanceCycleActive() ? "IDLE" : "GRID_ACTIVE", profitExit.message()));
+                return;
+            }
             BigDecimal price = marketSnapshot.lastPrice();
             BigDecimal totalEquity = accountSnapshot.totalEquityUsdt();
             if (price.signum() <= 0 || totalEquity.signum() <= 0) {
@@ -154,7 +370,31 @@ public class RebalanceService {
                 BigDecimal lockedTargetRatio = lockedCycleTargetRatio(targetRatio);
                 TradeSide cycleSide = cycleEntrySide();
                 boolean flat = rebalanceGridFlat(cycleSide);
-                boolean reached = !flat && targetReached(currentRatio, lockedTargetRatio, cycleSide);
+                if (continuation != null && !continuation.targetRearmed()
+                        && !targetReached(currentRatio,lockedTargetRatio,cycleSide)) {
+                    RebalanceCycleContinuation next = continuation.rearmed();
+                    continuationWriter.accept(next); continuation = next;
+                }
+                boolean reached = !flat && (continuation == null || continuation.targetRearmed())
+                        && !(profitExit != null && profitExit.armed())
+                        && targetReached(currentRatio, lockedTargetRatio, cycleSide);
+                String previousWaterPhase = waterExit == null ? null : waterExit.phase();
+                boolean waterBlocked = waterExit != null && waterExit.poll(marketSnapshot, activeCycleStartedAt, reached || flat);
+                if (waterExit != null && !waterExit.phase().equals(previousWaterPhase)) {
+                    eventLogger.info("rebalance.water.phase", Map.of("from", previousWaterPhase,
+                            "to", waterExit.phase(), "message", waterExit.message()));
+                }
+                if (waterBlocked) {
+                    if (waterExit.complete()) {
+                        stopRebalanceGrid(waterExit.message());
+                        save(stateForSnapshot("IDLE", marketSnapshot, accountSnapshot, lockedTargetRatio, currentRatio, samples,
+                                waterExit.message()));
+                    } else {
+                        save(stateForSnapshot("GRID_ACTIVE", marketSnapshot, accountSnapshot, lockedTargetRatio, currentRatio, samples,
+                                waterExit.message()));
+                    }
+                    return;
+                }
                 if (reached || flat) {
                     String reason = reached
                             ? "target ratio reached; rebalance grid stopped"
@@ -169,8 +409,36 @@ public class RebalanceService {
                 recoverMissingPairIfNeeded(marketSnapshot);
                 save(stateForSnapshot("GRID_ACTIVE", marketSnapshot, accountSnapshot, lockedTargetRatio, currentRatio, samples,
                         rebalanceGridRunning()
-                                ? "rebalance grid running with locked target ratio"
+                                ? profitExit != null && profitExit.armed() ? profitExit.message() : "rebalance grid running with locked target ratio"
                                 : "rebalance cycle active; waiting for grid fills or target"));
+                return;
+            }
+            if (waterExit != null && waterExit.frozen()
+                    && waterExit.poll(marketSnapshot, null, false)) {
+                save(stateWith("WAITING", waterExit.message()));
+                return;
+            }
+            if (monitorStore != null && monitorStore.configured()) {
+                if (activeMonitorRule != null) clearActiveMonitorRule();
+                if (!idleForMonitorStart()) {
+                    save(stateForSnapshot("WAITING", marketSnapshot, accountSnapshot, BigDecimal.ZERO,
+                            currentRatio, samples, "monitor waiting for Cycle and orders to become idle"));
+                    return;
+                }
+                RebalanceMonitorRule selected = monitorStore.rules().stream()
+                        .filter(rule -> rule.matches(price, currentRatio))
+                        .findFirst().orElse(null);
+                if (selected == null) {
+                    save(stateForSnapshot("IDLE", marketSnapshot, accountSnapshot, BigDecimal.ZERO,
+                            currentRatio, samples, "monitor waiting for an enabled price and ratio condition"));
+                    return;
+                }
+                activeMonitorRule = selected;
+                monitorStore.setActive(selected);
+                startRebalanceGrid(marketSnapshot, accountSnapshot, selected.side(),
+                        selected.gridQty().multiply(selected.initialSteps()),
+                        selected.targetRatio(), currentRatio, samples);
+                if (!rebalanceCycleActive()) clearActiveMonitorRule();
                 return;
             }
             if (settings.mode() == RebalanceMode.AUTO_CYCLE) {
@@ -190,6 +458,57 @@ public class RebalanceService {
                 BigDecimal initialQty = settings.autoBaseGridQty().multiply(settings.autoInitialSteps());
                 startRebalanceGrid(marketSnapshot, accountSnapshot, TradeSide.BUY, initialQty,
                         BigDecimal.ONE, currentRatio, samples);
+                return;
+            }
+            if (settings.mode() == RebalanceMode.AUTO_SHORT_CYCLE
+                    || settings.mode() == RebalanceMode.AUTO_LONG_BELOW) {
+                RebalanceBand shortBand = settings.bands().stream()
+                        .min(Comparator.comparing(RebalanceBand::priceFloor))
+                        .orElseThrow(() -> new IllegalStateException("auto short cycle requires a price threshold and target ratio"));
+                BigDecimal thresholdPrice = shortBand.priceFloor();
+                BigDecimal shortTargetRatio = shortBand.targetRatio();
+                if (!idleForAutoCycleStart()) {
+                    save(stateForSnapshot(state.status(), marketSnapshot, accountSnapshot, shortTargetRatio, currentRatio, samples,
+                            "automatic cycle start blocked; state must be IDLE with no active cycle or orders"));
+                    return;
+                }
+                if (price.compareTo(thresholdPrice) < 0) {
+                    if (currentRatio.compareTo(BigDecimal.ONE) >= 0) {
+                        save(stateForSnapshot("IDLE", marketSnapshot, accountSnapshot, BigDecimal.ONE, currentRatio, samples,
+                                "auto long cycle idle; BTC ratio reached 100%"));
+                        return;
+                    }
+                    BigDecimal initialQty = settings.autoBaseGridQty().multiply(settings.autoInitialSteps());
+                    startRebalanceGrid(marketSnapshot, accountSnapshot, TradeSide.BUY, initialQty,
+                            BigDecimal.ONE, currentRatio, samples);
+                    return;
+                }
+                if (settings.mode() == RebalanceMode.AUTO_LONG_BELOW) {
+                    save(stateForSnapshot("IDLE", marketSnapshot, accountSnapshot, BigDecimal.ONE, currentRatio, samples,
+                            "auto long cycle waiting; BTC price must be below "
+                                    + thresholdPrice.stripTrailingZeros().toPlainString()));
+                    return;
+                }
+                if (price.compareTo(thresholdPrice) == 0) {
+                    save(stateForSnapshot("IDLE", marketSnapshot, accountSnapshot, shortTargetRatio, currentRatio, samples,
+                            "automatic cycle waiting; BTC price equals trigger threshold "
+                                    + thresholdPrice.stripTrailingZeros().toPlainString()));
+                    return;
+                }
+                if (currentRatio.compareTo(shortTargetRatio) <= 0) {
+                    save(stateForSnapshot("IDLE", marketSnapshot, accountSnapshot, shortTargetRatio, currentRatio, samples,
+                            "auto short cycle idle; BTC ratio reached target"));
+                    return;
+                }
+                BigDecimal targetBaseQty = totalEquity.multiply(shortTargetRatio).divide(price, 8, RoundingMode.HALF_UP);
+                BigDecimal rawQty = accountSnapshot.netBaseQty().subtract(targetBaseQty);
+                if (rawQty.signum() <= 0) {
+                    save(stateForSnapshot("WAITING", marketSnapshot, accountSnapshot, shortTargetRatio, currentRatio, samples,
+                            "calculated short quantity is below tradable minimum"));
+                    return;
+                }
+                startRebalanceGrid(marketSnapshot, accountSnapshot, TradeSide.SELL, rawQty,
+                        shortTargetRatio, currentRatio, samples);
                 return;
             }
             BigDecimal targetRatio = targetRatio(price, false);
@@ -236,6 +555,7 @@ public class RebalanceService {
         if (tradingFills.isEmpty() && activeOrders.isEmpty()) {
             return;
         }
+        latestTradingExecutionId = tradingFills.isEmpty() ? null : tradingFills.get(tradingFills.size()-1).executionId();
         BigDecimal netQty = tradingFills.isEmpty()
                 ? BigDecimal.ZERO
                 : zero(tradingFills.get(tradingFills.size() - 1).cumulativeQty());
@@ -245,21 +565,43 @@ public class RebalanceService {
         TradeSide entrySide = tradingFills.isEmpty()
                 ? (netQty.signum() < 0 ? TradeSide.SELL : TradeSide.BUY)
                 : ("SELL".equals(tradingFills.get(0).side()) ? TradeSide.SELL : TradeSide.BUY);
-        ensureCommandExecutor(entrySide, settings.maxInitialSteps());
+        for (FillRecord fill : tradingFills) {
+            fillNotifier.accept(new FillEvent(fill.executionId(), fill.symbol(), fill.clientOrderId(),
+                    TradeSide.valueOf(fill.side()), fill.qty(), fill.price(), fill.time()),
+                    cycleBaseGridQty(entrySide), true);
+        }
+        ensureCommandExecutor(entrySide, activeMonitorRule == null ? settings.maxInitialSteps() : activeMonitorRule.initialSteps());
         if (!tradingFills.isEmpty()) {
             rebalanceLedger.restore(snapshotFromFills(tradingFills, netQty));
+            FillRecord referenceOrder = tradingFills.stream().filter(f -> !RebalanceManualAdjustment.isManual(f))
+                    .reduce((a,b) -> b).orElse(null);
+            ((RebalanceStrategyLedger)rebalanceLedger).restoreReferenceOrder(referenceOrder == null ? null : referenceOrder.clientOrderId());
             activeCycleStartedAt = tradingFills.get(0).time();
+            if (continuation != null && waterExit != null)
+                waterExit.resumeCompletedForContinuation(activeCycleStartedAt);
+            if (continuation != null && continuation.cycleStartedAt().equals(activeCycleStartedAt)
+                    && tradingFills.stream().noneMatch(f -> !RebalanceManualAdjustment.isManual(f)
+                        && !f.time().isBefore(continuation.resumedAt()))) {
+                StrategyLedgerSnapshot old = rebalanceLedger.snapshot();
+                rebalanceLedger.restore(new StrategyLedgerSnapshot(old.symbol(),old.netQty(),old.avgEntryPrice(),
+                        old.realizedPnl(),old.floatingPnl(),old.previousFillPrice(),continuation.referencePrice(),
+                        old.lastFillSide(),old.lastFillZone(),old.consecutiveBuyFills(),old.consecutiveSellFills(),
+                        old.inventoryMode(),old.updatedAt()));
+            }
+
         }
+        BigDecimal restoredTargetRatio = continuation != null
+                ? continuation.targetRatio() : restoredCycleTargetRatio(tradingFills);
         ActiveOrderPair pair = activePairFromOrders(activeOrders);
         rebalanceEngine.restore(
                 new StrategyRuntimeState(pair == null ? GridState.WAITING_TRIGGER : GridState.GRID_ACTIVE, pair, Instant.now()),
-                null
+                pair == null ? null : restoredPairSpacing(pair)
         );
         save(new RebalanceState(
                 settings.enabled(),
                 settings.symbol(),
                 "GRID_ACTIVE",
-                state.targetRatio(),
+                restoredTargetRatio,
                 state.currentRatio(),
                 state.baseBalance(),
                 state.contractPositionQty(),
@@ -278,17 +620,54 @@ public class RebalanceService {
                 "symbol", settings.symbol(),
                 "fills", tradingFills.size(),
                 "openOrders", activeOrders.size(),
-                "netQty", netQty
+                "netQty", netQty,
+                "targetRatio", restoredTargetRatio
         ));
     }
 
+    private BigDecimal restoredCycleTargetRatio(List<FillRecord> tradingFills) {
+        if (activeMonitorRule != null) return currentMonitorTargetRatio();
+        for (FillRecord fill : tradingFills) {
+            if (fill.configJson() == null || fill.configJson().isBlank()) {
+                continue;
+            }
+            try {
+                JsonNode target = OBJECT_MAPPER.readTree(fill.configJson()).path("targetRatio");
+                if (!target.isMissingNode() && !target.isNull()) {
+                    BigDecimal value = target.decimalValue();
+                    if (value.signum() > 0) {
+                        return value;
+                    }
+                }
+            } catch (RuntimeException | java.io.IOException ignored) {
+                // Older cycle metadata may not be JSON; fall back to the persisted state.
+            }
+        }
+        return state.targetRatio();
+    }
+
     public synchronized boolean onExecution(FillEvent fillEvent, String source) {
+        return onExecution(fillEvent, source, () -> {
+        });
+    }
+
+    public synchronized boolean onExecution(
+            FillEvent fillEvent,
+            String source,
+            Runnable afterLedgerApplied
+    ) {
         if (!isRebalanceFill(fillEvent)) {
             return false;
         }
         if (fillEvent.executionId() != null
                 && !fillEvent.executionId().isBlank()
                 && !processedExecutionIds.add(fillEvent.executionId())) {
+            // A later standard execution message may carry the fee omitted by
+            // an earlier fast message. Keep strategy processing idempotent but
+            // let the persistence observer reconcile richer accounting data.
+            if (afterLedgerApplied != null) {
+                afterLedgerApplied.run();
+            }
             eventLogger.warn("rebalance.fill.duplicate", Map.of(
                     "source", source,
                     "executionId", fillEvent.executionId(),
@@ -297,6 +676,8 @@ public class RebalanceService {
             ));
             return false;
         }
+        latestTradingExecutionId = fillEvent.executionId();
+        discardPendingRequote();
         workingOrderRegistry.markFilled(fillEvent.clientOrderId(), fillEvent.fillTime() == null ? Instant.now() : fillEvent.fillTime());
         if (activeCycleStartedAt == null) {
             activeCycleStartedAt = fillEvent.fillTime() == null ? Instant.now() : fillEvent.fillTime();
@@ -312,9 +693,58 @@ public class RebalanceService {
         ));
         boolean cycleWasActive = rebalanceCycleActive();
         TradeSide cycleSide = cycleEntrySide();
-        if (rebalanceEngine != null && rebalanceLedger != null && rebalanceCommandExecutor != null) {
+        boolean fillObserved = false;
+        BigDecimal notificationBaseQty = cycleBaseGridQty(cycleSide == null ? fillEvent.side() : cycleSide);
+        MarketSnapshot fillMarketSnapshot = null;
+        boolean manualAdjustment = isManualAdjustmentOrder(fillEvent.clientOrderId());
+        boolean outsideContinuationRange = false;
+        if (continuation != null) {
+            try {
+                MarketSnapshot observed = marketDataGateway.latestSnapshot(settings.symbol());
+                outsideContinuationRange = !continuation.ready() || continuationRecoveryFailed
+                        || !fresh(observed.timestamp(),Instant.now()) || !continuation.contains(observed.lastPrice());
+            }
+            catch (RuntimeException ignored) { outsideContinuationRange = true; }
+        }
+        boolean waterAccountingOnly = manualAdjustment || outsideContinuationRange || (waterExit != null && waterExit.frozen());
+        if (waterExit != null && !waterAccountingOnly && !(profitExit != null && profitExit.frozen())) {
+            try {
+                fillMarketSnapshot = marketDataGateway.latestSnapshot(settings.symbol());
+                waterExit.beforeFill(fillEvent, fillMarketSnapshot);
+                waterAccountingOnly = waterExit.frozen();
+                if (waterAccountingOnly) eventLogger.info("rebalance.water.fill-freeze", Map.of("executionId", fillEvent.executionId()));
+            } catch (RuntimeException e) {
+                // Execution accounting must succeed even when a market/evidence request fails.
+                waterAccountingOnly = true;
+                eventLogger.warn("rebalance.water.fill-check.failed", Map.of("message", String.valueOf(e.getMessage())));
+            }
+        }
+        if ((isAccountingOnlyCorrectionOrder(fillEvent.clientOrderId())
+                || (profitExit != null && profitExit.frozen()) || waterAccountingOnly) && rebalanceLedger != null) {
+            StrategyLedgerSnapshot reference = manualAdjustment ? rebalanceLedger.snapshot() : null;
+            rebalanceLedger.applyFill(fillEvent);
+            if (reference != null && rebalanceLedger.snapshot().netQty().signum() != 0) {
+                StrategyLedgerSnapshot accounting = rebalanceLedger.snapshot();
+                rebalanceLedger.restore(new StrategyLedgerSnapshot(
+                        accounting.symbol(), accounting.netQty(), accounting.avgEntryPrice(), accounting.realizedPnl(),
+                        accounting.floatingPnl(), reference.previousFillPrice(), reference.lastFillPrice(),
+                        reference.lastFillSide(), reference.lastFillZone(), reference.consecutiveBuyFills(),
+                        reference.consecutiveSellFills(), accounting.inventoryMode(), accounting.updatedAt()));
+            }
+            recordAndNotifyFill(fillEvent, notificationBaseQty, afterLedgerApplied, fillMarketSnapshot);
+            fillObserved = true;
+            eventLogger.info("rebalance.fill.correction-applied", Map.of(
+                    "executionId", fillEvent.executionId(),
+                    "clientOrderId", fillEvent.clientOrderId(),
+                    "symbol", fillEvent.symbol(),
+                    "side", fillEvent.side().name(),
+                    "qty", fillEvent.fillQty()
+            ));
+        } else if (rebalanceEngine != null && rebalanceLedger != null && rebalanceCommandExecutor != null) {
             MarketSnapshot marketSnapshot = marketDataGateway.latestSnapshot(settings.symbol());
-            List<StrategyCommand> commands = rebalanceEngine.onFill(fillEvent, marketSnapshot);
+            List<StrategyCommand> commands = rebalanceEngine.onFill(fillEvent, marketSnapshot,
+                    () -> recordAndNotifyFill(fillEvent, notificationBaseQty, afterLedgerApplied, marketSnapshot));
+            fillObserved = true;
             List<String> failures = rebalanceCommandExecutor.execute(commands, rebalanceLedger.snapshot());
             if (!failures.isEmpty()) {
                 eventLogger.error("rebalance.grid.command.failed", Map.of(
@@ -328,6 +758,9 @@ public class RebalanceService {
                 save(stateWith("IDLE", reason));
                 return true;
             }
+        }
+        if (!fillObserved) {
+            recordAndNotifyFill(fillEvent, notificationBaseQty, afterLedgerApplied, fillMarketSnapshot);
         }
         boolean cycleStillActive = cycleWasActive || rebalanceCycleActive();
         save(new RebalanceState(
@@ -352,9 +785,41 @@ public class RebalanceService {
         return true;
     }
 
+    private void recordAndNotifyFill(FillEvent fill, BigDecimal baseQty,
+            Runnable persistenceObserver, MarketSnapshot marketSnapshot) {
+        if (persistenceObserver != null) {
+            persistenceObserver.run();
+        }
+        fillNotifier.accept(fill, baseQty, false, () -> notificationCycleSummary(marketSnapshot), settings.quoteCoin());
+    }
+
+    private CurrentCycleSummary notificationCycleSummary(MarketSnapshot marketSnapshot) {
+        if (cycleSummary == null) {
+            return null;
+        }
+        try {
+            MarketSnapshot market = marketSnapshot == null
+                    ? marketDataGateway.latestSnapshot(settings.symbol()) : marketSnapshot;
+            if (market == null || market.markPrice() == null || market.markPrice().signum() <= 0) {
+                return null;
+            }
+            return cycleSummary.apply(market.markPrice());
+        } catch (RuntimeException e) {
+            eventLogger.warn("rebalance.feishu.cycle-pnl.unavailable", Map.of("reason", e.getClass().getSimpleName()));
+            return null;
+        }
+    }
+
     public synchronized boolean onOrderUpdate(String symbol, String clientOrderId, OrderStatus status, Instant updatedAt) {
         if (!isRebalanceClientOrder(clientOrderId) || !settings.symbol().equalsIgnoreCase(symbol)) {
             return false;
+        }
+        if (state != null && "IDLE".equals(state.status())
+                && (status == OrderStatus.CANCELED || status == OrderStatus.EXPIRED || status == OrderStatus.FILLED)) {
+            // Cycle shutdown saves IDLE after canceling the remaining opposite order. Its asynchronous
+            // terminal update can arrive later and must not turn the strategy-level state back into an
+            // order-level status, otherwise strict auto-cycle idle gating can never start the next cycle.
+            return true;
         }
         if ((status == OrderStatus.CANCELED || status == OrderStatus.EXPIRED || status == OrderStatus.FILLED)
                 && !rebalanceCycleActive()) {
@@ -383,6 +848,11 @@ public class RebalanceService {
 
     public static boolean isRebalanceClientOrder(String clientOrderId) {
         return clientOrderId != null && clientOrderId.startsWith(CLIENT_ORDER_PREFIX);
+    }
+
+    static boolean isAccountingOnlyCorrectionOrder(String clientOrderId) {
+        return clientOrderId != null && (clientOrderId.contains("_PS_fix") || clientOrderId.startsWith("RBAL_WATER_")
+                || RebalanceManualAdjustment.isManualOrder(clientOrderId));
     }
 
     public String symbol() {
@@ -449,7 +919,7 @@ public class RebalanceService {
             BigDecimal currentRatio,
             List<BigDecimal> samples
     ) {
-        BigDecimal effectiveSteps = effectiveInitialSteps(rawQty);
+        BigDecimal effectiveSteps = effectiveInitialSteps(rawQty, side);
         if (effectiveSteps.signum() <= 0) {
             save(stateForSnapshot("WAITING", marketSnapshot, accountSnapshot, targetRatio, currentRatio, samples,
                     "calculated quantity is below initial grid size"));
@@ -489,7 +959,7 @@ public class RebalanceService {
                     "mode", settings.mode().configValue(),
                     "side", side.name(),
                     "effectiveInitialSteps", effectiveSteps,
-                    "baseGridQty", cycleBaseGridQty(),
+                    "baseGridQty", cycleBaseGridQty(side),
                     "targetRatio", targetRatio,
                     "currentRatio", currentRatio
             ));
@@ -510,13 +980,15 @@ public class RebalanceService {
         GridStrategyConfig config = gridConfig(side, effectiveInitialSteps);
         if (rebalanceLedger == null || rebalanceEngine == null || rebalanceCommandExecutor == null
                 || rebalanceEngine.config().entryDirection() != config.entryDirection()) {
-            rebalanceLedger = new InMemoryStrategyLedger(settings.symbol());
+            rebalanceLedger = new RebalanceStrategyLedger(settings.symbol());
             rebalanceEngine = new GridStrategyEngine(
                     config,
                     instrumentSpec,
                     rebalanceLedger,
                     new GridTriggerEvaluator(),
-                    new GridOrderPlanner(new ClientOrderIdFactory("RBAL")),
+                    orderPlanner == null
+                            ? new GridOrderPlanner(new ClientOrderIdFactory("RBAL"))
+                            : orderPlanner,
                     true
             );
             rebalanceCommandExecutor = new LiveCommandExecutor(
@@ -531,8 +1003,8 @@ public class RebalanceService {
 
     private GridStrategyConfig gridConfig(TradeSide side, BigDecimal effectiveInitialSteps) {
         EntryDirection entryDirection = side == TradeSide.BUY ? EntryDirection.LONG_ONLY : EntryDirection.SHORT_ONLY;
-        BigDecimal baseGridQty = cycleBaseGridQty();
-        BigDecimal maxOrderQty = settings.mode() == RebalanceMode.AUTO_CYCLE
+        BigDecimal baseGridQty = cycleBaseGridQty(side);
+        BigDecimal maxOrderQty = isAutoCycleMode()
                 ? settings.maxOrderQty().max(baseGridQty.multiply(effectiveInitialSteps))
                 : settings.maxOrderQty();
         return new GridStrategyConfig(
@@ -559,20 +1031,50 @@ public class RebalanceService {
         );
     }
 
-    private BigDecimal effectiveInitialSteps(BigDecimal rawQty) {
-        BigDecimal baseQty = cycleBaseGridQty();
+    private BigDecimal effectiveInitialSteps(BigDecimal rawQty, TradeSide side) {
+        BigDecimal baseQty = cycleBaseGridQty(side);
         if (rawQty == null || rawQty.signum() <= 0 || baseQty.signum() <= 0) {
             return BigDecimal.ZERO;
         }
         BigDecimal stepsByTarget = rawQty.divide(baseQty, 8, RoundingMode.DOWN);
-        BigDecimal maxSteps = settings.mode() == RebalanceMode.AUTO_CYCLE
+        BigDecimal maxSteps = activeMonitorRule != null ? activeMonitorRule.initialSteps() : isAutoCycleMode()
                 ? settings.autoInitialSteps()
                 : settings.maxInitialSteps();
         return stepsByTarget.min(maxSteps).max(BigDecimal.ZERO);
     }
 
-    private BigDecimal cycleBaseGridQty() {
-        return settings.mode() == RebalanceMode.AUTO_CYCLE ? settings.autoBaseGridQty() : settings.baseGridQty();
+    private BigDecimal cycleBaseGridQty(TradeSide side) {
+        if (activeMonitorRule != null) return activeMonitorRule.gridQty();
+        if (settings.mode() == RebalanceMode.AUTO_CYCLE
+                || settings.mode() == RebalanceMode.AUTO_LONG_BELOW) {
+            return settings.autoBaseGridQty();
+        }
+        if (settings.mode() == RebalanceMode.AUTO_SHORT_CYCLE) {
+            // Below the configured threshold this mode starts a long cycle using the dedicated auto quantity.
+            return side == TradeSide.BUY ? settings.autoBaseGridQty() : settings.baseGridQty();
+        }
+        return settings.baseGridQty();
+    }
+
+    private boolean isAutoCycleMode() {
+        return activeMonitorRule != null || settings.mode() == RebalanceMode.AUTO_CYCLE
+                || settings.mode() == RebalanceMode.AUTO_SHORT_CYCLE
+                || settings.mode() == RebalanceMode.AUTO_LONG_BELOW;
+    }
+
+    private boolean idleForAutoCycleStart() {
+        return state != null
+                && ("IDLE".equals(state.status()) || "ERROR".equals(state.status()))
+                && rebalanceEngine == null
+                && rebalanceLedger == null
+                && activeRebalanceOrders().isEmpty();
+    }
+
+    private boolean idleForMonitorStart() {
+        return state != null
+                && ("IDLE".equals(state.status()) || "WAITING".equals(state.status())
+                        || "ERROR".equals(state.status()) || "DISABLED".equals(state.status()))
+                && rebalanceEngine == null && rebalanceLedger == null && activeRebalanceOrders().isEmpty();
     }
 
     private boolean rebalanceGridRunning() {
@@ -644,6 +1146,7 @@ public class RebalanceService {
     }
 
     private BigDecimal lockedCycleTargetRatio(BigDecimal fallbackTargetRatio) {
+        if (activeMonitorRule != null) return currentMonitorTargetRatio();
         if (state == null || state.targetRatio() == null || state.targetRatio().signum() <= 0) {
             return fallbackTargetRatio;
         }
@@ -657,6 +1160,20 @@ public class RebalanceService {
         rebalanceLedger = null;
         rebalanceCommandExecutor = null;
         activeCycleStartedAt = null;
+        continuation = null;
+        discardPendingRequote();
+        clearActiveMonitorRule();
+    }
+
+    private void clearActiveMonitorRule() {
+        if (activeMonitorRule != null && monitorStore != null) monitorStore.clearActive();
+        activeMonitorRule = null;
+    }
+
+    private BigDecimal currentMonitorTargetRatio() {
+        return monitorStore.activeCurrentRule()
+                .map(RebalanceMonitorRule::targetRatio)
+                .orElse(activeMonitorRule.targetRatio());
     }
 
     public Instant activeCycleStartedAt() {
@@ -667,6 +1184,7 @@ public class RebalanceService {
         if (rebalanceEngine == null || rebalanceLedger == null || rebalanceCommandExecutor == null) {
             return;
         }
+        if (workingOrderRegistry.hasPendingCancellation()) return;
         List<WorkingOrder> activeOrders = activeRebalanceOrders();
         if (completePair(activeOrders) || rebalanceLedger.snapshot().netQty().signum() == 0) {
             return;
@@ -683,6 +1201,8 @@ public class RebalanceService {
                 ));
                 return;
             }
+            // Request acceptance is not a terminal cancellation. Rebuild on a later poll after confirmation.
+            if (workingOrderRegistry.hasPendingCancellation()) return;
             eventLogger.warn("rebalance.grid.incomplete-pair", Map.of(
                     "symbol", settings.symbol(),
                     "openOrders", activeOrders.size(),
@@ -697,7 +1217,10 @@ public class RebalanceService {
                     rebalanceEngine.runtimeState().lastTriggerTime()
             ));
         }
-        List<StrategyCommand> commands = rebalanceEngine.recoverPairFromLastFill(marketSnapshot, "rebalance-recover-pair");
+        boolean requote = validPendingRequote();
+        List<StrategyCommand> commands = rebalanceEngine.recoverPairFromLastFill(marketSnapshot,
+                requote ? "rebalance-timeout-requote" : "rebalance-recover-pair",
+                requote ? pendingRequote.spacing() : null);
         if (commands.isEmpty()) {
             return;
         }
@@ -705,6 +1228,10 @@ public class RebalanceService {
         if (!failures.isEmpty()) {
             eventLogger.error("rebalance.grid.recover-pair.failed", Map.of("symbol", settings.symbol(), "message", failures.get(0)));
         } else {
+            if (requote) {
+                eventLogger.info("rebalance.grid.requote.applied", Map.of("spacing",pendingRequote.spacing(),"count",commands.size()));
+                discardPendingRequote();
+            }
             eventLogger.info("rebalance.grid.recover-pair", Map.of("symbol", settings.symbol(), "count", commands.size()));
         }
     }
@@ -719,6 +1246,7 @@ public class RebalanceService {
         }
         List<WorkingOrder> orphanOrders = activeRebalanceOrders().stream()
                 .filter(order -> !activePair.contains(order.clientOrderId()))
+                .filter(order -> !order.cancellationRequested())
                 .toList();
         if (orphanOrders.isEmpty()) {
             return;
@@ -755,13 +1283,34 @@ public class RebalanceService {
         if (rebalanceEngine == null || rebalanceLedger == null || rebalanceCommandExecutor == null) {
             return;
         }
+        if (workingOrderRegistry.hasPendingCancellation()) return;
         GridState runtimeState = rebalanceEngine.runtimeState().state();
         if (runtimeState != GridState.GRID_ACTIVE && runtimeState != GridState.REQUOTE) {
+            return;
+        }
+        // Once a timeout has been staged, do not shrink repeatedly while cancellation is pending.
+        if (validPendingRequote()) {
+            boolean oldOrdersRemain = activeRebalanceOrders().stream()
+                    .anyMatch(o -> pendingRequote.canceledOrderIds().contains(o.clientOrderId()));
+            if (!oldOrdersRemain) return;
+            List<StrategyCommand> retryCancels = activeRebalanceOrders().stream()
+                    .map(o -> StrategyCommand.cancel(o.symbol(),o.clientOrderId(),"pair-timeout")).toList();
+            rebalanceCommandExecutor.execute(retryCancels,rebalanceLedger.snapshot());
             return;
         }
         List<StrategyCommand> commands = rebalanceEngine.onMarket(marketSnapshot);
         if (commands.isEmpty()) {
             return;
+        }
+        List<String> oldIds = commands.stream().filter(c -> c.type() == com.btcgrid.common.model.StrategyCommandType.CANCEL)
+                .map(StrategyCommand::clientOrderId).toList();
+        if (!oldIds.isEmpty() && commands.stream().anyMatch(c -> "pair-timeout".equals(c.reason()))) {
+            RebalanceRequoteStore.Plan plan = new RebalanceRequoteStore.Plan(activeCycleStartedAt.toEpochMilli(),
+                    latestTradingExecutionId,rebalanceEngine.config().toString(),rebalanceEngine.activeSpacing(),oldIds);
+            requoteStore.save(plan); // Persist before the first cancellation request.
+            pendingRequote = plan;
+            commands = commands.stream().filter(c -> c.type() == com.btcgrid.common.model.StrategyCommandType.CANCEL).toList();
+            eventLogger.info("rebalance.grid.requote.pending", Map.of("spacing",plan.spacing(),"orderIds",oldIds));
         }
         List<String> failures = rebalanceCommandExecutor.execute(commands, rebalanceLedger.snapshot());
         if (!failures.isEmpty()) {
@@ -775,12 +1324,66 @@ public class RebalanceService {
         }
     }
 
+    private BigDecimal restoredPairSpacing(ActiveOrderPair pair) {
+        BigDecimal reference = rebalanceLedger.snapshot().lastFillPrice();
+        if ((pair.buyOrder() != null && pair.buyOrder().price() == null)
+                || (pair.sellOrder() != null && pair.sellOrder().price() == null)) return null;
+        if (pair.buyOrder() != null && pair.sellOrder() != null)
+            return pair.sellOrder().price().subtract(pair.buyOrder().price()).abs().divide(new BigDecimal("2"));
+        OrderIntent order = pair.buyOrder() != null ? pair.buyOrder() : pair.sellOrder();
+        return order.price().subtract(reference).abs();
+    }
+
+    private boolean validPendingRequote() {
+        if (pendingRequote == null) return false;
+        if (activeCycleStartedAt == null || pendingRequote.cycleStartMillis() != activeCycleStartedAt.toEpochMilli()
+                || !java.util.Objects.equals(pendingRequote.latestExecutionId(),latestTradingExecutionId)
+                || !pendingRequote.config().equals(rebalanceEngine.config().toString())) {
+            discardPendingRequote(); return false;
+        }
+        // A completed replacement found after restart must not be canceled as the old pair.
+        List<WorkingOrder> open = activeRebalanceOrders();
+        if (!open.isEmpty() && open.stream().noneMatch(o -> pendingRequote.canceledOrderIds().contains(o.clientOrderId()))) {
+            discardPendingRequote(); return false;
+        }
+        return true;
+    }
+
+    private void discardPendingRequote() {
+        if (pendingRequote == null) return;
+        pendingRequote = null;
+        try { requoteStore.clear(); }
+        catch (RuntimeException e) {
+            // Never prevent accounting of a real fill because cleanup failed. The execution binding invalidates stale files.
+            eventLogger.warn("rebalance.grid.requote.cleanup.failed",Map.of("message",String.valueOf(e.getMessage())));
+        }
+    }
+
     private StrategyLedgerSnapshot snapshotFromFills(List<FillRecord> fills, BigDecimal netQty) {
         FillRecord last = fills.get(fills.size() - 1);
-        FillRecord previous = fills.size() < 2 ? null : fills.get(fills.size() - 2);
+        List<FillRecord> referenceFills = new ArrayList<>();
+        for (FillRecord fill : fills) {
+            if (RebalanceManualAdjustment.isManual(fill)) continue;
+            int tail = referenceFills.size()-1;
+            if (tail >= 0 && fill.clientOrderId() != null
+                    && fill.clientOrderId().equals(referenceFills.get(tail).clientOrderId())) referenceFills.set(tail,fill);
+            else referenceFills.add(fill);
+        }
+        FillRecord reference = referenceFills.isEmpty() ? null : referenceFills.get(referenceFills.size() - 1);
+        FillRecord previous = referenceFills.size() < 2 ? null : referenceFills.get(referenceFills.size() - 2);
         BigDecimal avgEntryPrice = netQty.signum() == 0
                 ? BigDecimal.ZERO
                 : zero(last.cumulativeValue()).divide(netQty, java.math.MathContext.DECIMAL64).abs();
+        int continuedBuys=0,continuedSells=0;
+        if (continuation != null && reference != null) {
+            int consecutive=0;
+            for (int i=referenceFills.size()-1;i>=0;i--) {
+                if (!reference.side().equals(referenceFills.get(i).side())) break;
+                consecutive++;
+            }
+            if ("BUY".equals(reference.side())) continuedBuys=consecutive;
+            else continuedSells=consecutive;
+        }
         return new StrategyLedgerSnapshot(
                 settings.symbol(),
                 netQty,
@@ -788,11 +1391,11 @@ public class RebalanceService {
                 BigDecimal.ZERO,
                 BigDecimal.ZERO,
                 previous == null ? BigDecimal.ZERO : zero(previous.price()),
-                zero(last.price()),
-                "SELL".equals(last.side()) ? TradeSide.SELL : TradeSide.BUY,
+                reference == null ? BigDecimal.ZERO : zero(reference.price()),
+                reference == null ? null : "SELL".equals(reference.side()) ? TradeSide.SELL : TradeSide.BUY,
                 BandZone.INSIDE_BAND,
-                0,
-                0,
+                continuedBuys,
+                continuedSells,
                 InventoryMode.NORMAL,
                 last.time() == null ? Instant.now() : last.time()
         );
@@ -821,7 +1424,9 @@ public class RebalanceService {
         if (buy == null && sell == null) {
             return null;
         }
-        return new ActiveOrderPair("RBAL_RESTORED_" + Instant.now().toEpochMilli(), buy, sell, Instant.now());
+        Instant createdAt = activeOrders.stream().map(WorkingOrder::createdAt).filter(java.util.Objects::nonNull)
+                .max(Instant::compareTo).orElseGet(Instant::now);
+        return new ActiveOrderPair("RBAL_RESTORED_" + Instant.now().toEpochMilli(), buy, sell, createdAt);
     }
 
     private BigDecimal zero(BigDecimal value) {

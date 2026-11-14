@@ -21,12 +21,23 @@ public record CurrentCycleSummary(
         BigDecimal cumulativeFundingFee,
         BigDecimal profitableReduceQty,
         BigDecimal profitReduceBoostExtraQty,
+        BigDecimal profitReduceBoostAveragePrice,
+        BigDecimal permanentProfitReduceQty,
+        BigDecimal lossAddBoostExtraQty,
+        BigDecimal lossAddBoostAveragePrice,
+        BigDecimal profitReleaseReserveQty,
+        BigDecimal profitReduceCarryQty,
+        BigDecimal lossAddCarryQty,
         BigDecimal startRatio,
         BigDecimal startPrice,
         BigDecimal latestFillPrice,
         BigDecimal marketPrice,
         String entryDirection,
         BigDecimal fillPricePnl,
-        BigDecimal markPricePnl
+        BigDecimal markPricePnl,
+        int buyCount24h,
+        int sellCount24h,
+        int buyCount72h,
+        int sellCount72h
 ) {
 }

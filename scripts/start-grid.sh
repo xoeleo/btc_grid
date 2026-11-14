@@ -44,6 +44,13 @@ start_app() {
 
   build_app
 
+  local feishu_env="${REBALANCE_FEISHU_ENV_FILE:-${HOME}/.config/btc-grid/rebalance-feishu.env}"
+  if [[ -f "${feishu_env}" ]]; then
+    set -a
+    source "${feishu_env}"
+    set +a
+  fi
+
   local cp
   cp="${ROOT_DIR}/grid-app/target/classes:${ROOT_DIR}/grid-app/target/grid-app-0.1.0-SNAPSHOT.jar:$(cat "${CLASSPATH_FILE}")"
 

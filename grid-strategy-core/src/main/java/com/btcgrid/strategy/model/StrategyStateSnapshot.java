@@ -13,6 +13,13 @@ public record StrategyStateSnapshot(
         BigDecimal activeSpacing,
         Set<String> processedExecutionIds,
         List<WorkingOrder> trackedWorkingOrders,
-        GridStrategyConfig cycleConfig
+        GridStrategyConfig cycleConfig,
+        GridSafetyState safetyState
 ) {
+    public StrategyStateSnapshot(
+            StrategyLedgerSnapshot ledgerSnapshot, StrategyRuntimeState runtimeState,
+            BigDecimal activeSpacing, Set<String> processedExecutionIds,
+            List<WorkingOrder> trackedWorkingOrders, GridStrategyConfig cycleConfig) {
+        this(ledgerSnapshot, runtimeState, activeSpacing, processedExecutionIds, trackedWorkingOrders, cycleConfig, null);
+    }
 }

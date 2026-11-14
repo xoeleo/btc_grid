@@ -1,0 +1,15 @@
+START two_year_2pp 1051200
+START year1_2pp 525600
+START year2_2pp 525600
+DONE year1_2pp equity 951619.87 CAGR 90.408 DD 23.931 rebalances 320 seconds 19.2
+START two_year_2pp_fee2 1051200
+DONE year2_2pp equity 409796.29 CAGR -18.052 DD 42.996 rebalances 139 seconds 20.7
+START two_year_2pp_borrow5 1051200
+DONE two_year_2pp equity 785030.17 CAGR 25.321 DD 43.139 rebalances 481 seconds 41.0
+START two_year_2pp_borrow10 1051200
+DONE two_year_2pp_fee2 equity 785344.08 CAGR 25.346 DD 43.253 rebalances 490 seconds 39.9
+START two_year_2pp_allow_long 1051200
+DONE two_year_2pp_borrow5 equity 786771.53 CAGR 25.46 DD 43.073 rebalances 489 seconds 40.6
+DONE two_year_2pp_borrow10 equity 784201.31 CAGR 25.255 DD 43.179 rebalances 478 seconds 42.0
+DONE two_year_2pp_allow_long equity 804581.67 CAGR 26.873 DD 43.19 rebalances 545 seconds 37.4
+ADDED 7; TOTAL 22 SCENARIOS. BASELINE 1pp/5pp OUTPUTS PRESERVED.

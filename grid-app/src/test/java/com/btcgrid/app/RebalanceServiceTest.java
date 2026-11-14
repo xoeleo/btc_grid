@@ -15,6 +15,9 @@ import com.btcgrid.common.model.OrderType;
 import com.btcgrid.common.model.ProductCategory;
 import com.btcgrid.common.model.TradeSide;
 import com.btcgrid.common.model.WorkingOrder;
+import com.btcgrid.strategy.model.ProfitSizingState;
+import com.btcgrid.strategy.service.ClientOrderIdFactory;
+import com.btcgrid.strategy.service.GridOrderPlanner;
 import java.math.BigDecimal;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -23,12 +26,40 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class RebalanceServiceTest {
+
+    private void confirmCanceled(WorkingOrderRegistry registry, List<String> ids) {
+        for (String id : List.copyOf(ids)) {
+            WorkingOrder order = registry.snapshot().stream().filter(o -> o.clientOrderId().equals(id)).findFirst().orElseThrow();
+            registry.applyUpdate(new com.btcgrid.common.model.OrderUpdateEvent(order.symbol(), id, order.exchangeOrderId(),
+                    OrderStatus.CANCELED, order.side(), order.price(), order.qty(), BigDecimal.ZERO, Instant.now()));
+        }
+    }
+
+    @Test
+    void splitsFundingFeeReconciliationIntoBybitSevenDayWindows() {
+        Instant start = Instant.parse("2026-07-21T08:03:39Z");
+        Instant end = start.plus(Duration.ofDays(8)).plusSeconds(30);
+
+        List<RebalanceLiveRunner.FundingFeeQueryWindow> windows =
+                RebalanceLiveRunner.fundingFeeQueryWindows(start, end);
+
+        assertEquals(2, windows.size());
+        assertEquals(start, windows.get(0).startInclusive());
+        assertEquals(Duration.ofDays(7).minusMillis(1), Duration.between(
+                windows.get(0).startInclusive(),
+                windows.get(0).endInclusive()
+        ));
+        assertEquals(windows.get(0).endInclusive().plusMillis(1), windows.get(1).startInclusive());
+        assertEquals(end, windows.get(1).endInclusive());
+    }
 
     @Test
     void placesBuyOrderWhenBtcRatioIsBelowPriceBandTarget() throws Exception {
@@ -438,7 +469,7 @@ class RebalanceServiceTest {
     }
 
     @Test
-    void activeLongCycleDoesNotStopUntilTargetRatioIsActuallyReached() throws Exception {
+    void restoredCycleUsesImmutableFillTargetInsteadOfDriftedStateTarget() throws Exception {
         Path stateFile = Files.createTempFile("rebalance-state", ".json");
         new FileRebalanceStateStore(stateFile).save(new RebalanceState(
                 true,
@@ -492,9 +523,9 @@ class RebalanceServiceTest {
                         baseCoin,
                         quoteCoin,
                         new BigDecimal("1.10"),
-                        new BigDecimal("0.04615385"),
+                        new BigDecimal("0.06923077"),
                         BigDecimal.ZERO,
-                        new BigDecimal("1.14615385"),
+                        new BigDecimal("1.16923077"),
                         new BigDecimal("100000")
                 ),
                 tradeGateway,
@@ -523,7 +554,8 @@ class RebalanceServiceTest {
                         BigDecimal.ZERO,
                         BigDecimal.ZERO,
                         "RBAL_BTCUSDT_I_test",
-                        "initial-long"
+                        "initial-long",
+                        "{\"targetRatio\":1}"
                 )),
                 List.of()
         );
@@ -533,6 +565,7 @@ class RebalanceServiceTest {
         assertTrue(cycleEndReasons.isEmpty());
         RebalanceState saved = new FileRebalanceStateStore(stateFile).load().orElseThrow();
         assertEquals("GRID_ACTIVE", saved.status());
+        assertEquals(BigDecimal.ONE, saved.targetRatio());
         Files.deleteIfExists(stateFile);
     }
 
@@ -649,6 +682,17 @@ class RebalanceServiceTest {
         assertEquals("IDLE", afterFill.status());
         assertEquals(List.of("rebalance grid position is flat; stopped"), cycleEndReasons);
         assertEquals(List.of("RBAL_BTCUSDT_PB_test"), tradeGateway.canceled);
+
+        registry.markCanceled("RBAL_BTCUSDT_PB_test", Instant.now());
+        service.onOrderUpdate(
+                "BTCUSDT",
+                "RBAL_BTCUSDT_PB_test",
+                OrderStatus.CANCELED,
+                Instant.now()
+        );
+
+        RebalanceState afterLateCancel = new FileRebalanceStateStore(stateFile).load().orElseThrow();
+        assertEquals("IDLE", afterLateCancel.status());
         Files.deleteIfExists(stateFile);
     }
 
@@ -748,6 +792,9 @@ class RebalanceServiceTest {
                         )
                 )
         );
+        // Production recovery tracks the supplied exchange orders before restoring the cycle.
+        registry.trackRemote(openOrder("RBAL_BTCUSDT_PB_test", TradeSide.BUY, Instant.now()));
+        registry.trackRemote(openOrder("RBAL_BTCUSDT_PS_test", TradeSide.SELL, Instant.now()));
         FillEvent fill = new FillEvent(
                 "dup-exec",
                 "BTCUSDT",
@@ -758,12 +805,15 @@ class RebalanceServiceTest {
                 Instant.now()
         );
 
-        service.onExecution(fill, "test");
+        java.util.concurrent.atomic.AtomicInteger accountingCallbacks = new java.util.concurrent.atomic.AtomicInteger();
+        service.onExecution(fill, "test", accountingCallbacks::incrementAndGet);
         int submittedAfterFirst = tradeGateway.submitted.size();
-        service.onExecution(fill, "test");
+        service.onExecution(fill, "test", accountingCallbacks::incrementAndGet);
 
-        assertTrue(submittedAfterFirst > 0);
+        assertEquals(0, submittedAfterFirst, "replacement waits for confirmed cancellation");
+        assertTrue(registry.hasPendingCancellation());
         assertEquals(submittedAfterFirst, tradeGateway.submitted.size());
+        assertEquals(2, accountingCallbacks.get());
         Files.deleteIfExists(stateFile);
     }
 
@@ -829,13 +879,103 @@ class RebalanceServiceTest {
         int submittedAfterPair = tradeGateway.submitted.size();
         assertEquals(3, submittedAfterPair);
 
+        AtomicInteger correctionRecorded = new AtomicInteger();
+        service.onExecution(new FillEvent(
+                "correction-fill",
+                "BTCUSDT",
+                "RBAL_BTCUSDT_PS_fix025_test",
+                TradeSide.SELL,
+                new BigDecimal("0.005"),
+                new BigDecimal("101"),
+                marketDataGateway.timestamp
+        ), "test", correctionRecorded::incrementAndGet);
+
+        assertEquals(1, correctionRecorded.get());
+        assertEquals(submittedAfterPair, tradeGateway.submitted.size());
+
         marketDataGateway.advance(Duration.ofMinutes(2));
         service.onPoll();
 
         assertEquals(2, tradeGateway.canceled.size());
+        assertEquals(submittedAfterPair, tradeGateway.submitted.size(), "no replacement before exchange terminal confirmation");
+        assertTrue(registry.hasPendingCancellation());
+        confirmCanceled(registry, tradeGateway.canceled);
+        service.onPoll();
         assertEquals(5, tradeGateway.submitted.size());
         assertTrue(tradeGateway.submitted.subList(submittedAfterPair, tradeGateway.submitted.size()).stream()
                 .allMatch(order -> order.clientOrderId().startsWith(RebalanceService.CLIENT_ORDER_PREFIX)));
+        Files.deleteIfExists(stateFile);
+    }
+
+    @Test
+    void rebalanceGridUsesAccumulatedProfitReduceSizingState() throws Exception {
+        Path stateFile = Files.createTempFile("rebalance-profit-sizing", ".json");
+        WorkingOrderRegistry registry = new WorkingOrderRegistry();
+        RecordingTradeGateway tradeGateway = new RecordingTradeGateway();
+        FakeMarketDataGateway marketDataGateway = new FakeMarketDataGateway(new BigDecimal("100"));
+        GridOrderPlanner planner = new GridOrderPlanner(
+                new ClientOrderIdFactory("RBAL"),
+                new BigDecimal("1.10"),
+                (market, ledger, price, qty) -> true,
+                (market, ledger, price, qty) -> false,
+                symbol -> new ProfitSizingState(
+                        new BigDecimal("0.0005"),
+                        BigDecimal.ZERO,
+                        BigDecimal.ZERO,
+                        BigDecimal.ZERO
+                )
+        );
+        RebalanceService service = new RebalanceService(
+                new RebalanceSettings(
+                        true, ProductCategory.LINEAR, "BTCUSDT", "UNIFIED", "BTC", "USDT",
+                        List.of(new RebalanceBand(BigDecimal.ZERO, new BigDecimal("0.75"))),
+                        new BigDecimal("0.01"), new BigDecimal("0.01"), new BigDecimal("0.85"),
+                        new BigDecimal("0.005"), new BigDecimal("5"), new BigDecimal("0.100"),
+                        new BigDecimal("1.0"), new BigDecimal("0.001"), new BigDecimal("0.001"),
+                        Duration.ofMinutes(15), 1, "rebalance-config.properties", stateFile.toString()
+                ),
+                marketDataGateway,
+                (accountType, baseCoin, quoteCoin, positionCategory, symbol) -> new AccountAssetSnapshot(
+                        marketDataGateway.timestamp,
+                        accountType,
+                        baseCoin,
+                        quoteCoin,
+                        new BigDecimal("0.72"),
+                        BigDecimal.ZERO,
+                        BigDecimal.ZERO,
+                        new BigDecimal("0.72"),
+                        new BigDecimal("100")
+                ),
+                tradeGateway,
+                registry,
+                new FileRebalanceStateStore(stateFile),
+                new NoopEventLogger(),
+                new AlertService(new NoopEventLogger()),
+                reason -> {
+                },
+                planner
+        );
+
+        service.onPoll();
+        OrderIntent initial = tradeGateway.submitted.get(0);
+        service.onExecution(new FillEvent(
+                "initial-fill-profit-sizing",
+                "BTCUSDT",
+                initial.clientOrderId(),
+                TradeSide.BUY,
+                initial.qty(),
+                new BigDecimal("100"),
+                marketDataGateway.timestamp
+        ), "test");
+
+        OrderIntent boostedReduce = tradeGateway.submitted.stream()
+                .filter(order -> order.type() == OrderType.LIMIT && order.side() == TradeSide.SELL)
+                .findFirst()
+                .orElseThrow();
+        assertEquals(new BigDecimal("0.006"), boostedReduce.qty());
+        assertTrue(boostedReduce.reason().contains(
+                "profit-reduce-boost:base=0.005,order=0.006,intended=0.0005,carry=0.0005,applied=0.001"
+        ));
         Files.deleteIfExists(stateFile);
     }
 
@@ -885,6 +1025,11 @@ class RebalanceServiceTest {
         service.cancelOrphanOrdersIfNeeded();
 
         assertEquals(List.of(orphanBuy.clientOrderId()), tradeGateway.canceled);
+        assertEquals(OrderStatus.NEW, registry.snapshot().stream()
+                .filter(order -> order.clientOrderId().equals(orphanBuy.clientOrderId()))
+                .findFirst().orElseThrow().status());
+        assertTrue(registry.hasPendingCancellation());
+        confirmCanceled(registry, tradeGateway.canceled);
         assertEquals(OrderStatus.CANCELED, registry.snapshot().stream()
                 .filter(order -> order.clientOrderId().equals(orphanBuy.clientOrderId()))
                 .findFirst().orElseThrow().status());
@@ -924,6 +1069,245 @@ class RebalanceServiceTest {
         Files.deleteIfExists(stateFile);
     }
 
+    @Test
+    void autoShortCycleStartsSellGridAboveConfiguredPriceAndTargetsSeventyPercent() throws Exception {
+        Path stateFile = Files.createTempFile("rebalance-auto-short-state", ".json");
+        RecordingTradeGateway tradeGateway = new RecordingTradeGateway();
+        RebalanceService service = autoShortCycleService(stateFile, tradeGateway, new BigDecimal("100.1"));
+
+        service.onPoll();
+
+        assertEquals(1, tradeGateway.submitted.size());
+        OrderIntent initial = tradeGateway.submitted.get(0);
+        assertEquals(TradeSide.SELL, initial.side());
+        assertEquals(new BigDecimal("0.025"), initial.qty());
+        RebalanceState saved = new FileRebalanceStateStore(stateFile).load().orElseThrow();
+        assertEquals("GRID_OPENING", saved.status());
+        assertEquals(new BigDecimal("0.70"), saved.targetRatio());
+        Files.deleteIfExists(stateFile);
+    }
+
+    @Test
+    void autoShortCycleWaitsAtConfiguredPriceThreshold() throws Exception {
+        Path stateFile = Files.createTempFile("rebalance-auto-short-state", ".json");
+        RecordingTradeGateway tradeGateway = new RecordingTradeGateway();
+        RebalanceService service = autoShortCycleService(stateFile, tradeGateway, new BigDecimal("80"));
+
+        service.onPoll();
+
+        assertTrue(tradeGateway.submitted.isEmpty());
+        RebalanceState saved = new FileRebalanceStateStore(stateFile).load().orElseThrow();
+        assertEquals("IDLE", saved.status());
+        assertTrue(saved.message().contains("equals trigger threshold 80"));
+        Files.deleteIfExists(stateFile);
+    }
+
+    @Test
+    void autoShortCycleRecoversFromTransientErrorWhenNoCycleOrOrdersRemain() throws Exception {
+        Path stateFile = Files.createTempFile("rebalance-auto-short-error-state", ".json");
+        new FileRebalanceStateStore(stateFile).save(new RebalanceState(
+                true, "BTCUSDT", "ERROR", new BigDecimal("0.70"), new BigDecimal("0.80"),
+                new BigDecimal("8"), BigDecimal.ZERO, new BigDecimal("8"), new BigDecimal("1001"),
+                new BigDecimal("100.1"), null, null, null, null, List.of(new BigDecimal("0.80")),
+                Instant.now(), "temporary account snapshot failure"
+        ));
+        RecordingTradeGateway tradeGateway = new RecordingTradeGateway();
+        RebalanceService service = autoShortCycleService(stateFile, tradeGateway, new BigDecimal("100.1"));
+
+        service.onPoll();
+
+        assertEquals(1, tradeGateway.submitted.size());
+        assertEquals(TradeSide.SELL, tradeGateway.submitted.get(0).side());
+        RebalanceState saved = new FileRebalanceStateStore(stateFile).load().orElseThrow();
+        assertEquals("GRID_OPENING", saved.status());
+        assertEquals(new BigDecimal("0.70"), saved.targetRatio());
+        Files.deleteIfExists(stateFile);
+    }
+
+    @Test
+    void autoShortCycleStartsLongGridBelowConfiguredPriceOnlyWhileIdle() throws Exception {
+        Path stateFile = Files.createTempFile("rebalance-auto-short-long-state", ".json");
+        RecordingTradeGateway tradeGateway = new RecordingTradeGateway();
+        RebalanceService service = autoShortCycleService(stateFile, tradeGateway, new BigDecimal("79.9"));
+
+        service.onPoll();
+
+        assertEquals(1, tradeGateway.submitted.size());
+        OrderIntent initial = tradeGateway.submitted.get(0);
+        assertEquals(TradeSide.BUY, initial.side());
+        assertEquals(new BigDecimal("0.015"), initial.qty());
+        RebalanceState saved = new FileRebalanceStateStore(stateFile).load().orElseThrow();
+        assertEquals("GRID_OPENING", saved.status());
+        assertEquals(BigDecimal.ONE, saved.targetRatio());
+        Files.deleteIfExists(stateFile);
+    }
+
+    @Test
+    void autoLongBelowUsesSingleGridQtyAndNeverShortsAtOrAboveThreshold() throws Exception {
+        for (String price : List.of("100000", "100001")) {
+            Path state = Files.createTempFile("auto-long-below-wait", ".json");
+            RecordingTradeGateway gateway = new RecordingTradeGateway();
+            RebalanceService service = thresholdCycleService(state, gateway, new BigDecimal(price),
+                    RebalanceMode.AUTO_LONG_BELOW, "100000", "0.006");
+            service.onPoll();
+            assertTrue(gateway.submitted.isEmpty());
+            assertEquals("IDLE", new FileRebalanceStateStore(state).load().orElseThrow().status());
+        }
+        Path state = Files.createTempFile("auto-long-below-start", ".json");
+        RecordingTradeGateway gateway = new RecordingTradeGateway();
+        RebalanceService service = thresholdCycleService(state, gateway, new BigDecimal("99999"),
+                RebalanceMode.AUTO_LONG_BELOW, "100000", "0.006");
+        service.onPoll();
+        assertEquals(1, gateway.submitted.size());
+        assertEquals(TradeSide.BUY, gateway.submitted.get(0).side());
+        assertEquals(0, new BigDecimal("0.030").compareTo(gateway.submitted.get(0).qty()));
+        assertEquals(BigDecimal.ONE, new FileRebalanceStateStore(state).load().orElseThrow().targetRatio());
+    }
+
+    @Test
+    void enabledMonitorsUseListOrderAndLockCycleSizing() throws Exception {
+        Path state = Files.createTempDirectory("rebalance-monitors").resolve("state.json");
+        RebalanceMonitorStore store = new RebalanceMonitorStore(state);
+        store.save(List.of(
+                new RebalanceMonitorRule("off", "disabled", false, TradeSide.BUY,
+                        RebalanceMonitorRule.Trigger.BELOW, new BigDecimal("10000"),
+                        new BigDecimal("10"), new BigDecimal("0.01"), BigDecimal.ONE),
+                new RebalanceMonitorRule("first", "first", true, TradeSide.BUY,
+                        RebalanceMonitorRule.Trigger.BELOW, new BigDecimal("10000"),
+                        new BigDecimal("5"), new BigDecimal("0.006"), BigDecimal.ONE),
+                new RebalanceMonitorRule("second", "second", true, TradeSide.SELL,
+                        RebalanceMonitorRule.Trigger.ABOVE, new BigDecimal("8000"),
+                        new BigDecimal("2"), new BigDecimal("0.01"), new BigDecimal("0.5"))));
+        RecordingTradeGateway gateway = new RecordingTradeGateway();
+        RebalanceService service = thresholdCycleService(state, gateway, new BigDecimal("9000"),
+                RebalanceMode.AUTO_LONG_BELOW, "100000", "0.001");
+        service.configureMonitorStore(store);
+
+        service.onPoll();
+
+        assertEquals(1, gateway.submitted.size());
+        assertEquals(TradeSide.BUY, gateway.submitted.get(0).side());
+        assertEquals(0, gateway.submitted.get(0).qty().compareTo(new BigDecimal("0.030")));
+        assertEquals("first", store.active().orElseThrow().id());
+        assertEquals(BigDecimal.ONE, new FileRebalanceStateStore(state).load().orElseThrow().targetRatio());
+        store.save(List.of(new RebalanceMonitorRule("first", "first", false, TradeSide.BUY,
+                RebalanceMonitorRule.Trigger.BELOW, new BigDecimal("10000"),
+                new BigDecimal("5"), new BigDecimal("0.006"), BigDecimal.ONE)));
+        assertEquals("first", store.active().orElseThrow().id());
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class, () -> store.save(List.of()));
+    }
+
+    @Test
+    void monitorTriggerIsStrictAndStoreRejectsInvalidRules() throws Exception {
+        Path state = Files.createTempDirectory("rebalance-monitor-threshold").resolve("state.json");
+        RebalanceMonitorStore store = new RebalanceMonitorStore(state);
+        store.save(List.of(new RebalanceMonitorRule("rule", "test", true, TradeSide.BUY,
+                RebalanceMonitorRule.Trigger.BELOW, new BigDecimal("10000"),
+                new BigDecimal("5"), new BigDecimal("0.006"), BigDecimal.ONE)));
+        RecordingTradeGateway gateway = new RecordingTradeGateway();
+        RebalanceService service = thresholdCycleService(state, gateway, new BigDecimal("10000"),
+                RebalanceMode.AUTO_LONG_BELOW, "100000", "0.001");
+        service.configureMonitorStore(store);
+        service.onPoll();
+        assertTrue(gateway.submitted.isEmpty());
+        assertEquals("IDLE", new FileRebalanceStateStore(state).load().orElseThrow().status());
+        assertTrue(store.active().isEmpty());
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class, () -> store.save(List.of(
+                new RebalanceMonitorRule("bad", "bad", true, TradeSide.BUY,
+                        RebalanceMonitorRule.Trigger.BELOW, BigDecimal.ZERO,
+                        new BigDecimal("5"), new BigDecimal("0.006"), BigDecimal.ONE))));
+    }
+
+    @Test
+    void shortMonitorUsesItsOwnConfigurableEndRatio() throws Exception {
+        Path state = Files.createTempDirectory("rebalance-monitor-short").resolve("state.json");
+        RebalanceMonitorStore store = new RebalanceMonitorStore(state);
+        store.save(List.of(new RebalanceMonitorRule("short", "high price short", true, TradeSide.SELL,
+                RebalanceMonitorRule.Trigger.ABOVE, new BigDecimal("8000"),
+                new BigDecimal("3"), new BigDecimal("0.004"), new BigDecimal("0.50"))));
+        RecordingTradeGateway gateway = new RecordingTradeGateway();
+        RebalanceService service = thresholdCycleService(state, gateway, new BigDecimal("9000"),
+                RebalanceMode.AUTO_LONG_BELOW, "100000", "0.001");
+        service.configureMonitorStore(store);
+
+        service.onPoll();
+
+        assertEquals(1, gateway.submitted.size());
+        assertEquals(TradeSide.SELL, gateway.submitted.get(0).side());
+        assertEquals(0, gateway.submitted.get(0).qty().compareTo(new BigDecimal("0.012")));
+        assertEquals(0, new FileRebalanceStateStore(state).load().orElseThrow()
+                .targetRatio().compareTo(new BigDecimal("0.50")));
+    }
+
+    @Test
+    void changingBoundRulesEndRatioEndsCurrentCycleWithoutFlatteningInventory() throws Exception {
+        Path state = Files.createTempDirectory("rebalance-monitor-live-target").resolve("state.json");
+        RebalanceMonitorStore store = new RebalanceMonitorStore(state);
+        RebalanceMonitorRule rule = new RebalanceMonitorRule("bound", "bound", true, TradeSide.BUY,
+                RebalanceMonitorRule.Trigger.BELOW, new BigDecimal("10000"),
+                new BigDecimal("5"), new BigDecimal("0.006"), BigDecimal.ONE);
+        store.save(List.of(rule));
+        store.setActive(rule);
+        RecordingTradeGateway gateway = new RecordingTradeGateway();
+        RebalanceService service = thresholdCycleService(state, gateway, new BigDecimal("9000"),
+                RebalanceMode.AUTO_LONG_BELOW, "100000", "0.001");
+        service.configureMonitorStore(store);
+        service.restoreActiveCycle(List.of(new FillRecord(Instant.now().minusSeconds(30),
+                "RBAL:BTCUSDT", "BUY", new BigDecimal("0.030"), new BigDecimal("9000"),
+                new BigDecimal("0.030"), new BigDecimal("9000"), BigDecimal.ZERO,
+                BigDecimal.ZERO, BigDecimal.ZERO, "RBAL_BTCUSDT_I_bound", "bound-fill")), List.of());
+        store.save(List.of(new RebalanceMonitorRule("bound", "bound", true, TradeSide.BUY,
+                RebalanceMonitorRule.Trigger.BELOW, new BigDecimal("10000"),
+                new BigDecimal("5"), new BigDecimal("0.006"), new BigDecimal("0.70"))));
+
+        service.onPoll();
+
+        assertEquals("IDLE", new FileRebalanceStateStore(state).load().orElseThrow().status());
+        assertEquals(0, new FileRebalanceStateStore(state).load().orElseThrow().targetRatio()
+                .compareTo(new BigDecimal("0.70")));
+        assertTrue(store.active().isEmpty());
+        assertTrue(gateway.submitted.isEmpty(), "changing the end ratio must not submit a flattening trade");
+    }
+
+    @Test
+    void autoShortCycleDoesNotStartLongGridBelowThresholdFromNonIdleState() throws Exception {
+        Path stateFile = Files.createTempFile("rebalance-auto-short-non-idle-state", ".json");
+        new FileRebalanceStateStore(stateFile).save(new RebalanceState(
+                true, "BTCUSDT", "GRID_OPENING", new BigDecimal("0.70"), new BigDecimal("0.80"),
+                new BigDecimal("8"), BigDecimal.ZERO, new BigDecimal("8"), new BigDecimal("799"),
+                new BigDecimal("79.9"), null, null, null, null, List.of(new BigDecimal("0.80")),
+                Instant.now(), "existing cycle state"
+        ));
+        RecordingTradeGateway tradeGateway = new RecordingTradeGateway();
+        RebalanceService service = autoShortCycleService(stateFile, tradeGateway, new BigDecimal("79.9"));
+
+        service.onPoll();
+
+        assertTrue(tradeGateway.submitted.isEmpty());
+        RebalanceState saved = new FileRebalanceStateStore(stateFile).load().orElseThrow();
+        assertEquals("GRID_OPENING", saved.status());
+        assertTrue(saved.message().contains("state must be IDLE"));
+        Files.deleteIfExists(stateFile);
+    }
+
+    @Test
+    void profitExitInstructionBlocksAutomaticCyclesAboveAndBelowThreshold() throws Exception {
+        for (String price : List.of("79", "81")) {
+            Path state = Files.createTempDirectory("profit-exit-service").resolve("state.json");
+            RecordingTradeGateway gateway = new RecordingTradeGateway();
+            RebalanceService service = autoShortCycleService(state, gateway, new BigDecimal(price));
+            Files.writeString(Path.of(state + ".profit-exit.json"), "{\"cycleStartMillis\":1789894318196}");
+            service.configureProfitExit(new RebalanceProfitExit.Exchange() {
+                public List<WorkingOrder> openOrders() { throw new AssertionError("no exchange mutations for absent cycle"); }
+                public RebalanceProfitExit.Evidence evidence(String id) { throw new AssertionError(); }
+                public BigDecimal bestOppositePrice(TradeSide side) { throw new AssertionError(); }
+            }, ignored -> null, ignored -> { throw new AssertionError(); });
+            service.onPoll();
+            assertTrue(gateway.submitted.isEmpty());
+            assertTrue(new FileRebalanceStateStore(state).load().orElseThrow().message().contains("new cycles disabled"));
+        }
+    }
+
     private RebalanceService autoCycleService(Path stateFile, RecordingTradeGateway tradeGateway, BigDecimal totalEquity) {
         FakeMarketDataGateway marketDataGateway = new FakeMarketDataGateway(new BigDecimal("100"));
         RebalanceSettings settings = new RebalanceSettings(
@@ -946,6 +1330,272 @@ class RebalanceServiceTest {
                 (accountType, baseCoin, quoteCoin, positionCategory, symbol) -> new AccountAssetSnapshot(
                         Instant.now(), accountType, baseCoin, quoteCoin, new BigDecimal("0.10"),
                         totalEquity.subtract(new BigDecimal("10")), BigDecimal.ZERO, new BigDecimal("0.10"), totalEquity
+                ),
+                tradeGateway,
+                new WorkingOrderRegistry(),
+                new FileRebalanceStateStore(stateFile),
+                new NoopEventLogger(),
+                new AlertService(new NoopEventLogger())
+        );
+    }
+
+    @Test
+    void largeFillNotificationReadsCycleAfterPersistenceAtMarketPrice() throws Exception {
+        Path directory = Files.createTempDirectory("rebalance-notification");
+        SqliteFillStore store = new SqliteFillStore(directory.resolve("fills.sqlite"));
+        RecordingTradeGateway gateway = new RecordingTradeGateway();
+        RebalanceService service = autoShortCycleService(directory.resolve("state.json"), gateway,
+                new BigDecimal("100"));
+        List<CurrentCycleSummary> observed = new ArrayList<>();
+        service.configureProfitExit(new RebalanceProfitExit.Exchange() {
+            public List<WorkingOrder> openOrders() { throw new AssertionError("No exit expected"); }
+            public RebalanceProfitExit.Evidence evidence(String id) { throw new AssertionError(); }
+            public BigDecimal bestOppositePrice(TradeSide side) { throw new AssertionError(); }
+        }, price -> {
+            CurrentCycleSummary cycle = store.currentCycle("RBAL:BTCUSDT", Instant.now(), price);
+            if (cycle != null) observed.add(cycle);
+            return cycle;
+        }, ignored -> { throw new AssertionError("No exit fill expected"); });
+        service.onPoll();
+        OrderIntent initial = gateway.submitted.get(0);
+        Instant time = Instant.parse("2026-10-17T21:29:59.623Z");
+        FillEvent execution = new FillEvent("notification-fill", "BTCUSDT", initial.clientOrderId(),
+                TradeSide.SELL, initial.qty(), new BigDecimal("101"), time,
+                initial.qty().multiply(new BigDecimal("101")), new BigDecimal("0.01"), "USDT");
+        Runnable persist = () -> store.save(new FillRecord(time, "RBAL:BTCUSDT", "SELL", execution.fillQty(),
+                execution.fillPrice(), execution.fillValue(), execution.fee(), "USDT",
+                execution.fillQty().negate(), execution.fillValue().negate(), execution.fee(),
+                execution.fillQty().negate(), execution.fillPrice(), BigDecimal.ZERO,
+                BigDecimal.ZERO, BigDecimal.ZERO, execution.clientOrderId(), execution.executionId()));
+
+        service.onExecution(execution, "test", persist);
+
+        assertEquals(1, observed.size(), "Notification must query the cycle after this fill is persisted");
+        CurrentCycleSummary cycle = observed.get(0);
+        assertEquals(1, cycle.fillCount());
+        assertEquals(0, cycle.buyCount());
+        assertEquals(1, cycle.sellCount());
+        assertEquals(new BigDecimal("100"), cycle.marketPrice());
+        assertEquals(0, execution.fillQty().subtract(execution.fee()).compareTo(cycle.markPricePnl()));
+        assertEquals(time, store.currentCycleFills("RBAL:BTCUSDT").get(0).time());
+        service.onExecution(execution, "test", persist);
+        assertEquals(1, observed.size(), "Duplicate execution must not trigger another notification query");
+    }
+
+    @Test
+    void waterExitCompletesCycleAndEnabledBoundMonitorCanStartNextCycle() throws Exception {
+        RebalanceWaterExitTest.Fixture f = new RebalanceWaterExitTest.Fixture();
+        f.price = new BigDecimal("105000");
+        Path state = f.path.resolveSibling("service.json");
+        RebalanceMonitorStore store = new RebalanceMonitorStore(state);
+        RebalanceMonitorRule rule = new RebalanceMonitorRule("bound", "bound", true, TradeSide.BUY,
+                RebalanceMonitorRule.Trigger.BELOW, new BigDecimal("200000"),
+                new BigDecimal("5"), new BigDecimal("0.006"), BigDecimal.ONE);
+        store.save(List.of(rule)); store.setActive(rule);
+        RecordingTradeGateway gateway = new RecordingTradeGateway();
+        RebalanceService service = thresholdCycleService(state, gateway, f.price,
+                RebalanceMode.AUTO_LONG_BELOW, "200000", "0.006");
+        service.configureMonitorStore(store);
+        service.configureProfitExit(new RebalanceProfitExit.Exchange() {
+            public List<WorkingOrder> openOrders() { return List.copyOf(f.open); }
+            public RebalanceProfitExit.Evidence evidence(String id) { return f.evidence.get(id); }
+            public BigDecimal bestOppositePrice(TradeSide side) { return f.price; }
+        }, ignored -> f.cycle(), f::apply);
+        service.restoreActiveCycle(List.of(new FillRecord(f.start, "RBAL:BTCUSDT", "BUY", f.qty,
+                new BigDecimal("100000"), f.qty, new BigDecimal("100000"), BigDecimal.ZERO,
+                BigDecimal.ZERO, BigDecimal.ZERO, "RBAL_initial", "initial")), List.of());
+
+        service.onPoll();
+        assertEquals(1, gateway.submitted.size());
+        OrderIntent exit = gateway.submitted.get(0);
+        assertEquals(TradeSide.SELL, exit.side());
+        assertEquals(0, f.qty.compareTo(exit.qty()));
+        assertEquals("GRID_ACTIVE", new FileRebalanceStateStore(state).load().orElseThrow().status());
+        assertTrue(store.active().isPresent());
+        f.finish(exit); service.onPoll();
+        assertEquals(0, f.qty.signum());
+        assertEquals("IDLE", new FileRebalanceStateStore(state).load().orElseThrow().status());
+        assertTrue(store.active().isEmpty()); assertTrue(store.rules().get(0).enabled());
+        service.onPoll();
+        assertEquals(2, gateway.submitted.size());
+        assertEquals(TradeSide.BUY, gateway.submitted.get(1).side());
+        assertEquals("GRID_OPENING", new FileRebalanceStateStore(state).load().orElseThrow().status());
+    }
+
+    @Test
+    void manualReductionKeepsCurrentCycleAndRebuildsGridAfterConfirmedFill() throws Exception {
+        RebalanceWaterExitTest.Fixture f = new RebalanceWaterExitTest.Fixture(); f.price = new BigDecimal("99000");
+        Path state = f.path.resolveSibling("service.json");
+        RebalanceMonitorStore store = new RebalanceMonitorStore(state);
+        RebalanceMonitorRule rule = new RebalanceMonitorRule("bound", "bound", true, TradeSide.BUY,
+                RebalanceMonitorRule.Trigger.BELOW, new BigDecimal("200000"),
+                new BigDecimal("5"), new BigDecimal("0.006"), BigDecimal.ONE);
+        store.save(List.of(rule)); store.setActive(rule);
+        RecordingTradeGateway gateway = new RecordingTradeGateway();
+        RebalanceService service = thresholdCycleService(state, gateway, f.price,
+                RebalanceMode.AUTO_LONG_BELOW, "200000", "0.006");
+        service.configureMonitorStore(store);
+        service.configureProfitExit(new RebalanceProfitExit.Exchange() {
+            public List<WorkingOrder> openOrders() { return List.copyOf(f.open); }
+            public RebalanceProfitExit.Evidence evidence(String id) { return f.evidence.get(id); }
+            public BigDecimal bestOppositePrice(TradeSide side) { return f.price; }
+        }, ignored -> f.cycle(), f::apply);
+        service.restoreActiveCycle(List.of(new FillRecord(f.start, "RBAL:BTCUSDT", "BUY", f.qty,
+                new BigDecimal("100000"), f.qty, new BigDecimal("100000"), BigDecimal.ZERO,
+                BigDecimal.ZERO, BigDecimal.ZERO, "RBAL_initial", "initial")), List.of());
+        var gridReference = referenceSnapshot(service);
+        assertEquals(0, new BigDecimal("0.010").compareTo(service.requestManualReduction()));
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, service::requestManualReduction);
+        service.onPoll(); assertEquals(1, gateway.submitted.size());
+        OrderIntent order = gateway.submitted.get(0);
+        assertEquals(0, new BigDecimal("0.010").compareTo(order.qty()));
+        f.finish(order); service.onPoll();
+        assertEquals(0, new BigDecimal("0.09").compareTo(f.qty));
+        assertReferenceUnchanged(gridReference, referenceSnapshot(service));
+        assertEquals("GRID_ACTIVE", new FileRebalanceStateStore(state).load().orElseThrow().status());
+        assertEquals(f.start, service.activeCycleStartedAt());
+        assertEquals(3, gateway.submitted.size(), "confirmed reduction rebuilds the ordinary grid pair");
+    }
+
+    @Test
+    void manualAdditionKeepsCycleAndOnlyRebuildsGridAfterAllCappedOrdersFill() throws Exception {
+        RebalanceWaterExitTest.Fixture f = new RebalanceWaterExitTest.Fixture(); f.price = new BigDecimal("99000");
+        Path state = f.path.resolveSibling("service.json");
+        RebalanceMonitorStore store = new RebalanceMonitorStore(state);
+        RebalanceMonitorRule rule = new RebalanceMonitorRule("bound", "bound", true, TradeSide.BUY,
+                RebalanceMonitorRule.Trigger.BELOW, new BigDecimal("200000"),
+                new BigDecimal("5"), new BigDecimal("0.006"), BigDecimal.ONE);
+        store.save(List.of(rule)); store.setActive(rule);
+        RecordingTradeGateway gateway = new RecordingTradeGateway();
+        RebalanceService service = thresholdCycleService(state, gateway, f.price,
+                RebalanceMode.AUTO_LONG_BELOW, "200000", "0.006");
+        service.configureMonitorStore(store);
+        service.configureProfitExit(new RebalanceProfitExit.Exchange() {
+            public List<WorkingOrder> openOrders() { return List.copyOf(f.open); }
+            public RebalanceProfitExit.Evidence evidence(String id) { return f.evidence.get(id); }
+            public BigDecimal bestOppositePrice(TradeSide side) { return f.price; }
+        }, ignored -> f.cycle(), f::apply);
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, service::requestManualAddition);
+        service.restoreActiveCycle(List.of(new FillRecord(f.start, "RBAL:BTCUSDT", "BUY", f.qty,
+                new BigDecimal("100000"), f.qty, new BigDecimal("100000"), BigDecimal.ZERO,
+                BigDecimal.ZERO, BigDecimal.ZERO, "RBAL_initial", "initial")), List.of());
+        var gridReference = referenceSnapshot(service);
+        assertEquals(0, new BigDecimal("0.010").compareTo(service.requestManualAddition()));
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, service::requestManualAddition);
+        service.onPoll();
+        for (int i = 0; i < 10; i++) {
+            assertEquals(i + 1, gateway.submitted.size(), "normal grid stays frozen during addition");
+            OrderIntent order = gateway.submitted.get(i);
+            assertEquals(TradeSide.BUY, order.side());
+            assertEquals(0, new BigDecimal("0.001").compareTo(order.qty()));
+            f.finish(order); service.onPoll();
+        }
+        assertEquals(0, new BigDecimal("0.110").compareTo(f.qty));
+        assertReferenceUnchanged(gridReference, referenceSnapshot(service));
+        assertEquals(f.start, service.activeCycleStartedAt());
+        assertEquals("GRID_ACTIVE", new FileRebalanceStateStore(state).load().orElseThrow().status());
+        assertEquals(12, gateway.submitted.size(), "only confirmed addition rebuilds the ordinary grid pair");
+        service.requestManualCycleExit();
+        org.junit.jupiter.api.Assertions.assertThrows(IllegalStateException.class, service::requestManualAddition);
+    }
+
+    @Test
+    void restoreIgnoresManualPricesButUsesTheirActualInventoryAndCost() throws Exception {
+        Path state = Files.createTempDirectory("manual-reference").resolve("state.json");
+        RebalanceService service = thresholdCycleService(state, new RecordingTradeGateway(), new BigDecimal("82824.9"),
+                RebalanceMode.AUTO_LONG_BELOW, "200000", "0.006");
+        var start = Instant.parse("2026-10-21T10:00:00Z");
+        List<FillRecord> fills = List.of(
+                referenceFill(start, "BUY", "0.2", "83000", "0.2", "16600", "RBAL_grid1", null),
+                referenceFill(start.plusSeconds(1), "BUY", "0.1", "82914.7", "0.3", "24891.47", "RBAL_grid2", null),
+                referenceFill(start.plusSeconds(2), "SELL", "0.028", "84571.5", "0.272", "22523.468",
+                        "RBAL_WATER_legacy_manual", "{\"manualPositionAdjustment\":true}"),
+                referenceFill(start.plusSeconds(3), "BUY", "0.02", "81000", "0.292", "24143.468",
+                        "RBAL_MANUAL_add", null));
+        service.restoreActiveCycle(fills, List.of());
+        var snapshot = referenceSnapshot(service);
+        assertEquals(0, new BigDecimal("0.292").compareTo(snapshot.netQty()));
+        assertEquals(0, new BigDecimal("24143.468").divide(new BigDecimal("0.292"), java.math.MathContext.DECIMAL64)
+                .compareTo(snapshot.avgEntryPrice()));
+        assertEquals(0, new BigDecimal("82914.7").compareTo(snapshot.lastFillPrice()));
+        assertEquals(0, new BigDecimal("83000").compareTo(snapshot.previousFillPrice()));
+        assertEquals(TradeSide.BUY, snapshot.lastFillSide());
+        assertEquals(start, service.activeCycleStartedAt());
+
+        service.onExecution(new FillEvent("grid-next", "BTCUSDT", "RBAL_grid_next", TradeSide.BUY,
+                new BigDecimal("0.006"), new BigDecimal("82900"), start.plusSeconds(4)), "test");
+        var reference = referenceSnapshot(service);
+        assertEquals(1, reference.consecutiveBuyFills());
+        FillEvent add = new FillEvent("manual-add", "BTCUSDT", "RBAL_MANUAL_buy", TradeSide.BUY,
+                new BigDecimal("0.02"), new BigDecimal("81000"), start.plusSeconds(5));
+        service.onExecution(add, "test");
+        assertReferenceUnchanged(reference, referenceSnapshot(service));
+        service.onExecution(new FillEvent("manual-reduce", "BTCUSDT", "RBAL_MANUAL_sell", TradeSide.SELL,
+                new BigDecimal("0.01"), new BigDecimal("84571.5"), start.plusSeconds(6)), "test");
+        assertReferenceUnchanged(reference, referenceSnapshot(service));
+        assertEquals(0, new BigDecimal("0.308").compareTo(referenceSnapshot(service).netQty()));
+        assertFalse(service.onExecution(add, "duplicate"));
+        assertEquals(0, new BigDecimal("0.308").compareTo(referenceSnapshot(service).netQty()));
+
+        service.onExecution(new FillEvent("auto-half", "BTCUSDT", "RBAL_WATER_auto", TradeSide.SELL,
+                new BigDecimal("0.01"), new BigDecimal("85000"), start.plusSeconds(7)), "test");
+        assertEquals(0, new BigDecimal("85000").compareTo(referenceSnapshot(service).lastFillPrice()),
+                "automatic water exits keep their original reference-price behavior");
+    }
+
+    private static FillRecord referenceFill(Instant time, String side, String qty, String price, String cumulativeQty,
+            String cumulativeValue, String id, String metadata) {
+        BigDecimal q = new BigDecimal(qty), p = new BigDecimal(price), cumulative = new BigDecimal(cumulativeQty);
+        return new FillRecord(time, "RBAL:BTCUSDT", side, q, p, q.multiply(p), new BigDecimal("0.1"), "USDT",
+                cumulative, new BigDecimal(cumulativeValue), new BigDecimal("0.4"), cumulative,
+                BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, id, id + "-exec", metadata);
+    }
+
+    private static com.btcgrid.ledger.model.StrategyLedgerSnapshot referenceSnapshot(RebalanceService service) throws Exception {
+        var field = RebalanceService.class.getDeclaredField("rebalanceLedger");
+        field.setAccessible(true);
+        return ((com.btcgrid.ledger.service.StrategyLedger) field.get(service)).snapshot();
+    }
+
+    private static void assertReferenceUnchanged(com.btcgrid.ledger.model.StrategyLedgerSnapshot before,
+            com.btcgrid.ledger.model.StrategyLedgerSnapshot after) {
+        assertEquals(before.lastFillPrice(), after.lastFillPrice());
+        assertEquals(before.previousFillPrice(), after.previousFillPrice());
+        assertEquals(before.lastFillSide(), after.lastFillSide());
+        assertEquals(before.consecutiveBuyFills(), after.consecutiveBuyFills());
+        assertEquals(before.consecutiveSellFills(), after.consecutiveSellFills());
+    }
+
+    private RebalanceService autoShortCycleService(
+            Path stateFile,
+            RecordingTradeGateway tradeGateway,
+            BigDecimal price
+    ) {
+        return thresholdCycleService(stateFile, tradeGateway, price, RebalanceMode.AUTO_SHORT_CYCLE, "80", "0.003");
+    }
+
+    private RebalanceService thresholdCycleService(
+            Path stateFile, RecordingTradeGateway tradeGateway, BigDecimal price,
+            RebalanceMode mode, String threshold, String singleGridQty
+    ) {
+        FakeMarketDataGateway marketDataGateway = new FakeMarketDataGateway(price);
+        RebalanceSettings settings = new RebalanceSettings(
+                true, mode, new BigDecimal("6"), new BigDecimal(singleGridQty), new BigDecimal("5"),
+                ProductCategory.LINEAR, "BTCUSDT", "UNIFIED", "BTC", "USDT",
+                List.of(new RebalanceBand(new BigDecimal(threshold), new BigDecimal("0.70"))),
+                new BigDecimal("0.01"), new BigDecimal("0.0016"), new BigDecimal("0.85"),
+                new BigDecimal("0.005"), new BigDecimal("5"), new BigDecimal("0.001"), new BigDecimal("10"),
+                new BigDecimal("0.001"), new BigDecimal("0.001"), Duration.ofMinutes(15), 1,
+                "rebalance-config.properties", stateFile.toString()
+        );
+        BigDecimal netBaseQty = new BigDecimal("8");
+        BigDecimal totalEquity = price.multiply(BigDecimal.TEN);
+        return new RebalanceService(
+                settings,
+                marketDataGateway,
+                (accountType, baseCoin, quoteCoin, positionCategory, symbol) -> new AccountAssetSnapshot(
+                        Instant.now(), accountType, baseCoin, quoteCoin, netBaseQty,
+                        totalEquity.subtract(netBaseQty.multiply(price)), BigDecimal.ZERO, netBaseQty, totalEquity
                 ),
                 tradeGateway,
                 new WorkingOrderRegistry(),

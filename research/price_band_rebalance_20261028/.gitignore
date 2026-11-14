@@ -1,0 +1,17 @@
+# Commit this study's reproducible evidence, not raw market data or runtime state.
+!/*.json
+!/*.csv
+!/*.html
+!/*.png
+!/outputs/*.csv
+!/snapshots/before_2pp/*.json
+!/snapshots/before_2pp/*.csv
+!/snapshots/before_2pp/*.html
+!/snapshots/before_2pp/*.png
+!/run.log
+!/validate.log
+!/add2pp.log
+!/validate_2pp.log
+!/data_verification.log
+!/report_build.log
+!/report_2pp_build.log

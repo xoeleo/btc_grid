@@ -29,6 +29,7 @@ import com.btcgrid.strategy.service.GridOrderPlanner;
 import com.btcgrid.strategy.service.GridStrategyEngine;
 import com.btcgrid.strategy.service.GridTriggerEvaluator;
 import com.btcgrid.strategy.model.StrategyStateSnapshot;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.math.BigDecimal;
 import java.time.Duration;
@@ -43,6 +44,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class GridLiveRunnerOpenOrderReconciliationTest {
@@ -56,22 +58,58 @@ class GridLiveRunnerOpenOrderReconciliationTest {
         ));
         GridLiveRunner runner = runner(registry, orderQueryGateway);
 
-        Object result = invokeReconcileOpenOrders(runner);
+        invokeReconcileMissingExecutions(runner);
 
         assertEquals(OrderStatus.FILLED, onlyOrder(registry).status());
-        assertTrue(recoveredExecution(result));
-        assertEquals(Set.of("GRID_SOLUSDT_PB_test"), orderQueryGateway.executionQueryClientOrderIds);
+        assertTrue(orderQueryGateway.executionQueryWasUnfiltered);
     }
 
     @Test
-    void missingRemoteOpenOrderWithoutExecutionIsMarkedCanceled() throws Exception {
+    void missingRemoteOpenOrderWithoutTerminalStatusRemainsPending() throws Exception {
         WorkingOrderRegistry registry = new WorkingOrderRegistry();
         registry.trackRemote(openOrder("GRID_SOLUSDT_PB_test", Instant.now().minusSeconds(30)));
         GridLiveRunner runner = runner(registry, new FakeOrderQueryGateway(List.of()));
 
+        InvocationTargetException failure = assertThrows(InvocationTargetException.class,
+                () -> invokeReconcileOpenOrders(runner));
+
+        assertTrue(failure.getCause() instanceof IllegalStateException);
+        assertEquals(OrderStatus.NEW, onlyOrder(registry).status());
+    }
+
+    @Test
+    void missingRemoteOpenOrderWithConfirmedCanceledStatusIsMarkedCanceled() throws Exception {
+        WorkingOrderRegistry registry = new WorkingOrderRegistry();
+        WorkingOrder order = openOrder("GRID_SOLUSDT_PB_test", Instant.now().minusSeconds(30));
+        registry.trackRemote(order);
+        FakeOrderQueryGateway gateway = new FakeOrderQueryGateway(List.of());
+        gateway.recentOrders = List.of(withStatus(order, OrderStatus.CANCELED));
+        GridLiveRunner runner = runner(registry, gateway);
+
         invokeReconcileOpenOrders(runner);
 
         assertEquals(OrderStatus.CANCELED, onlyOrder(registry).status());
+    }
+
+    @Test
+    void missingRemoteOpenOrderThatReappearsIsNotCanceled() throws Exception {
+        WorkingOrderRegistry registry = new WorkingOrderRegistry();
+        WorkingOrder order = openOrder("GRID_SOLUSDT_PB_test", Instant.now().minusSeconds(30));
+        registry.trackRemote(order);
+        FakeOrderQueryGateway gateway = new FakeOrderQueryGateway(List.of());
+        GridLiveRunner runner = runner(registry, gateway);
+
+        InvocationTargetException firstFailure = assertThrows(InvocationTargetException.class,
+                () -> invokeReconcileOpenOrders(runner));
+        assertTrue(firstFailure.getCause() instanceof IllegalStateException);
+        gateway.openOrders = List.of(order);
+        invokeReconcileOpenOrders(runner);
+        gateway.openOrders = List.of();
+        InvocationTargetException secondFailure = assertThrows(InvocationTargetException.class,
+                () -> invokeReconcileOpenOrders(runner));
+        assertTrue(secondFailure.getCause() instanceof IllegalStateException);
+
+        assertEquals(OrderStatus.NEW, onlyOrder(registry).status());
     }
 
     @Test
@@ -80,8 +118,10 @@ class GridLiveRunnerOpenOrderReconciliationTest {
         registry.trackRemote(openOrder("GRID_SOLUSDT_PB_recent", Instant.now()));
         GridLiveRunner runner = runner(registry, new FakeOrderQueryGateway(List.of()));
 
-        invokeReconcileOpenOrders(runner);
+        InvocationTargetException failure = assertThrows(InvocationTargetException.class,
+                () -> invokeReconcileOpenOrders(runner));
 
+        assertTrue(failure.getCause() instanceof IllegalStateException);
         assertEquals(OrderStatus.NEW, onlyOrder(registry).status());
     }
 
@@ -121,10 +161,10 @@ class GridLiveRunnerOpenOrderReconciliationTest {
         return method.invoke(runner);
     }
 
-    private boolean recoveredExecution(Object result) throws Exception {
-        Method method = result.getClass().getDeclaredMethod("recoveredExecution");
+    private Object invokeReconcileMissingExecutions(GridLiveRunner runner) throws Exception {
+        Method method = GridLiveRunner.class.getDeclaredMethod("reconcileMissingExecutions");
         method.setAccessible(true);
-        return (boolean) method.invoke(result);
+        return method.invoke(runner);
     }
 
     private WorkingOrder onlyOrder(WorkingOrderRegistry registry) {
@@ -145,6 +185,22 @@ class GridLiveRunnerOpenOrderReconciliationTest {
                 false,
                 OrderStatus.NEW,
                 createdAt,
+                Instant.now()
+        );
+    }
+
+    private WorkingOrder withStatus(WorkingOrder order, OrderStatus status) {
+        return new WorkingOrder(
+                order.symbol(),
+                order.clientOrderId(),
+                order.exchangeOrderId(),
+                order.side(),
+                order.orderType(),
+                order.price(),
+                order.qty(),
+                order.reduceOnly(),
+                status,
+                order.createdAt(),
                 Instant.now()
         );
     }
@@ -246,7 +302,10 @@ class GridLiveRunnerOpenOrderReconciliationTest {
 
     private static class FakeOrderQueryGateway implements BybitOrderQueryGateway {
         private final List<FillEvent> executions;
+        private List<WorkingOrder> openOrders = List.of();
+        private List<WorkingOrder> recentOrders = List.of();
         private Set<String> executionQueryClientOrderIds = Set.of();
+        private boolean executionQueryWasUnfiltered;
 
         private FakeOrderQueryGateway(List<FillEvent> executions) {
             this.executions = executions;
@@ -254,13 +313,29 @@ class GridLiveRunnerOpenOrderReconciliationTest {
 
         @Override
         public List<WorkingOrder> fetchOpenOrders(String symbol) {
-            return List.of();
+            return openOrders;
+        }
+
+        @Override
+        public List<WorkingOrder> fetchRecentOrders(String symbol, Set<String> clientOrderIds) {
+            return recentOrders;
         }
 
         @Override
         public List<FillEvent> fetchRecentExecutions(String symbol, Set<String> clientOrderIds) {
             executionQueryClientOrderIds = Set.copyOf(clientOrderIds);
             return executions;
+        }
+
+        @Override
+        public List<FillEvent> fetchExecutions(String symbol, Set<String> clientOrderIds,
+                                               Instant startInclusive, Instant endInclusive) {
+            if (clientOrderIds == null) {
+                executionQueryWasUnfiltered = true;
+                executionQueryClientOrderIds = Set.of();
+                return executions;
+            }
+            return fetchRecentExecutions(symbol, clientOrderIds);
         }
     }
 

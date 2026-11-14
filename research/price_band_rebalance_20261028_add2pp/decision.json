@@ -1,0 +1,40 @@
+{
+  "status": "RESEARCH_ONLY",
+  "live_deployed": false,
+  "thresholds_percentage_points": [
+    5,
+    2,
+    1
+  ],
+  "short_only_1pp_minus_5pp_usdt": -4181.048152218456,
+  "allow_long_1pp_minus_5pp_usdt": -198.1723778701853,
+  "both_modes_1pp_return_lower": true,
+  "both_modes_1pp_drawdown_higher": true,
+  "independent_export_audit_passed": true,
+  "external_review": "NOT_EXECUTED: tools cannot verify ChatGPT Pro Extra High",
+  "data_cutoff_utc": "2026-10-02T00:00:00Z",
+  "not_current_to_2026_10_28": true,
+  "additional_threshold_requested_posthoc": 2,
+  "baseline_15_results_unchanged": true,
+  "baseline_45_csvs_byte_identical": true,
+  "two_point_comparisons": {
+    "short_only": {
+      "final_equity": {
+        "5": 790824.4843224688,
+        "2": 785030.1695884104,
+        "1": 786643.4361702503
+      },
+      "2pp_minus_5pp_usdt": -5794.314734058338,
+      "2pp_minus_1pp_usdt": -1613.2665818398818
+    },
+    "allow_long": {
+      "final_equity": {
+        "5": 808014.6985538787,
+        "2": 804581.6676157122,
+        "1": 807816.5261760085
+      },
+      "2pp_minus_5pp_usdt": -3433.030938166543,
+      "2pp_minus_1pp_usdt": -3234.8585602963576
+    }
+  }
+}
